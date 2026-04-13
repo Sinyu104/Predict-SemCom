@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+env/
+
+# Trained model outputs (large files — use Git LFS or store externally)
+outputs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Data
+data/*.hdf5
+data/*.h5
+
+# Logs
+runs/
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# HuggingFace cache (never commit model weights)
+.cache/
+
+# claude md
+Claude.md
