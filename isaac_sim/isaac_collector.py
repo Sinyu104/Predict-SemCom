@@ -566,15 +566,16 @@ class FrankaScene:
     def apply_action(self, action: np.ndarray):
         """
         Apply a 7-DoF end-effector delta action.
-        action[:3] = position delta; action[6] = gripper.
+        action[:3] = position delta (metres); action[6] = gripper (+1 open, -1 closed).
         """
         ee_pos, _ = self.franka.end_effector.get_world_pose()
-        target    = ee_pos + action[:3].astype(np.float64) * 0.05
+        target    = ee_pos + action[:3].astype(np.float64)
         ctrl      = self.controller.forward(
             target_end_effector_position=target,
             target_end_effector_orientation=None,
         )
         self.art_ctrl.apply_action(ctrl)
+        self._set_gripper(open_gripper=float(action[6]) > 0.0)
 
     def step(self):
         # render=True drives the RTX viewport renderer each physics step.
