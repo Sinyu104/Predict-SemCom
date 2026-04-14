@@ -785,15 +785,27 @@ def collect(args):
           f"p={args.interference_prob}")
     print(f"[Collector] Output: {args.output}\n")
 
+    # Success threshold: cube must be within this XY distance of GOAL_POS
+    # and below this height (resting on tray, not hovering).
+    SUCCESS_XY_THRESH = 0.10   # metres
+    SUCCESS_Z_MAX     = 0.07   # metres (tray top ≈ 0.004 + cube half-height 0.025)
+
+    def is_success() -> bool:
+        cube_pos, _ = scene.cube.get_world_pose()
+        xy_dist = np.linalg.norm(cube_pos[:2] - scene.GOAL_POS[:2])
+        return bool(xy_dist < SUCCESS_XY_THRESH and cube_pos[2] < SUCCESS_Z_MAX)
+
     t0             = time.time()
     total_latency  = 0.0
     total_requests = 0
+    n_success      = 0
 
     for ep in range(args.num_episodes):
         scene.reset(randomise=True)
         injector.reset()
-        obs_buf = []
-        act_buf = []
+        obs_buf  = []
+        act_buf  = []
+        success  = False
 
         for step in range(args.episode_length):
             # Capture observation BEFORE action
@@ -821,33 +833,48 @@ def collect(args):
 
             scene.step()
 
+            # Check success after physics settles each step
+            if is_success():
+                success = True
+                print(f"  ep {ep+1:4d}  SUCCESS at step {step+1}")
+                break
+
+        if success:
+            n_success += 1
+
         writer.write(obs_buf, act_buf, metadata={
             "disturbed":       int(args.interference_action or args.interference_pose),
             "n_action_events": injector.action_events,
             "n_pose_events":   injector.pose_events,
+            "success":         int(success),
+            "steps":           len(obs_buf),
         })
 
-        elapsed = time.time() - t0
-        eta     = elapsed / (ep + 1) * (args.num_episodes - ep - 1)
+        elapsed     = time.time() - t0
+        eta         = elapsed / (ep + 1) * (args.num_episodes - ep - 1)
+        success_str = f"success={n_success}/{ep+1} ({100*n_success/(ep+1):.1f}%)"
         if args.scripted:
             print(
                 f"  ep {ep+1:4d}/{args.num_episodes}  "
                 f"phase={scene.phase}  "
-                f"Δp={injector.pose_events}  ETA {eta:.0f}s"
+                f"{success_str}  Δp={injector.pose_events}  ETA {eta:.0f}s"
             )
         else:
             avg_lat = total_latency / max(total_requests, 1)
             print(
                 f"  ep {ep+1:4d}/{args.num_episodes}  "
+                f"{success_str}  "
                 f"Δa={injector.action_events}  Δp={injector.pose_events}  "
                 f"avg_vla={avg_lat:.0f}ms  ETA {eta:.0f}s"
             )
 
+    final_rate = 100.0 * n_success / max(args.num_episodes, 1)
+    print(f"\n[Collector] Success rate: {n_success}/{args.num_episodes} ({final_rate:.1f}%)")
     writer.close()
     if client is not None:
         client.close()
     simulation_app.close()
-    print(f"\n[Collector] Done. Total time: {time.time()-t0:.0f}s")
+    print(f"[Collector] Done. Total time: {time.time()-t0:.0f}s")
 
 
 # ========================================================================== #
