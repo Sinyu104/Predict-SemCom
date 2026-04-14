@@ -144,6 +144,21 @@ class OpenVLAServer:
         for p in self.model.parameters():
             p.requires_grad_(False)
 
+        # Merge custom dataset_statistics.json (written during fine-tuning) into
+        # the model's norm_stats so that custom unnorm_keys (e.g. "franka_isaac")
+        # are recognised.  This is necessary when loading a PEFT adapter because
+        # the base model only knows about its original training datasets.
+        stats_path = os.path.join(model_dir, "dataset_statistics.json")
+        if os.path.isfile(stats_path):
+            with open(stats_path) as f:
+                extra_stats = json.load(f)
+            if hasattr(self.model, "norm_stats"):
+                self.model.norm_stats.update(extra_stats)
+                print(f"[VLAServer] Loaded norm_stats from {stats_path}")
+            else:
+                print(f"[VLAServer] WARNING: model has no norm_stats attribute; "
+                      f"cannot inject custom dataset statistics.")
+
         # Log which device each major component landed on
         import torch
         if torch.cuda.is_available():
