@@ -121,9 +121,18 @@ class OpenVLAAgent(nn.Module):
                 kwargs["torch_dtype"] = torch.bfloat16
         else:
             kwargs["torch_dtype"] = torch.bfloat16
-        self._vla = AutoModelForVision2Seq.from_pretrained(
-            self._model_name, **kwargs
-        ).to(self._vla_device)
+        if self._vla_device == "auto":
+            # device_map="auto" distributes layers across all available GPUs.
+            # .to() must NOT be called in this case — HuggingFace handles placement.
+            kwargs["device_map"] = "auto"
+            self._vla = AutoModelForVision2Seq.from_pretrained(
+                self._model_name, **kwargs
+            )
+        else:
+            # Explicit device (e.g. "cuda:0") — load on CPU then move.
+            self._vla = AutoModelForVision2Seq.from_pretrained(
+                self._model_name, **kwargs
+            ).to(self._vla_device)
         # Freeze ALL VLA parameters — gradients never flow into the VLA
         for p in self._vla.parameters():
             p.requires_grad_(False)

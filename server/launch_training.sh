@@ -50,6 +50,8 @@ export NCCL_DEBUG=WARN          # set to INFO for verbose NCCL logging
 # Avoid HDF5 multiprocessing issues
 export HDF5_USE_FILE_LOCKING=FALSE
 
+export NCCL_SOCKET_IFNAME=lo,eth,en
+
 # ── Launch ────────────────────────────────────────────────────────── #
 echo "[launch] Starting torchrun with ${NUM_GPUS} processes …"
 echo "[launch] Args: $*"

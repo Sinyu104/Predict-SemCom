@@ -103,20 +103,20 @@ def build_agent(args, config: dict, rank: int):
     model_name = ft_dir if (ft_dir and os.path.isdir(ft_dir)) \
                  else config["openvla_model_name"]
 
-    device_map = (
-        args.openvla_device_map
-        or config.get("openvla_device_map", "auto")
-    )
+    # With torchrun each rank owns one GPU.  Load the VLA on that rank's GPU
+    # so each process has its own copy.  "auto" is only safe when a single
+    # process owns all GPUs (e.g. the standalone vla_server.py).
+    vla_device = f"cuda:{rank}"
 
     if rank == 0:
         print(f"[main] OpenVLA model : {model_name}")
-        print(f"[main] device_map    : {device_map}")
+        print(f"[main] device_map    : {vla_device} (one copy per rank)")
 
     return OpenVLAAgent(
         instruction = config["openvla_instruction"],
         unnorm_key  = config.get("openvla_unnorm_key", "bridge_orig"),
         model_name  = model_name,
-        device      = device_map,   # "auto" for multi-GPU
+        device      = vla_device,
         quantize    = config.get("openvla_quantize", False),
     )
 
