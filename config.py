@@ -65,7 +65,7 @@ CONFIG = {
 
     # ── Optimisation ────────────────────────────────────────────────── #
     "learning_rate": 1e-4,
-    "batch_size":    2,    # per-GPU batch size (effective = 16 × 4 = 64)
+    "batch_size":    4,    # per-GPU batch size (effective = 4 × 4 = 16)
     "epochs":        50,
 
     # ── Multi-GPU (DDP) ─────────────────────────────────────────────── #
