@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from models import (
     PredictiveSemComSystem,
@@ -233,9 +234,114 @@ class BaseTrainer:
     def _task_loss(
         self, y_rec: torch.Tensor, actions_gt: torch.Tensor
     ) -> torch.Tensor:
-        return self.agent.task_loss_forward(
-            y_rec, actions_gt.to(y_rec.device)
-        )
+        """
+        Compute task loss using the real OpenVLA on rank 0 only.
+
+        In multi-GPU mode, y_rec from all ranks is gathered to rank 0 where
+        the frozen VLA computes dL/d(y_rec) for all samples.  The gradients
+        are broadcast back so every rank gets the correct training signal
+        through its local encoder / reshaper — no stub gradients are used.
+        """
+        if not dist.is_initialized() or self.world_size == 1:
+            return self.agent.task_loss_forward(
+                y_rec, actions_gt.to(y_rec.device)
+            )
+
+        B          = y_rec.size(0)
+        actions_gt = actions_gt.to(self.device)
+
+        # 1. Gather detached y_rec and actions from all ranks
+        all_y_buf = [torch.empty_like(y_rec)      for _ in range(self.world_size)]
+        all_a_buf = [torch.empty_like(actions_gt) for _ in range(self.world_size)]
+        dist.all_gather(all_y_buf, y_rec.detach())
+        dist.all_gather(all_a_buf, actions_gt.detach())
+
+        # 2. Rank 0 runs the real VLA forward/backward over the full batch
+        if self.rank == 0:
+            all_y  = torch.cat(all_y_buf, dim=0).requires_grad_(True)
+            all_a  = torch.cat(all_a_buf, dim=0)
+            L_real = self.agent.task_loss_forward(all_y, all_a)
+            L_real.backward()
+            grad_all    = all_y.grad.contiguous()        # (world_size*B, C, H, W)
+            loss_tensor = (L_real.detach() / self.world_size).reshape(1)
+        else:
+            grad_all    = torch.empty(
+                self.world_size * B, *y_rec.shape[1:], device=self.device
+            )
+            loss_tensor = torch.zeros(1, device=self.device)
+
+        # 3. Broadcast gradients and scalar loss from rank 0 to all ranks
+        dist.broadcast(grad_all,    src=0)
+        dist.broadcast(loss_tensor, src=0)
+
+        # 4. Surrogate loss: d/d(y_rec)[(y_rec * g).sum()] == g exactly,
+        #    giving each rank the correct OpenVLA gradient.
+        #    Straight-through trick keeps the logged scalar meaningful.
+        grad_local = grad_all[self.rank * B : (self.rank + 1) * B].detach()
+        surrogate  = (y_rec * grad_local).sum()
+        return surrogate - surrogate.detach() + loss_tensor.squeeze()
+
+    def _task_loss_pair(
+        self,
+        y_rec:      torch.Tensor,   # (B, 3, H, W)
+        y_align:    torch.Tensor,   # (B, 3, H, W)
+        actions_gt: torch.Tensor,   # (B, 7)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute task loss for both y_rec and y_align in a SINGLE VLA forward+backward.
+
+        Combines both tensors into one batch before the VLA pass, halving the
+        number of backward passes through the 7B model compared to calling
+        _task_loss twice.  Gradients are broadcast back to all ranks.
+        """
+        if not dist.is_initialized() or self.world_size == 1:
+            L_task  = self.agent.task_loss_forward(y_rec,   actions_gt.to(y_rec.device))
+            L_align = self.agent.task_loss_forward(y_align, actions_gt.to(y_align.device))
+            return L_task, L_align
+
+        B          = y_rec.size(0)
+        actions_gt = actions_gt.to(self.device)
+        WB         = self.world_size * B
+
+        # 1. Gather detached y_rec, y_align, and actions from all ranks
+        all_yrec_buf   = [torch.empty_like(y_rec)      for _ in range(self.world_size)]
+        all_yalign_buf = [torch.empty_like(y_align)    for _ in range(self.world_size)]
+        all_a_buf      = [torch.empty_like(actions_gt) for _ in range(self.world_size)]
+        dist.all_gather(all_yrec_buf,   y_rec.detach())
+        dist.all_gather(all_yalign_buf, y_align.detach())
+        dist.all_gather(all_a_buf,      actions_gt.detach())
+
+        # 2. Rank 0: single VLA forward+backward over combined batch (2*WB images)
+        if self.rank == 0:
+            # Concatenate both groups; actions repeated for each group
+            all_y  = torch.cat(all_yrec_buf + all_yalign_buf, dim=0).requires_grad_(True)
+            all_a  = torch.cat(all_a_buf    + all_a_buf,      dim=0)
+            L_real = self.agent.task_loss_forward(all_y, all_a)
+            L_real.backward()
+            # task_loss_forward normalises by total batch (2*WB); ×2 restores
+            # the per-group gradient scale to match individual _task_loss calls.
+            grad_all     = all_y.grad.contiguous() * 2   # (2*WB, C, H, W)
+            loss_tensor  = (L_real.detach() * 2 / self.world_size).reshape(1)
+        else:
+            grad_all    = torch.empty(
+                2 * WB, *y_rec.shape[1:], device=self.device
+            )
+            loss_tensor = torch.zeros(1, device=self.device)
+
+        # 3. Broadcast combined gradients and scalar from rank 0
+        dist.broadcast(grad_all,    src=0)
+        dist.broadcast(loss_tensor, src=0)
+
+        # 4. Split gradients: first WB rows → y_rec, last WB rows → y_align
+        grad_rec   = grad_all[self.rank * B : (self.rank + 1) * B].detach()
+        grad_align = grad_all[WB + self.rank * B : WB + (self.rank + 1) * B].detach()
+
+        half_loss   = loss_tensor.squeeze() / 2
+        surr_rec    = (y_rec   * grad_rec).sum()
+        surr_align  = (y_align * grad_align).sum()
+        L_task  = surr_rec   - surr_rec.detach()   + half_loss
+        L_align = surr_align - surr_align.detach() + half_loss
+        return L_task, L_align
 
     def save_checkpoint(self, filename: str, extra: dict | None = None):
         """Save checkpoint from rank 0 only."""
@@ -316,8 +422,16 @@ class Stage1Trainer(BaseTrainer):
         totals = {"task": 0.0, "kl": 0.0, "align": 0.0, "total": 0.0}
         n = 0
 
+        phase = "train" if train else "val"
+        pbar = tqdm(
+            loader,
+            desc=f"  {phase} ep {epoch}",
+            disable=not self.is_main,
+            leave=False,
+            dynamic_ncols=True,
+        )
         with torch.set_grad_enabled(train):
-            for bi, (obs_t, act_t, _) in enumerate(loader):
+            for obs_t, act_t, _ in pbar:
                 obs_t = obs_t.to(self.device)
                 act_t = act_t.to(self.device)
                 B     = obs_t.size(0)
@@ -332,10 +446,9 @@ class Stage1Trainer(BaseTrainer):
                     sample_z=train,
                 )
 
-                L_task  = self._task_loss(out["y_rec"], act_t)
                 L_kl    = JsccEncoder.kl_loss(out["mu"], out["log_var"])
                 y_align = self._unwrap(self.system.reshaper)(out["z_rec"])
-                L_align = self._task_loss(y_align, act_t)
+                L_task, L_align = self._task_loss_pair(out["y_rec"], y_align, act_t)
                 loss    = L_task + self.beta1 * L_kl + self.beta2 * L_align
 
                 if train:
@@ -354,14 +467,12 @@ class Stage1Trainer(BaseTrainer):
                 totals["total"] += loss.item()
                 n += 1
 
-                if (train and self.is_main
-                        and bi % self.config.get("log_interval", 10) == 0):
-                    print(
-                        f"    [{bi:4d}/{len(loader)}] "
-                        f"task={L_task.item():.4f}  "
-                        f"kl={L_kl.item():.4f}  "
-                        f"align={L_align.item():.4f}"
-                    )
+                pbar.set_postfix(
+                    task=f"{L_task.item():.4f}",
+                    kl=f"{L_kl.item():.4f}",
+                    align=f"{L_align.item():.4f}",
+                    total=f"{loss.item():.4f}",
+                )
 
         # Average metrics across all GPUs
         avg = {}
@@ -380,7 +491,13 @@ class Stage1Trainer(BaseTrainer):
                   f"{self.config['batch_size']} × {self.world_size} = "
                   f"{self.config['batch_size'] * self.world_size}")
 
-        for ep in range(1, epochs + 1):
+        epoch_bar = tqdm(
+            range(1, epochs + 1),
+            desc="[Stage1]",
+            disable=not self.is_main,
+            dynamic_ncols=True,
+        )
+        for ep in epoch_bar:
             tr = self._run_epoch(self.train_loader, True,  ep)
             vl = self._run_epoch(self.val_loader,   False, ep)
             self.scheduler.step()
@@ -388,10 +505,11 @@ class Stage1Trainer(BaseTrainer):
             if self.is_main:
                 self._log("Stage1", {"train_" + k: v for k, v in tr.items()}, ep)
                 self._log("Stage1", {"val_"   + k: v for k, v in vl.items()}, ep)
-                print(
-                    f"[Stage1] ep {ep:3d}/{epochs}  "
-                    f"train={tr['total']:.4f}  val={vl['total']:.4f}  "
-                    f"val_task={vl['task']:.4f}  val_kl={vl['kl']:.4f}"
+                epoch_bar.set_postfix(
+                    train=f"{tr['total']:.4f}",
+                    val=f"{vl['total']:.4f}",
+                    val_task=f"{vl['task']:.4f}",
+                    val_kl=f"{vl['kl']:.4f}",
                 )
                 if vl["total"] < best:
                     best = vl["total"]

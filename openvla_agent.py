@@ -115,12 +115,12 @@ class OpenVLAAgent(nn.Module):
                 from transformers import BitsAndBytesConfig
                 kwargs["quantization_config"] = BitsAndBytesConfig(
                     load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_compute_dtype=torch.float16,
                 )
             except ImportError:
-                kwargs["torch_dtype"] = torch.bfloat16
+                kwargs["torch_dtype"] = torch.float16
         else:
-            kwargs["torch_dtype"] = torch.bfloat16
+            kwargs["torch_dtype"] = torch.float16
         if self._vla_device == "auto":
             # device_map="auto" distributes layers across all available GPUs.
             # .to() must NOT be called in this case — HuggingFace handles placement.
@@ -128,6 +128,8 @@ class OpenVLAAgent(nn.Module):
             self._vla = AutoModelForVision2Seq.from_pretrained(
                 self._model_name, **kwargs
             )
+            # Resolve to a real device for subsequent tensor .to() calls.
+            self._vla_device = next(self._vla.parameters()).device
         else:
             # Explicit device (e.g. "cuda:0") — load on CPU then move.
             self._vla = AutoModelForVision2Seq.from_pretrained(
@@ -202,71 +204,62 @@ class OpenVLAAgent(nn.Module):
         prompt = (f"In: What action should the robot take to "
                   f"{self.instruction}?\nOut:")
 
-        total_loss = torch.tensor(0.0, device=y_rec.device, dtype=y_rec.dtype)
-
-        for i in range(B):
-            pil_img  = self._to_pil(y_rec[i])
-            inputs   = self._processor(prompt, pil_img)
-
-            # Move inputs to VLA device, keeping pixel_values as float32
-            # so gradients can flow back through them.
-            pixel_values = inputs["pixel_values"]           # numpy or tensor
-            if not isinstance(pixel_values, torch.Tensor):
-                pixel_values = torch.tensor(pixel_values)
-            # pixel_values: (1, 3, H, W)
-            pixel_values = pixel_values.to(
-                self._vla_device, dtype=torch.float32
+        # ── 1. Differentiable pixel_values for the whole batch ──────────── #
+        if y_rec.shape[-2:] != (224, 224):
+            y_resized = F.interpolate(
+                y_rec, size=(224, 224), mode="bilinear", align_corners=False
             )
-            # Detach from any previous graph, then re-attach via y_rec.
-            # We reconstruct pixel_values from y_rec so gradients flow.
-            # OpenVLA's processor resizes to 224×224 internally.
-            if y_rec.shape[-2:] != (224, 224):
-                y_resized = F.interpolate(
-                    y_rec[i].unsqueeze(0), size=(224, 224),
-                    mode="bilinear", align_corners=False
-                )
-            else:
-                y_resized = y_rec[i].unsqueeze(0)           # (1,3,224,224)
+        else:
+            y_resized = y_rec                                # (B, 3, 224, 224)
 
-            # Normalise to ImageNet stats that OpenVLA expects
-            mean = torch.tensor([0.485, 0.456, 0.406],
-                                 device=y_rec.device).view(1, 3, 1, 1)
-            std  = torch.tensor([0.229, 0.224, 0.225],
-                                 device=y_rec.device).view(1, 3, 1, 1)
-            pixel_values_grad = (y_resized - mean) / std   # (1,3,224,224)
-            # Cast to bfloat16 to match VLA weights, but keep grad
-            pixel_values_grad = pixel_values_grad.to(
-                self._vla_device, dtype=torch.bfloat16
-            )
+        mean = torch.tensor([0.485, 0.456, 0.406],
+                             device=y_rec.device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225],
+                             device=y_rec.device).view(1, 3, 1, 1)
+        pixel_values_grad = (y_resized - mean) / std        # (B, 3, 224, 224)
+        # OpenVLA's prismatic backbone (DINOv2 + SigLIP) expects 6 channels.
+        pixel_values_grad = torch.cat(
+            [pixel_values_grad, pixel_values_grad], dim=1   # (B, 6, 224, 224)
+        )
+        pixel_values_grad = pixel_values_grad.to(
+            self._vla_device, dtype=torch.float16
+        )
 
-            input_ids = torch.tensor(
-                inputs["input_ids"], dtype=torch.long
-            ).to(self._vla_device)
+        # ── 2. input_ids via batched processor call ──────────────────────── #
+        # PIL images are only needed for the processor's tokenisation of the
+        # text prompt; gradients do NOT flow through this path.
+        pil_imgs = [self._to_pil(y_rec[i]) for i in range(B)]
+        inputs   = self._processor(
+            [prompt] * B, pil_imgs,
+            return_tensors="pt", padding=True,
+        )
+        input_ids      = inputs["input_ids"].to(self._vla_device)       # (B, T)
+        attention_mask = inputs["attention_mask"].to(self._vla_device)  # (B, T)
 
-            # Ground-truth action token IDs for cross-entropy target
-            action_token_ids = self._action_to_tokens(
-                actions_gt[i].cpu().numpy(), self._processor
-            ).to(self._vla_device)  # (7,)
+        # ── 3. Ground-truth action token IDs for the whole batch ─────────── #
+        action_token_ids = torch.stack([
+            self._action_to_tokens(actions_gt[i].cpu().numpy(), self._processor)
+            for i in range(B)
+        ]).to(self._vla_device)                                         # (B, 7)
 
-            # Forward pass through frozen VLA
-            # pixel_values_grad has requires_grad via y_rec
-            outputs = self._vla(
-                input_ids=input_ids,
-                pixel_values=pixel_values_grad,
-                output_hidden_states=False,
-            )
-            # outputs.logits: (1, T, vocab_size)
-            logits = outputs.logits[0]          # (T, vocab_size)
+        # ── 4. Single batched VLA forward pass ───────────────────────────── #
+        outputs = self._vla(
+            input_ids      = input_ids,
+            pixel_values   = pixel_values_grad,
+            attention_mask = attention_mask,
+            output_hidden_states = False,
+        )
+        # outputs.logits: (B, T, vocab_size)
+        action_logits = outputs.logits[:, -self.ACTION_TOKEN_COUNT:, :]  # (B, 7, V)
+        action_logits    = action_logits.to(y_rec.device, dtype=y_rec.dtype)
+        action_token_ids = action_token_ids.to(y_rec.device)
 
-            # The last 7 positions correspond to the 7 action tokens.
-            action_logits = logits[-self.ACTION_TOKEN_COUNT:, :]  # (7, V)
-            action_logits = action_logits.to(y_rec.device, dtype=y_rec.dtype)
-            action_token_ids = action_token_ids.to(y_rec.device)
-
-            step_loss = F.cross_entropy(action_logits, action_token_ids)
-            total_loss = total_loss + step_loss
-
-        return total_loss / B
+        # ── 5. Cross-entropy over all B×7 action tokens ──────────────────── #
+        V = action_logits.size(-1)
+        return F.cross_entropy(
+            action_logits.reshape(-1, V),       # (B*7, V)
+            action_token_ids.reshape(-1),        # (B*7,)
+        )
 
     # ------------------------------------------------------------------ #
     #  Inference — returns numpy action (no gradient)                     #
@@ -289,7 +282,7 @@ class OpenVLAAgent(nn.Module):
         for i in range(B):
             pil_img = self._to_pil(y_rec[i])
             inputs  = self._processor(prompt, pil_img).to(
-                self._vla_device, dtype=torch.bfloat16
+                self._vla_device, dtype=torch.float16
             )
             action_np = self._vla.predict_action(
                 **inputs, unnorm_key=self.unnorm_key, do_sample=False

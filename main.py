@@ -97,10 +97,13 @@ def build_agent(args, config: dict, rank: int):
         )
 
     from openvla_agent import OpenVLAAgent
+    import sys, os as _os
+    sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "server"))
+    from vla_server import _resolve_model_dir
 
     # Use fine-tuned weights if available, else fall back to base model
     ft_dir     = config.get("openvla_finetune_dir", "")
-    model_name = ft_dir if (ft_dir and os.path.isdir(ft_dir)) \
+    model_name = _resolve_model_dir(ft_dir) if (ft_dir and os.path.isdir(ft_dir)) \
                  else config["openvla_model_name"]
 
     # The VLA is frozen — only ONE copy is needed across all ranks.

@@ -65,7 +65,7 @@ CONFIG = {
 
     # ── Optimisation ────────────────────────────────────────────────── #
     "learning_rate": 1e-4,
-    "batch_size":    16,    # per-GPU batch size (effective = 16 × 4 = 64)
+    "batch_size":    2,    # per-GPU batch size (effective = 16 × 4 = 64)
     "epochs":        50,
 
     # ── Multi-GPU (DDP) ─────────────────────────────────────────────── #
@@ -93,7 +93,7 @@ CONFIG = {
     "openvla_model_name":    "openvla/openvla-7b",
     "openvla_instruction":   "pick up the red cube and place it on the tray",
     "openvla_unnorm_key":    "franka_isaac",
-    "openvla_finetune_dir":  "outputs/openvla_finetuned",
+    "openvla_finetune_dir":  "outputs/openvla_finetuned_v3",
 
     # On the server, split OpenVLA across T4 GPUs using device_map="auto".
     # With 4 × 16 GB T4, the 7B model (14 GB bfloat16) fits comfortably.
