@@ -103,22 +103,30 @@ def build_agent(args, config: dict, rank: int):
     model_name = ft_dir if (ft_dir and os.path.isdir(ft_dir)) \
                  else config["openvla_model_name"]
 
-    # With torchrun each rank owns one GPU.  Load the VLA on that rank's GPU
-    # so each process has its own copy.  "auto" is only safe when a single
-    # process owns all GPUs (e.g. the standalone vla_server.py).
-    vla_device = f"cuda:{rank}"
-
+    # The VLA is frozen — only ONE copy is needed across all ranks.
+    # Load it on cuda:0 (rank 0's GPU) with device_map="auto" so HuggingFace
+    # can shard its 14 GB across all 4 GPUs if needed.
+    # Non-zero ranks get a lightweight stub; task_loss calls are routed to
+    # rank 0 via the shared system object (the agent is NOT DDP-wrapped).
     if rank == 0:
         print(f"[main] OpenVLA model : {model_name}")
-        print(f"[main] device_map    : {vla_device} (one copy per rank)")
-
-    return OpenVLAAgent(
-        instruction = config["openvla_instruction"],
-        unnorm_key  = config.get("openvla_unnorm_key", "bridge_orig"),
-        model_name  = model_name,
-        device      = vla_device,
-        quantize    = config.get("openvla_quantize", False),
-    )
+        print(f"[main] VLA loaded on rank 0 only (frozen, shared across ranks)")
+        return OpenVLAAgent(
+            instruction = config["openvla_instruction"],
+            unnorm_key  = config.get("openvla_unnorm_key", "bridge_orig"),
+            model_name  = model_name,
+            device      = "auto",
+            quantize    = config.get("openvla_quantize", False),
+        )
+    else:
+        from openvla_agent import OpenVLAStub
+        return OpenVLAStub(
+            obs_channels = config["obs_channels"],
+            obs_height   = config["obs_height"],
+            obs_width    = config["obs_width"],
+            action_dim   = config["action_dim"],
+            instruction  = config["openvla_instruction"],
+        )
 
 
 # ── Main ─────────────────────────────────────────────────────────────────── #
