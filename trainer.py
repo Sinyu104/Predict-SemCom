@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
 from models import (
@@ -299,6 +300,7 @@ class BaseTrainer:
             L_align = self.agent.task_loss_forward(y_align, actions_gt.to(y_align.device))
             return L_task, L_align
 
+        need_grad  = torch.is_grad_enabled()
         B          = y_rec.size(0)
         actions_gt = actions_gt.to(self.device)
         WB         = self.world_size * B
@@ -313,15 +315,26 @@ class BaseTrainer:
 
         # 2. Rank 0: single VLA forward+backward over combined batch (2*WB images)
         if self.rank == 0:
-            # Concatenate both groups; actions repeated for each group
-            all_y  = torch.cat(all_yrec_buf + all_yalign_buf, dim=0).requires_grad_(True)
-            all_a  = torch.cat(all_a_buf    + all_a_buf,      dim=0)
-            L_real = self.agent.task_loss_forward(all_y, all_a)
-            L_real.backward()
-            # task_loss_forward normalises by total batch (2*WB); ×2 restores
-            # the per-group gradient scale to match individual _task_loss calls.
-            grad_all     = all_y.grad.contiguous() * 2   # (2*WB, C, H, W)
-            loss_tensor  = (L_real.detach() * 2 / self.world_size).reshape(1)
+            all_y = torch.cat(all_yrec_buf + all_yalign_buf, dim=0)
+            all_a = torch.cat(all_a_buf    + all_a_buf,      dim=0)
+            if need_grad:
+                # enable_grad ensures the computation graph is built even if
+                # the caller context has grad disabled (e.g. during validation).
+                with torch.enable_grad():
+                    all_y.requires_grad_(True)
+                    L_real = self.agent.task_loss_forward(all_y, all_a)
+                    L_real.backward()
+                # task_loss_forward normalises by total batch (2*WB); ×2 restores
+                # the per-group gradient scale to match individual _task_loss calls.
+                grad_all    = all_y.grad.contiguous() * 2   # (2*WB, C, H, W)
+            else:
+                # Validation: only need the scalar, skip expensive backward pass.
+                with torch.no_grad():
+                    L_real = self.agent.task_loss_forward(all_y, all_a)
+                grad_all = torch.zeros(
+                    2 * WB, *y_rec.shape[1:], device=self.device
+                )
+            loss_tensor = (L_real.detach() * 2 / self.world_size).reshape(1)
         else:
             grad_all    = torch.empty(
                 2 * WB, *y_rec.shape[1:], device=self.device
@@ -332,11 +345,16 @@ class BaseTrainer:
         dist.broadcast(grad_all,    src=0)
         dist.broadcast(loss_tensor, src=0)
 
+        half_loss = loss_tensor.squeeze() / 2
+
+        if not need_grad:
+            # Validation: return plain scalars, no surrogate needed.
+            return half_loss, half_loss
+
         # 4. Split gradients: first WB rows → y_rec, last WB rows → y_align
         grad_rec   = grad_all[self.rank * B : (self.rank + 1) * B].detach()
         grad_align = grad_all[WB + self.rank * B : WB + (self.rank + 1) * B].detach()
 
-        half_loss   = loss_tensor.squeeze() / 2
         surr_rec    = (y_rec   * grad_rec).sum()
         surr_align  = (y_align * grad_align).sum()
         L_task  = surr_rec   - surr_rec.detach()   + half_loss
@@ -369,6 +387,26 @@ class BaseTrainer:
             for k, v in values.items():
                 self.writer.add_scalar(f"{tag}/{k}", v, step)
 
+    def _save_samples(self, tag: str, obs: torch.Tensor, y_rec: torch.Tensor,
+                      epoch: int, n: int = 8, suffix: str = "",
+                      tb_step: int | None = None):
+        """Save a side-by-side grid of input obs vs reconstructed y_rec."""
+        if not self.is_main:
+            return
+        obs   = obs[:n].detach().cpu().clamp(0, 1)
+        y_rec = y_rec[:n].detach().cpu().clamp(0, 1)
+        # interleave: obs_0, y_rec_0, obs_1, y_rec_1, ...
+        pairs = torch.stack([obs, y_rec], dim=1).flatten(0, 1)  # (2n, C, H, W)
+        grid  = make_grid(pairs, nrow=2, padding=2)
+
+        sample_dir = os.path.join(self.out_dir, "samples", tag)
+        os.makedirs(sample_dir, exist_ok=True)
+        save_image(grid, os.path.join(sample_dir, f"ep{epoch:04d}{suffix}.png"))
+
+        if self.writer is not None:
+            step = tb_step if tb_step is not None else epoch
+            self.writer.add_image(f"{tag}/obs_vs_yrec", grid, step)
+
 
 # ========================================================================== #
 #  Stage 1  —  VIB Encoder + Task-Oriented Reshaper                         #
@@ -381,10 +419,9 @@ class Stage1Trainer(BaseTrainer):
     Both Encoder and Reshaper are wrapped in DDP so their gradients are
     synchronised across the 4 T4 GPUs after each backward pass.
 
-    Loss (ATROC-style VIB, Eq. 17):
-        L = L_task(OpenVLA(Reshaper(z_received)), a_gt)   [distortion]
-          + beta1 * KL(q(z|x) || N(0,I))                 [rate]
-          + beta2 * L_task(OpenVLA(Reshaper(z_rec)), a_gt)[alignment]
+    Loss (VIB):
+        L = L_task(OpenVLA(Reshaper(z_rec)), a_gt)   [distortion]
+          + beta1 * KL(q(z|x) || N(0,I))             [rate]
     """
 
     def __init__(
@@ -411,7 +448,6 @@ class Stage1Trainer(BaseTrainer):
             self.optimizer, T_max=config["epochs"], eta_min=1e-6
         )
         self.beta1 = config.get("vib_beta1", 1.0)
-        self.beta2 = config.get("vib_beta2", 1.0)
 
     def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
         self.system.jscc_encoder.train(train)
@@ -419,8 +455,10 @@ class Stage1Trainer(BaseTrainer):
         if train and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
 
-        totals = {"task": 0.0, "kl": 0.0, "align": 0.0, "total": 0.0}
-        n = 0
+        totals    = {"task": 0.0, "kl": 0.0, "total": 0.0}
+        n         = 0
+        sample_obs   = None   # first-batch snapshots for visualisation
+        sample_y_rec = None
 
         phase = "train" if train else "val"
         pbar = tqdm(
@@ -446,10 +484,21 @@ class Stage1Trainer(BaseTrainer):
                     sample_z=train,
                 )
 
-                L_kl    = JsccEncoder.kl_loss(out["mu"], out["log_var"])
-                y_align = self._unwrap(self.system.reshaper)(out["z_rec"])
-                L_task, L_align = self._task_loss_pair(out["y_rec"], y_align, act_t)
-                loss    = L_task + self.beta1 * L_kl + self.beta2 * L_align
+                L_kl   = JsccEncoder.kl_loss(out["mu"], out["log_var"])
+                L_task = self._task_loss(out["y_rec"], act_t)
+                loss   = L_task + self.beta1 * L_kl
+
+                if sample_obs is None:
+                    sample_obs   = obs_t.detach()
+                    sample_y_rec = out["y_rec"].detach()
+
+                if train and n % 200 == 0:
+                    global_step = (epoch - 1) * len(loader) + n
+                    self._save_samples(
+                        "Stage1_train",
+                        obs_t.detach(), out["y_rec"].detach(),
+                        epoch, suffix=f"_b{n:05d}", tb_step=global_step,
+                    )
 
                 if train:
                     self.optimizer.zero_grad()
@@ -463,14 +512,12 @@ class Stage1Trainer(BaseTrainer):
 
                 totals["task"]  += L_task.item()
                 totals["kl"]    += L_kl.item()
-                totals["align"] += L_align.item()
                 totals["total"] += loss.item()
                 n += 1
 
                 pbar.set_postfix(
                     task=f"{L_task.item():.4f}",
                     kl=f"{L_kl.item():.4f}",
-                    align=f"{L_align.item():.4f}",
                     total=f"{loss.item():.4f}",
                 )
 
@@ -479,7 +526,7 @@ class Stage1Trainer(BaseTrainer):
         for k, v in totals.items():
             t = torch.tensor(v / max(n, 1), device=self.device)
             avg[k] = reduce_mean(t).item()
-        return avg
+        return avg, sample_obs, sample_y_rec
 
     def train(self):
         best   = math.inf
@@ -498,13 +545,15 @@ class Stage1Trainer(BaseTrainer):
             dynamic_ncols=True,
         )
         for ep in epoch_bar:
-            tr = self._run_epoch(self.train_loader, True,  ep)
-            vl = self._run_epoch(self.val_loader,   False, ep)
+            tr, t_obs, t_yrec = self._run_epoch(self.train_loader, True,  ep)
+            vl, v_obs, v_yrec = self._run_epoch(self.val_loader,   False, ep)
             self.scheduler.step()
 
             if self.is_main:
                 self._log("Stage1", {"train_" + k: v for k, v in tr.items()}, ep)
                 self._log("Stage1", {"val_"   + k: v for k, v in vl.items()}, ep)
+                self._save_samples("Stage1_train", t_obs, t_yrec, ep)
+                self._save_samples("Stage1_val",   v_obs, v_yrec, ep)
                 epoch_bar.set_postfix(
                     train=f"{tr['total']:.4f}",
                     val=f"{vl['total']:.4f}",
