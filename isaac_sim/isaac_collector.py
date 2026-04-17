@@ -311,6 +311,28 @@ class InterferenceInjector:
 
 
 # ========================================================================== #
+#  Helpers                                                                    #
+# ========================================================================== #
+
+def _float_to_uint8(arr: np.ndarray) -> np.ndarray:
+    """
+    Convert a float RGB/RGBA array to uint8 [0, 255] regardless of whether
+    the annotator returned values in [0, 1] or [0, 255].
+
+    Isaac Sim 4.x replicator returns float32 in [0, 255] range, NOT [0, 1].
+    Multiplying a [0, 255] float by 255 saturates everything → all-white frames.
+    This helper detects the actual range and scales only when necessary.
+    """
+    arr = arr.astype(np.float32)
+    if arr.max() > 1.0:
+        # Already in [0, 255] range — just cast, no scaling needed.
+        return arr.clip(0, 255).astype(np.uint8)
+    else:
+        # Normalised [0, 1] range — scale up.
+        return (arr * 255.0).clip(0, 255).astype(np.uint8)
+
+
+# ========================================================================== #
 #  Franka Scene                                                               #
 # ========================================================================== #
 
@@ -340,22 +362,27 @@ class FrankaScene:
     DIST_THRESHOLD  = 0.03    # metres — "close enough" to advance phase
 
     # Camera position and rotation read directly from the Isaac Sim viewport.
-    CAM_POS = (1.94813, 1.0027, 0.88385)   # (x, y, z) in metres
-    CAM_ROT = (66.05069, 0.0, 126.51205)   # Euler XYZ in degrees
+    CAM_POS = (2.39661, 0.46729, 1.05345)   # (x, y, z) in metres
+    CAM_ROT = (65.86584, 0.0, 104.8045)   # Euler XYZ in degrees
 
     def __init__(self):
         self.world = World(
             stage_units_in_meters=1.0,
-            physics_dt   = 1 / 120,
-            rendering_dt = 4 / 120,
+            physics_dt   = 1 / 120,   # 4 physics substeps per world.step() call
+            rendering_dt = 4 / 120,   # each world.step() = 4/120 s of sim time → 300 steps ≈ 10 s
         )
         self._build()
         self.world.reset()
 
+        print("[Isaac Sim] Warming up RTX Renderer and compiling shaders...")
+        for _ in range(100):
+            self.world.app.update()
+
         # Annotator is created once; render product is recreated in reset()
         # because world.reset() invalidates existing render products.
         self._rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-        self._render_product = None
+        self._render_product = rep.create.render_product(self._cam_path, (OBS_W, OBS_H))
+        self._rgb_annot.attach([self._render_product])
         self._obs_checked = False
 
         self.controller = RMPFlowController(
@@ -368,16 +395,21 @@ class FrankaScene:
         self._grasp_pos  = None  # EE position saved when entering Phase 2
 
     def _build(self):
+        # Use the default ground plane without repainting — the built-in
+        # Isaac Sim material composites cleanly with RTX in 5.1.
+        # UsdPreviewSurface overrides caused RTX compositing artefacts
+        # ("covered" overlay effect on captured frames).
         self.world.scene.add_default_ground_plane()
-        self._paint_ground(Gf.Vec3f(0.17, 0.42, 0.79))   # solid light blue
 
         from pxr import UsdLux
         stage = self.world.stage
+        # Isaac Sim 5.1 uses physical light units; 800/500 nits massively
+        # overexposes the scene. These values produce correct exposure.
         dome = UsdLux.DomeLight.Define(stage, "/World/Lights/Dome")
-        dome.CreateIntensityAttr(800.0)
+        dome.CreateIntensityAttr(300.0)
         dome.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
         distant = UsdLux.DistantLight.Define(stage, "/World/Lights/Sun")
-        distant.CreateIntensityAttr(500.0)
+        distant.CreateIntensityAttr(250.0)
         distant.CreateAngleAttr(0.53)
         distant.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 5.0))
 
@@ -479,36 +511,52 @@ class FrankaScene:
     def reset(self, randomise: bool = True):
         self.world.reset()
         # Re-attach the render product every time — world.reset() invalidates it.
-        self._attach_render_product()
+        # self._attach_render_product()
 
         self.controller.reset()
         self._phase      = 0
         self._grip_timer = 0
         self._grasp_pos  = None
         if randomise:
-            x = np.random.uniform(*self.CUBE_X_RANGE)
-            y = np.random.uniform(*self.CUBE_Y_RANGE)
+            MIN_CUBE_DIST = 0.12  # metres — minimum separation between cube centres
+            def _sample():
+                return np.array([
+                    np.random.uniform(*self.CUBE_X_RANGE),
+                    np.random.uniform(*self.CUBE_Y_RANGE),
+                ])
+            def _too_close(positions):
+                for i in range(len(positions)):
+                    for j in range(i + 1, len(positions)):
+                        if np.linalg.norm(positions[i] - positions[j]) < MIN_CUBE_DIST:
+                            return True
+                return False
+
+            while True:
+                positions = [_sample(), _sample(), _sample()]
+                if not _too_close(positions):
+                    break
+
+            x, y   = positions[0]
+            xb, yb = positions[1]
+            xy, yy = positions[2]
             self.cube.set_world_pose(
                 position=np.array([x, y, self.CUBE_INIT[2]])
             )
-            xb = np.random.uniform(*self.CUBE_X_RANGE)
-            yb = np.random.uniform(*self.CUBE_Y_RANGE)
             self.cube_blue.set_world_pose(
                 position=np.array([xb, yb, self.CUBE_INIT[2]])
             )
-            xy = np.random.uniform(*self.CUBE_X_RANGE)
-            yy = np.random.uniform(*self.CUBE_Y_RANGE)
             self.cube_yellow.set_world_pose(
                 position=np.array([xy, yy, self.CUBE_INIT[2]])
             )
 
         # Warm-up: settle physics and prime the annotator buffer.
-        # 30 render steps are enough for the RTX pipeline to fully stabilise;
-        # the extra get_obs() call flushes any residual stale frame so that
-        # the very first observation in the episode is guaranteed non-black.
-        for _ in range(30):
-            self.world.step(render=True)
-        self.get_obs()   # discard — just flushes the annotator
+        # 60 steps ensures the RTX pipeline is fully initialised after the
+        # render product is recreated (first ~10 frames are often black).
+        # Use rep.orchestrator.step() so the same code-path as the collection
+        # loop drives app.update() — avoids double-stepping artefacts.
+        for _ in range(10):
+            rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
+        self.get_obs()   # discard — flush any residual stale frame
 
     def get_obs(self) -> np.ndarray:
         """Return (OBS_H, OBS_W, 3) uint8 RGB frame via replicator annotator."""
@@ -548,8 +596,8 @@ class FrankaScene:
                 arr = arr.reshape(OBS_H, OBS_W, 4)
             elif arr.size == OBS_H * OBS_W * 3:
                 arr = arr.reshape(OBS_H, OBS_W, 3)
-                return arr.astype(np.uint8) if arr.dtype == np.uint8 \
-                    else (arr * 255).clip(0, 255).astype(np.uint8)
+                return arr if arr.dtype == np.uint8 \
+                    else _float_to_uint8(arr)
             else:
                 print(f"[Camera] unexpected flat size {arr.size}; returning zeros")
                 return np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
@@ -560,7 +608,11 @@ class FrankaScene:
             rgb = arr  # already RGB
 
         if rgb.dtype != np.uint8:
-            rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+            rgb = _float_to_uint8(rgb)
+        
+        if rgb.max() == 0:
+            print("[Error] Got black frame.")
+
         return rgb
 
     def apply_action(self, action: np.ndarray):
@@ -578,10 +630,29 @@ class FrankaScene:
         self._set_gripper(open_gripper=float(action[6]) > 0.0)
 
     def step(self):
-        # render=True drives the RTX viewport renderer each physics step.
-        # In non-headless mode this fills the GPU frame buffer and the replicator
-        # annotator (rgb) can then read the result via get_data().
-        self.world.step(render=True)
+        # Do NOT call world.step() here.  world.step(render=True) calls
+        # app.update() internally, which fires the orchestrator tick and
+        # records the new sim-time into _sim_times_to_write.  If
+        # rep.orchestrator.step() is then called, it sees that sim-time
+        # already in the queue and loops until the NEXT sim-time is written,
+        # causing double-stepping (physics advances twice per collection step).
+        #
+        # rep.orchestrator.step() drives physics through its own app.update()
+        # loop, so world.step() is redundant here.
+        #
+        # rt_subframes=4 — render four sub-passes before the annotator writes.
+        #   RTX RayTracedLighting starts with a grey/cleared buffer on each
+        #   new frame.  With rt_subframes=1 the first pass may not be complete
+        #   when get_data() is called.  4 sub-passes give the pipeline enough
+        #   time to converge to a clean frame (timeline is paused during
+        #   sub-passes so physics does not advance).
+        #
+        # pause_timeline=False — allow the simulation timeline to keep running
+        #   between full frames (physics is not frozen between steps).
+        #
+        # wait_for_render=True (default) — block until PostProcessDispatcher
+        #   confirms the annotator buffer has been written for this sim-time.
+        rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
 
     def _set_gripper(self, open_gripper: bool) -> None:
         """Set finger joints via a dedicated ArticulationAction with joint_indices.
@@ -788,7 +859,7 @@ def collect(args):
     # Success threshold: cube must be within this XY distance of GOAL_POS
     # and below this height (resting on tray, not hovering).
     SUCCESS_XY_THRESH = 0.10   # metres
-    SUCCESS_Z_MAX     = 0.07   # metres (tray top ≈ 0.004 + cube half-height 0.025)
+    SUCCESS_Z_MAX     = 0.035   # metres (tray top ≈ 0.004 + cube half-height 0.025)
 
     def is_success() -> bool:
         cube_pos, _ = scene.cube.get_world_pose()
@@ -807,14 +878,14 @@ def collect(args):
         act_buf  = []
         success  = False
 
-        for step in range(args.episode_length):
-            # Capture observation BEFORE action
-            obs_t = scene.get_obs()                         # (H, W, 3) uint8
+        # Read the first observation after warmup — the buffer is freshly
+        # written by the last warmup render, so this is guaranteed valid.
+        obs_t = scene.get_obs()
 
+        for step in range(args.episode_length):
+            # obs_t was captured right after the previous scene.step() (or
+            # after warmup for step 0), so the render was already complete.
             if args.scripted:
-                # _compute_rmpflow_action computes the target, applies it via
-                # art_ctrl internally, and returns the (7,) action for HDF5.
-                # Do NOT call scene.apply_action() again — that would double-apply.
                 action = scene._compute_rmpflow_action()
             else:
                 t_req  = time.perf_counter()
@@ -831,7 +902,13 @@ def collect(args):
             obs_buf.append(obs_t)
             act_buf.append(action)
 
+            # Step physics and render the new state, then immediately read
+            # the annotator — get_obs() now always follows scene.step() so
+            # the buffer is written before we read it.
+            
             scene.step()
+            obs_t = scene.get_obs()
+            
 
             # Check success after physics settles each step
             if is_success():
