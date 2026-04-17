@@ -131,7 +131,13 @@ class OpenVLAServer:
                 base_model_id, trust_remote_code=True
             )
             base = AutoModelForVision2Seq.from_pretrained(base_model_id, **load_kwargs)
-            self.model = PeftModel.from_pretrained(base, model_dir)
+            peft_model = PeftModel.from_pretrained(base, model_dir)
+            # Merge LoRA weights into the base model and discard the adapter
+            # structure.  This eliminates device mismatches that arise when
+            # device_map="auto" places base-layer tensors on one GPU and the
+            # separately-loaded LoRA A/B matrices on another.
+            print("[VLAServer] Merging LoRA weights into base model …")
+            self.model = peft_model.merge_and_unload()
         else:
             self.processor = AutoProcessor.from_pretrained(
                 model_dir, trust_remote_code=True
@@ -167,6 +173,47 @@ class OpenVLAServer:
             for i in range(n_gpus):
                 mem = torch.cuda.get_device_properties(i).total_memory / 1e9
                 print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({mem:.1f} GB)")
+        # Build action tokenizer using the same processor.tokenizer used during
+        # fine-tuning so that token ID ↔ bin mapping is identical at inference.
+        self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
+        self._debug_first_call = True   # print full debug on the first request only
+
+        # ── Checkpoint verification ───────────────────────────────────── #
+        # 1. Confirm which file(s) were actually loaded
+        print(f"[VLAServer] model_dir resolved to: '{model_dir}'")
+        if os.path.isfile(os.path.join(model_dir, "adapter_config.json")):
+            # List LoRA weight files so we can confirm they are non-empty
+            lora_files = [
+                f for f in os.listdir(model_dir)
+                if f.endswith(".bin") or f.endswith(".safetensors")
+            ]
+            total_bytes = sum(
+                os.path.getsize(os.path.join(model_dir, f)) for f in lora_files
+            )
+            print(f"[VLAServer] LoRA adapter files : {lora_files}")
+            print(f"[VLAServer] LoRA total size    : {total_bytes / 1e6:.1f} MB")
+        else:
+            cfg_path = os.path.join(model_dir, "config.json")
+            print(f"[VLAServer] Full model config  : {cfg_path}  "
+                  f"(exists={os.path.isfile(cfg_path)})")
+
+        # 2. Show action token ID range — must match what finetune used
+        at = self.action_tokenizer
+        print(f"[VLAServer] ActionTokenizer: vocab={len(self.processor.tokenizer)} "
+              f"| action_token_ids[0]={at.action_token_ids[0]} "
+              f"… [{at.n_bins-1}]={at.action_token_ids[-1]}")
+
+        # 3. Round-trip sanity check: encode a known action, decode it back
+        _test_action = np.array([0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        _test_ids    = at(_test_action)
+        _token_to_bin = {int(tid): i for i, tid in enumerate(at.action_token_ids)}
+        _bin_idx  = np.array([_token_to_bin[tid] for tid in _test_ids])
+        _centers  = (at.bin_edges[:-1] + at.bin_edges[1:]) / 2.0
+        _decoded  = _centers[_bin_idx]
+        print(f"[VLAServer] Round-trip check:")
+        print(f"  original : {_test_action.tolist()}")
+        print(f"  token_ids: {_test_ids}")
+        print(f"  decoded  : {_decoded.tolist()}")
         print("[VLAServer] Model loaded and frozen.")
 
     @__import__("torch").inference_mode()
@@ -178,23 +225,78 @@ class OpenVLAServer:
         """
         Run OpenVLA inference on a single RGB frame.
 
+        Uses the same ActionTokenizer that was used during fine-tuning to
+        decode generated token IDs back to continuous actions, guaranteeing
+        that the token ID ↔ bin mapping is identical between training and
+        inference.  Calling model.predict_action() instead would use OpenVLA's
+        internal decoder, which may differ from our custom ActionTokenizer.
+
         Returns
         -------
         list of 7 floats: [x, y, z, rx, ry, rz, gripper]
         """
+        import torch
+
         pil_img = Image.fromarray(obs_rgb)
         prompt  = f"In: What action should the robot take to {instruction}?\nOut:"
 
-        inputs  = self.processor(prompt, pil_img).to(
+        inputs = self.processor(prompt, pil_img, return_tensors="pt").to(
             "cuda:0",
-            dtype=__import__("torch").float16,
+            dtype=torch.float16,
         )
-        action_np = self.model.predict_action(
+
+        # Generate exactly 7 action tokens
+        generated = self.model.generate(
             **inputs,
-            unnorm_key=self.unnorm_key,
+            max_new_tokens=7,
             do_sample=False,
         )
-        return action_np.tolist()   # list of 7 Python floats
+
+        # The last 7 token IDs in the output are the action tokens
+        action_token_ids = generated[0, -7:].cpu().numpy()
+
+        # Map token IDs → bin indices (inverse of ActionTokenizer.__call__)
+        token_to_bin = {
+            int(tid): i
+            for i, tid in enumerate(self.action_tokenizer.action_token_ids)
+        }
+        unknown_ids = [int(tid) for tid in action_token_ids if int(tid) not in token_to_bin]
+        bin_indices = np.array([
+            token_to_bin.get(int(tid), self.action_tokenizer.n_bins // 2)
+            for tid in action_token_ids
+        ])
+
+        # Map bin indices → continuous values via bin centres
+        bin_centers = (
+            self.action_tokenizer.bin_edges[:-1]
+            + self.action_tokenizer.bin_edges[1:]
+        ) / 2.0
+        actions = bin_centers[bin_indices]
+
+        # ── First-call debug dump ─────────────────────────────────────── #
+        if self._debug_first_call:
+            self._debug_first_call = False
+            print("\n[VLAServer] ── FIRST INFERENCE DEBUG ──────────────────────")
+            print(f"  prompt              : {prompt!r}")
+            print(f"  input_ids shape     : {inputs['input_ids'].shape}")
+            print(f"Min: {inputs['input_ids'].min().item()}")
+            print(f"Max: {inputs['input_ids'].max().item()}")
+            print(f"Avg: {inputs['input_ids'].float().mean().item():.2f}")
+            print(f"  generated shape     : {generated.shape}")
+            print(f"  raw generated ids   : {generated[0].tolist()}")
+            print(f"  action token ids    : {action_token_ids.tolist()}")
+            print(f"  valid action range  : [{self.action_tokenizer.action_token_ids[0]}"
+                  f" … {self.action_tokenizer.action_token_ids[-1]}]")
+            if unknown_ids:
+                print(f"  WARNING unknown ids : {unknown_ids}  "
+                      f"(model generated non-action tokens — mapped to bin 128 / value ~0)")
+            else:
+                print(f"  all token ids are valid action tokens")
+            print(f"  bin_indices         : {bin_indices.tolist()}")
+            print(f"  decoded actions     : {actions.tolist()}")
+            print("[VLAServer] ────────────────────────────────────────────────\n")
+
+        return actions.tolist()   # list of 7 Python floats
 
 
 # ========================================================================== #
@@ -270,32 +372,67 @@ def finetune_openvla(args):
     except ImportError:
         raise ImportError("Install peft: pip install peft accelerate")
 
-    print(f"\n[finetune] Base model : {args.model_dir}")
+    # ── Resolve start epoch when resuming ────────────────────────────── #
+    import re
+    start_epoch = 0
+    if args.resume_from:
+        basename = os.path.basename(args.resume_from.rstrip("/"))
+        m = re.match(r"checkpoint_epoch(\d+)$", basename)
+        if m:
+            start_epoch = int(m.group(1))
+        else:
+            raise ValueError(
+                f"--resume_from path must end with 'checkpoint_epochN', "
+                f"got: {args.resume_from!r}"
+            )
+        print(f"\n[finetune] Resuming from  : {args.resume_from}  (epoch {start_epoch})")
+    else:
+        print(f"\n[finetune] Base model : {args.model_dir}")
+
     print(f"[finetune] Demo data  : {args.demo_data}")
     print(f"[finetune] Output     : {args.finetune_output}")
 
-    processor = AutoProcessor.from_pretrained(
-        args.model_dir, trust_remote_code=True
-    )
-    model = AutoModelForVision2Seq.from_pretrained(
-        args.model_dir,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-        device_map="auto",
-    )
+    if args.resume_from:
+        # Load base model, then restore the LoRA adapter from the checkpoint.
+        from peft import PeftModel
+        from peft import LoraConfig as _LC  # noqa — keep import happy
+        with open(os.path.join(args.resume_from, "adapter_config.json")) as _f:
+            _adapter_cfg = json.load(_f)
+        _base_id = _adapter_cfg["base_model_name_or_path"]
+        print(f"[finetune] Base model (from adapter config): {_base_id}")
+        processor = AutoProcessor.from_pretrained(_base_id, trust_remote_code=True)
+        _base = AutoModelForVision2Seq.from_pretrained(
+            _base_id,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="auto",
+        )
+        model = PeftModel.from_pretrained(_base, args.resume_from, is_trainable=True)
+    else:
+        processor = AutoProcessor.from_pretrained(
+            args.model_dir, trust_remote_code=True
+        )
+        model = AutoModelForVision2Seq.from_pretrained(
+            args.model_dir,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="auto",
+        )
 
-    # Apply LoRA — only the language backbone attention layers are tuned.
-    # Vision encoder weights are left frozen for stability.
-    lora_cfg = LoraConfig(
-        r             = args.lora_rank,
-        lora_alpha    = args.lora_rank * 2,
-        target_modules= ["q_proj", "k_proj"],
-        lora_dropout  = 0.05,
-        bias          = "none",
-        task_type     = TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_cfg)
+        # Apply LoRA — only the language backbone attention layers are tuned.
+        # Vision encoder weights are left frozen for stability.
+        lora_cfg = LoraConfig(
+            r             = args.lora_rank,
+            lora_alpha    = args.lora_rank * 2,
+            target_modules= ["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout  = 0.05,
+            bias          = "none",
+            task_type     = TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(model, lora_cfg)
+
     model.print_trainable_parameters()
 
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -306,8 +443,9 @@ def finetune_openvla(args):
 
     # ── Demo dataset ─────────────────────────────────────────────────── #
     class DemoDataset(TorchDataset):
-        def __init__(self, path: str):
+        def __init__(self, path: str, frame_stride: int = 1):
             self.samples = []
+            n_eps = 0
             with h5py.File(path, "r") as f:
                 for ep_key in sorted(f.keys()):
                     grp = f[ep_key]
@@ -315,27 +453,44 @@ def finetune_openvla(args):
                         continue
                     obs  = np.array(grp["observations"])   # (T, H, W, 3)
                     acts = np.array(grp["actions"])         # (T, 7)
-                    for t in range(len(obs) - 1):
+                    for t in range(0, len(obs) - 1, frame_stride):
                         self.samples.append((obs[t], acts[t].astype(np.float32)))
+                    n_eps += 1
+            print(f"[finetune] {n_eps} episodes → {len(self.samples)} samples "
+                  f"(stride={frame_stride})")
 
         def __len__(self): return len(self.samples)
 
         def __getitem__(self, idx):
             return self.samples[idx]
 
-    dataset = DemoDataset(args.demo_data)
+    dataset = DemoDataset(args.demo_data, frame_stride=args.frame_stride)
     loader  = DataLoader(
         dataset, batch_size=args.finetune_batch_size,
         shuffle=True, num_workers=0, drop_last=True,
     )
     print(f"[finetune] {len(dataset)} demonstration steps")
 
+    total_epochs = start_epoch + args.finetune_epochs
+
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.finetune_lr,
     )
     from torch.optim.lr_scheduler import CosineAnnealingLR
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.finetune_epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+
+    # Restore optimizer / scheduler state when resuming
+    if args.resume_from:
+        train_state_path = os.path.join(args.resume_from, "training_state.pt")
+        if os.path.isfile(train_state_path):
+            state = torch.load(train_state_path, map_location="cpu")
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            print(f"[finetune] Restored optimizer + scheduler from {train_state_path}")
+        else:
+            print(f"[finetune] No training_state.pt found in {args.resume_from}; "
+                  f"optimizer/scheduler start fresh (LR may differ slightly).")
 
     from tqdm import tqdm
 
@@ -344,7 +499,7 @@ def finetune_openvla(args):
     )
     model.train()
 
-    epoch_bar = tqdm(range(args.finetune_epochs), desc="Epochs", unit="epoch")
+    epoch_bar = tqdm(range(start_epoch, total_epochs), desc="Epochs", unit="epoch")
     for ep in epoch_bar:
         total_loss = 0.0
         n_steps    = 0
@@ -354,48 +509,49 @@ def finetune_openvla(args):
         for obs_batch, act_batch in step_bar:
             # obs_batch: (B, H, W, 3) uint8
             B = obs_batch.shape[0]
-            batch_loss = torch.tensor(0.0, device="cuda:0")
 
+            # Build all PIL images for the batch
+            pil_imgs = []
             for i in range(B):
-                pil_img = Image.fromarray(obs_batch[i].numpy())
-                inputs  = processor(
-                    prompt_tpl, pil_img, return_tensors="pt"
-                ).to("cuda:0", dtype=torch.float16)
+                pil_imgs.append(Image.fromarray(obs_batch[i].numpy()))
 
-                # Encode ground-truth action as token IDs
-                act_np     = act_batch[i].numpy()
-                token_ids  = action_tokenizer(act_np)
-                action_ids = torch.tensor(
-                    token_ids, dtype=torch.long, device="cuda:0"
-                ).unsqueeze(0)
+            # Single batched processor call instead of B individual calls
+            inputs = processor(
+                [prompt_tpl] * B, pil_imgs, return_tensors="pt", padding=True
+            ).to("cuda:0", dtype=torch.float16)
 
-                # Causal LM loss requires labels == input_ids length.
-                # Append action tokens to input_ids; mask the prompt with -100.
-                prompt_len     = inputs["input_ids"].shape[1]
-                action_len     = action_ids.shape[1]
-                full_input_ids = torch.cat(
-                    [inputs["input_ids"].to("cuda:0"), action_ids], dim=1
-                )
-                labels = torch.cat([
-                    torch.full((1, prompt_len), -100, dtype=torch.long, device="cuda:0"),
-                    action_ids,
-                ], dim=1)
-                full_attn_mask = torch.cat([
-                    inputs["attention_mask"].to("cuda:0"),
-                    torch.ones(1, action_len, dtype=inputs["attention_mask"].dtype, device="cuda:0"),
-                ], dim=1)
+            # Encode ground-truth actions as token IDs — (B, 7)
+            act_np     = act_batch.numpy()                        # (B, 7)
+            token_ids  = np.stack([action_tokenizer(act_np[i]) for i in range(B)])
+            action_ids = torch.tensor(token_ids, dtype=torch.long, device="cuda:0")
 
-                forward_inputs = {
-                    k: v for k, v in inputs.items()
-                    if k not in ("input_ids", "attention_mask")
-                }
-                forward_inputs["input_ids"]      = full_input_ids
-                forward_inputs["attention_mask"] = full_attn_mask
+            # Append action tokens to input_ids; mask prompt positions with -100
+            prompt_len     = inputs["input_ids"].shape[1]
+            action_len     = action_ids.shape[1]                  # always 7
+            full_input_ids = torch.cat(
+                [inputs["input_ids"], action_ids], dim=1
+            )
+            labels = torch.cat([
+                torch.full((B, prompt_len), -100, dtype=torch.long, device="cuda:0"),
+                action_ids,
+            ], dim=1)
+            full_attn_mask = torch.cat([
+                inputs["attention_mask"],
+                torch.ones(B, action_len, dtype=inputs["attention_mask"].dtype,
+                           device="cuda:0"),
+            ], dim=1)
 
-                outputs    = model(**forward_inputs, labels=labels)
-                batch_loss = batch_loss + outputs.loss
+            forward_inputs = {
+                k: v for k, v in inputs.items()
+                if k not in ("input_ids", "attention_mask")
+            }
+            forward_inputs["input_ids"]      = full_input_ids
+            forward_inputs["attention_mask"] = full_attn_mask
 
-            batch_loss = batch_loss / B
+            # Single forward pass for the whole batch
+            outputs    = model(**forward_inputs, labels=labels)
+            batch_loss = outputs.loss   # already averaged over B by the model
+
             optimizer.zero_grad()
             batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -410,16 +566,23 @@ def finetune_openvla(args):
         avg = total_loss / max(n_steps, 1)
         scheduler.step()
         epoch_bar.set_postfix(avg_loss=f"{avg:.4f}")
-        print(f"[finetune] Epoch {ep+1}/{args.finetune_epochs}  loss={avg:.4f}")
+        print(f"[finetune] Epoch {ep+1}/{total_epochs}  loss={avg:.4f}")
 
         # Save checkpoint for this epoch, then delete the previous one
         ckpt_dir = os.path.join(args.finetune_output, f"checkpoint_epoch{ep+1}")
         os.makedirs(ckpt_dir, exist_ok=True)
         model.save_pretrained(ckpt_dir)
         processor.save_pretrained(ckpt_dir)
+        # Save optimizer + scheduler so training can be resumed from this checkpoint
+        torch.save(
+            {"optimizer": optimizer.state_dict(),
+             "scheduler": scheduler.state_dict(),
+             "epoch": ep + 1},
+            os.path.join(ckpt_dir, "training_state.pt"),
+        )
         print(f"[finetune] Checkpoint saved → {ckpt_dir}")
 
-        if ep > 0:
+        if ep > start_epoch:
             prev_ckpt = os.path.join(args.finetune_output, f"checkpoint_epoch{ep}")
             if os.path.isdir(prev_ckpt):
                 import shutil
@@ -428,7 +591,7 @@ def finetune_openvla(args):
 
     # Copy the final checkpoint to the output root for easy loading
     os.makedirs(args.finetune_output, exist_ok=True)
-    final_ckpt = os.path.join(args.finetune_output, f"checkpoint_epoch{args.finetune_epochs}")
+    final_ckpt = os.path.join(args.finetune_output, f"checkpoint_epoch{total_epochs}")
     model.save_pretrained(args.finetune_output)
     processor.save_pretrained(args.finetune_output)
 
@@ -643,6 +806,15 @@ def parse_args():
     p.add_argument("--finetune_lr",        type=float, default=2e-5)
     p.add_argument("--finetune_batch_size",type=int,   default=4)
     p.add_argument("--lora_rank",          type=int,   default=32)
+    p.add_argument("--frame_stride",       type=int,   default=1,
+                   help="Use every Nth frame per episode (e.g. 3 = 3x fewer samples, "
+                        "3x faster training). Adjacent frames are nearly identical "
+                        "so stride=3-5 loses little information.")
+    p.add_argument("--resume_from",        type=str,   default=None,
+                   help="Path to a checkpoint_epochN directory to resume training "
+                        "from (e.g. outputs/openvla_finetuned_v2/checkpoint_epoch6). "
+                        "The LoRA adapter and optimizer/scheduler state are restored "
+                        "and epoch numbering continues from N.")
 
     return p.parse_args()
 
