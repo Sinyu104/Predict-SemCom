@@ -383,6 +383,19 @@ class BaseTrainer:
             print(f"  [ckpt] Loaded ← {path}")
         return ckpt
 
+    def _load_resume(self, path: str) -> tuple[int, float]:
+        """Restore full training state for resuming. Returns (start_epoch, best)."""
+        ckpt = self.load_checkpoint(path)
+        if "optimizer_state" in ckpt and hasattr(self, "optimizer"):
+            self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scheduler_state" in ckpt and hasattr(self, "scheduler"):
+            self.scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best        = ckpt.get("best",  math.inf)
+        if self.is_main:
+            print(f"  [ckpt] Resuming from epoch {start_epoch}  best={best:.4f}")
+        return start_epoch, best
+
     def _log(self, tag: str, values: dict, step: int):
         if self.is_main and self.writer is not None:
             for k, v in values.items():
@@ -427,12 +440,13 @@ class Stage1Trainer(BaseTrainer):
 
     def __init__(
         self,
-        config:     dict,
-        data_path:  str,
-        device:     torch.device,
+        config:      dict,
+        data_path:   str,
+        device:      torch.device,
         agent,
-        rank:       int,
-        world_size: int,
+        rank:        int,
+        world_size:  int,
+        resume_ckpt: str | None = None,
     ):
         super().__init__(config, data_path, device, agent, rank, world_size)
 
@@ -449,10 +463,15 @@ class Stage1Trainer(BaseTrainer):
             self.optimizer, T_max=config["epochs"], eta_min=1e-6
         )
         self.beta1              = config.get("vib_beta1",          1.0)
-        self.l1_weight          = config.get("l1_weight",          5.0)
+        self.l1_weight          = config.get("l1_weight",          10.0)
         self.l1_anneal_epochs   = config.get("l1_anneal_epochs",   2)
         self.task_weight        = config.get("task_weight",        1.0)
         self.task_anneal_epochs = config.get("task_anneal_epochs", 2)
+
+        self.start_epoch = 1
+        self.best        = math.inf
+        if resume_ckpt:
+            self.start_epoch, self.best = self._load_resume(resume_ckpt)
 
     def _run_epoch(self, loader, train: bool, epoch: int, l1_w: float = 0.0, task_w: float = 1.0) -> dict:
         self.system.jscc_encoder.train(train)
@@ -537,7 +556,7 @@ class Stage1Trainer(BaseTrainer):
         return avg, sample_obs, sample_y_rec
 
     def train(self):
-        best   = math.inf
+        best   = self.best
         epochs = self.config["epochs"]
         if self.is_main:
             print(f"\n[Stage1] VIB training for {epochs} epochs on "
@@ -547,7 +566,7 @@ class Stage1Trainer(BaseTrainer):
                   f"{self.config['batch_size'] * self.world_size}")
 
         epoch_bar = tqdm(
-            range(1, epochs + 1),
+            range(self.start_epoch, epochs + 1),
             desc="[Stage1]",
             disable=not self.is_main,
             dynamic_ncols=True,
@@ -577,9 +596,18 @@ class Stage1Trainer(BaseTrainer):
                 )
                 if vl["total"] < best:
                     best = vl["total"]
-                    self.save_checkpoint("stage1_best.pt", {"epoch": ep, **vl})
+                    self.save_checkpoint("stage1_best.pt", {
+                        "epoch": ep, "best": best,
+                        "optimizer_state": self.optimizer.state_dict(),
+                        "scheduler_state": self.scheduler.state_dict(),
+                        **vl,
+                    })
 
-        self.save_checkpoint("stage1_final.pt")
+        self.save_checkpoint("stage1_final.pt", {
+            "epoch": epochs, "best": best,
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+        })
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
@@ -611,6 +639,7 @@ class Stage2Trainer(BaseTrainer):
         agent,
         rank:         int,
         world_size:   int,
+        resume_ckpt:  str | None = None,
     ):
         super().__init__(config, data_path, device, agent, rank, world_size)
         self.load_checkpoint(stage1_ckpt)
@@ -631,6 +660,11 @@ class Stage2Trainer(BaseTrainer):
         )
         self.alpha = config.get("pred_alpha", 0.5)
         self.beta  = config.get("pred_beta",  0.1)
+
+        self.start_epoch = 1
+        self.best        = math.inf
+        if resume_ckpt:
+            self.start_epoch, self.best = self._load_resume(resume_ckpt)
 
     def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
         self._unwrap(self.system.predictor).train(train)
@@ -710,13 +744,13 @@ class Stage2Trainer(BaseTrainer):
         return avg
 
     def train(self):
-        best   = math.inf
+        best   = self.best
         epochs = self.config["epochs"]
         if self.is_main:
             print(f"\n[Stage2] Predictor training for {epochs} epochs on "
                   f"{self.world_size} GPU(s) …")
 
-        for ep in range(1, epochs + 1):
+        for ep in range(self.start_epoch, epochs + 1):
             tr = self._run_epoch(self.train_loader, True,  ep)
             vl = self._run_epoch(self.val_loader,   False, ep)
             self.scheduler.step()
@@ -731,9 +765,18 @@ class Stage2Trainer(BaseTrainer):
                 )
                 if vl["total"] < best:
                     best = vl["total"]
-                    self.save_checkpoint("stage2_best.pt", {"epoch": ep, **vl})
+                    self.save_checkpoint("stage2_best.pt", {
+                        "epoch": ep, "best": best,
+                        "optimizer_state": self.optimizer.state_dict(),
+                        "scheduler_state": self.scheduler.state_dict(),
+                        **vl,
+                    })
 
-        self.save_checkpoint("stage2_final.pt")
+        self.save_checkpoint("stage2_final.pt", {
+            "epoch": epochs, "best": best,
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+        })
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
@@ -761,6 +804,7 @@ class Stage3Trainer(BaseTrainer):
         agent,
         rank:        int,
         world_size:  int,
+        resume_ckpt: str | None = None,
     ):
         super().__init__(config, data_path, device, agent, rank, world_size)
 
@@ -785,6 +829,20 @@ class Stage3Trainer(BaseTrainer):
         self.temperature = config.get("tau_temperature", 1.0)
         self.anneal_rate = config.get("tau_anneal_rate", 0.95)
         self.min_temp    = config.get("tau_min_temp",    0.05)
+
+        self.start_epoch   = 1
+        self.best          = math.inf
+        self.start_temp    = self.temperature
+        if resume_ckpt:
+            ckpt = self.load_checkpoint(resume_ckpt)
+            if "optimizer_state" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer_state"])
+            self.start_epoch = ckpt.get("epoch", 0) + 1
+            self.best        = ckpt.get("best",  math.inf)
+            self.start_temp  = ckpt.get("temperature", self.temperature)
+            if self.is_main:
+                print(f"  [ckpt] Resuming from epoch {self.start_epoch}  "
+                      f"best={self.best:.4f}  T={self.start_temp:.4f}")
 
     def _run_epoch(self, loader, train: bool, T: float) -> dict:
         self.system.train(train)
@@ -836,14 +894,14 @@ class Stage3Trainer(BaseTrainer):
         return avg
 
     def train(self):
-        best   = math.inf
+        best   = self.best
         epochs = self.config["epochs"]
-        T      = self.temperature
+        T      = self.start_temp
         if self.is_main:
             print(f"\n[Stage3] Learned tau for {epochs} epochs  "
                   f"lambda={self.lam}  T0={T}")
 
-        for ep in range(1, epochs + 1):
+        for ep in range(self.start_epoch, epochs + 1):
             T  = max(T * self.anneal_rate, self.min_temp)
             tr = self._run_epoch(self.train_loader, True,  T)
             vl = self._run_epoch(self.val_loader,   False, T)
@@ -862,9 +920,16 @@ class Stage3Trainer(BaseTrainer):
                 )
                 if vl["total"] < best:
                     best = vl["total"]
-                    self.save_checkpoint("stage3_best.pt", {"epoch": ep, **vl})
+                    self.save_checkpoint("stage3_best.pt", {
+                        "epoch": ep, "best": best, "temperature": T,
+                        "optimizer_state": self.optimizer.state_dict(),
+                        **vl,
+                    })
 
-        self.save_checkpoint("stage3_final.pt")
+        self.save_checkpoint("stage3_final.pt", {
+            "epoch": epochs, "best": best, "temperature": T,
+            "optimizer_state": self.optimizer.state_dict(),
+        })
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
