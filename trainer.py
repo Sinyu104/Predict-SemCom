@@ -234,7 +234,7 @@ class BaseTrainer:
         return module.module if isinstance(module, DDP) else module
 
     def _task_loss(
-        self, y_rec: torch.Tensor, actions_gt: torch.Tensor
+        self, y_rec: torch.Tensor, actions_gt: torch.Tensor, training: bool = True
     ) -> torch.Tensor:
         """
         Compute task loss using the real OpenVLA on rank 0 only.
@@ -248,6 +248,22 @@ class BaseTrainer:
             return self.agent.task_loss_forward(
                 y_rec, actions_gt.to(y_rec.device)
             )
+
+        if not training:
+            # Validation: just compute the scalar loss on rank 0, no backward needed.
+            all_y_buf = [torch.empty_like(y_rec)      for _ in range(self.world_size)]
+            all_a_buf = [torch.empty_like(actions_gt) for _ in range(self.world_size)]
+            dist.all_gather(all_y_buf, y_rec.detach())
+            dist.all_gather(all_a_buf, actions_gt.detach())
+            if self.rank == 0:
+                all_y = torch.cat(all_y_buf, dim=0)
+                all_a = torch.cat(all_a_buf, dim=0)
+                with torch.no_grad():
+                    loss_tensor = (self.agent.task_loss_forward(all_y, all_a).detach() / self.world_size).reshape(1)
+            else:
+                loss_tensor = torch.zeros(1, device=self.device)
+            dist.broadcast(loss_tensor, src=0)
+            return loss_tensor.squeeze()
 
         B          = y_rec.size(0)
         actions_gt = actions_gt.to(self.device)
@@ -464,9 +480,9 @@ class Stage1Trainer(BaseTrainer):
         )
         self.beta1              = config.get("vib_beta1",          1.0)
         self.l1_weight          = config.get("l1_weight",          10.0)
-        self.l1_anneal_epochs   = config.get("l1_anneal_epochs",   2)
+        self.l1_anneal_epochs   = config.get("l1_anneal_epochs",   5)
         self.task_weight        = config.get("task_weight",        1.0)
-        self.task_anneal_epochs = config.get("task_anneal_epochs", 2)
+        self.task_anneal_epochs = config.get("task_anneal_epochs", 5)
 
         self.start_epoch = 1
         self.best        = math.inf
@@ -509,7 +525,7 @@ class Stage1Trainer(BaseTrainer):
                 )
 
                 L_kl   = JsccEncoder.kl_loss(out["mu"], out["log_var"])
-                L_task = self._task_loss(out["y_rec"], act_t)
+                L_task = self._task_loss(out["y_rec"], act_t, training=train)
                 L_l1   = F.l1_loss(out["y_rec"], obs_t)
                 loss   = task_w * L_task + self.beta1 * L_kl + l1_w * L_l1
 
