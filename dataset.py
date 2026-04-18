@@ -28,12 +28,22 @@ Notes
   Increase if your h5py is built with thread-safe HDF5.
 """
 
+import json
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import torchvision.transforms.functional as TF
 import h5py
+
+
+def load_task_config(task_dir: str) -> dict:
+    """Read task.json from a task data directory."""
+    path = os.path.join(task_dir, "task.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"task.json not found at '{path}'")
+    with open(path) as f:
+        return json.load(f)
 
 
 class GNMTrajectoryDataset(Dataset):
@@ -174,6 +184,50 @@ class GNMTrajectoryDataset(Dataset):
 
 
 # ========================================================================== #
+#  Multi-task dataset wrapper                                                #
+# ========================================================================== #
+
+class MultiTaskDataset(Dataset):
+    """
+    Wraps multiple GNMTrajectoryDataset instances (one per task) and tags
+    each sample with the task's language instruction.
+
+    __getitem__ returns (obs_t, action_t, obs_tp1, instruction).
+    """
+
+    def __init__(
+        self,
+        task_dirs:   list[str],
+        obs_height:  int = 224,
+        obs_width:   int = 224,
+        obs_channels:int = 3,
+    ):
+        self._datasets     = []
+        self._instructions = []
+        self._offsets      = [0]
+
+        for task_dir in task_dirs:
+            cfg      = load_task_config(task_dir)
+            hdf5_path= os.path.join(task_dir, "demos.hdf5")
+            ds       = GNMTrajectoryDataset(hdf5_path, obs_height, obs_width, obs_channels)
+            self._datasets.append(ds)
+            self._instructions.append(cfg.get("instruction", ""))
+            self._offsets.append(self._offsets[-1] + len(ds))
+
+    def __len__(self) -> int:
+        return self._offsets[-1]
+
+    def __getitem__(self, idx: int):
+        # Find which sub-dataset this index falls into
+        for i in range(len(self._datasets)):
+            if idx < self._offsets[i + 1]:
+                local_idx   = idx - self._offsets[i]
+                obs_t, act, obs_tp1 = self._datasets[i][local_idx]
+                return obs_t, act, obs_tp1, self._instructions[i]
+        raise IndexError(f"Index {idx} out of range for MultiTaskDataset (len={len(self)})")
+
+
+# ========================================================================== #
 #  DataLoader builder                                                        #
 # ========================================================================== #
 
@@ -245,5 +299,61 @@ def build_dataloaders(
         f"[dataset] '{os.path.basename(hdf5_path)}'  "
         f"total={n_total}  train={n_train}  val={n_val}  "
         f"action_dim={dataset._action_dim}"
+    )
+    return train_loader, val_loader
+
+
+def build_multi_task_dataloaders(
+    config:    dict,
+    task_dirs: list[str],
+) -> tuple:
+    """
+    Build train/val DataLoaders from multiple task directories.
+    Each sample includes a language instruction string.
+
+    Returns
+    -------
+    train_loader, val_loader  (batches are (obs_t, action_t, obs_tp1, instruction))
+    """
+    from torch.utils.data import random_split
+
+    dataset = MultiTaskDataset(
+        task_dirs    = task_dirs,
+        obs_height   = config["obs_height"],
+        obs_width    = config["obs_width"],
+        obs_channels = config["obs_channels"],
+    )
+
+    n_total = len(dataset)
+    n_val   = max(1, int(0.2 * n_total))
+    n_train = n_total - n_val
+
+    generator = torch.Generator().manual_seed(config.get("seed", 42))
+    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=generator)
+
+    num_workers = config.get("num_workers", 0)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size         = config["batch_size"],
+        shuffle            = True,
+        num_workers        = num_workers,
+        pin_memory         = True,
+        drop_last          = True,
+        persistent_workers = (num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size         = config["batch_size"],
+        shuffle            = False,
+        num_workers        = num_workers,
+        pin_memory         = True,
+        drop_last          = False,
+        persistent_workers = (num_workers > 0),
+    )
+
+    print(
+        f"[dataset] multi-task  tasks={len(task_dirs)}  "
+        f"total={n_total}  train={n_train}  val={n_val}"
     )
     return train_loader, val_loader

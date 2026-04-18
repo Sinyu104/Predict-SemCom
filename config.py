@@ -90,9 +90,8 @@ CONFIG = {
     "obs_jpeg_quality":  85,                # JPEG quality for obs compression
 
     # ── OpenVLA ─────────────────────────────────────────────────────── #
+    # instruction and unnorm_key are now per-task, loaded from data/<task>/task.json
     "openvla_model_name":    "openvla/openvla-7b",
-    "openvla_instruction":   "pick up the red cube and place it on the tray",
-    "openvla_unnorm_key":    "franka_isaac",
     "openvla_finetune_dir":  "outputs/openvla_finetuned_v3",
 
     # On the server, split OpenVLA across T4 GPUs using device_map="auto".
@@ -107,7 +106,9 @@ CONFIG = {
     "finetune_batch_size":   4,
 
     # ── Paths ────────────────────────────────────────────────────────── #
-    "default_data_path":     "data/trajectories.hdf5",
+    # default_data_path is kept for backward compat with --stored_data flag.
+    # For multi-task training use --tasks in main.py instead.
+    "default_data_path":     "data/pick_red_cube_to_tray/demos.hdf5",
     "output_dir":            "./outputs",
 
     # ── Misc ─────────────────────────────────────────────────────────── #

@@ -71,8 +71,8 @@ class OpenVLAAgent(nn.Module):
 
     def __init__(
         self,
-        instruction: str  = "pick up the red cube and place it on the tray",
-        unnorm_key:  str  = "bridge_orig",
+        instruction: str  = "",
+        unnorm_key:  str  = "franka_isaac",
         model_name:  str  = "openvla/openvla-7b",
         device:      str  = "cuda:0",
         quantize:    bool = False,
@@ -177,8 +177,9 @@ class OpenVLAAgent(nn.Module):
 
     def task_loss_forward(
         self,
-        y_rec:     torch.Tensor,   # (B, 3, H, W) float32, Reshaper output
-        actions_gt: torch.Tensor,  # (B, 7) float32, ground-truth actions
+        y_rec:        torch.Tensor,        # (B, 3, H, W) float32, Reshaper output
+        actions_gt:   torch.Tensor,        # (B, 7) float32, ground-truth actions
+        instructions: list[str] | None = None,  # per-sample; falls back to self.instruction
     ) -> torch.Tensor:
         """
         Compute a DIFFERENTIABLE task loss.
@@ -200,9 +201,13 @@ class OpenVLAAgent(nn.Module):
         """
         self._load()
 
-        B      = y_rec.size(0)
-        prompt = (f"In: What action should the robot take to "
-                  f"{self.instruction}?\nOut:")
+        B = y_rec.size(0)
+        if instructions is None:
+            instructions = [self.instruction] * B
+        prompts = [
+            f"In: What action should the robot take to {instr}?\nOut:"
+            for instr in instructions
+        ]
 
         # ── 1. Differentiable pixel_values for the whole batch ──────────── #
         if y_rec.shape[-2:] != (224, 224):
@@ -230,7 +235,7 @@ class OpenVLAAgent(nn.Module):
         # text prompt; gradients do NOT flow through this path.
         pil_imgs = [self._to_pil(y_rec[i]) for i in range(B)]
         inputs   = self._processor(
-            [prompt] * B, pil_imgs,
+            prompts, pil_imgs,
             return_tensors="pt", padding=True,
         )
         input_ids      = inputs["input_ids"].to(self._vla_device)       # (B, T)
@@ -268,18 +273,21 @@ class OpenVLAAgent(nn.Module):
     @torch.inference_mode()
     def predict_action(
         self,
-        y_rec: torch.Tensor,   # (B, 3, H, W) float32
+        y_rec:        torch.Tensor,         # (B, 3, H, W) float32
+        instructions: list[str] | None = None,
     ) -> torch.Tensor:
         """
         Greedy-decode 7-DoF actions from the Reshaper output.
         Returns (B, 7) float32 on CPU.
         """
         self._load()
-        B      = y_rec.size(0)
-        prompt = (f"In: What action should the robot take to "
-                  f"{self.instruction}?\nOut:")
+        B = y_rec.size(0)
+        if instructions is None:
+            instructions = [self.instruction] * B
         actions = []
         for i in range(B):
+            prompt  = (f"In: What action should the robot take to "
+                       f"{instructions[i]}?\nOut:")
             pil_img = self._to_pil(y_rec[i])
             inputs  = self._processor(prompt, pil_img).to(
                 self._vla_device, dtype=torch.float16
@@ -319,7 +327,7 @@ class OpenVLAStub(nn.Module):
         obs_width:    int = 224,
         action_dim:   int = 7,
         instruction:  str = "",
-        unnorm_key:   str = "bridge_orig",
+        unnorm_key:   str = "franka_isaac",
         **kwargs,                           # absorb extra OpenVLAAgent args
     ):
         super().__init__()
@@ -342,20 +350,18 @@ class OpenVLAStub(nn.Module):
 
     def task_loss_forward(
         self,
-        y_rec:      torch.Tensor,   # (B, 3, H, W)
-        actions_gt: torch.Tensor,   # (B, 7)
+        y_rec:        torch.Tensor,
+        actions_gt:   torch.Tensor,
+        instructions: list[str] | None = None,  # accepted but unused by stub
     ) -> torch.Tensor:
-        """
-        Differentiable MSE loss between stub predictions and ground truth.
-        Gradients flow back through y_rec → Reshaper → Encoder.
-        """
-        pred = self._enc(y_rec)                         # (B, 7)
+        pred = self._enc(y_rec)
         return F.mse_loss(pred, actions_gt.to(y_rec.device))
 
     @torch.inference_mode()
     def predict_action(
         self,
-        y_rec: torch.Tensor,        # (B, 3, H, W)
+        y_rec:        torch.Tensor,
+        instructions: list[str] | None = None,  # accepted but unused by stub
     ) -> torch.Tensor:
         return self._enc(y_rec).cpu()
 
