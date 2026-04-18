@@ -38,6 +38,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ResBlock(nn.Module):
+    """Strided residual conv block (encoder)."""
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+        self.skip = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_ch),
+        ) if (stride != 1 or in_ch != out_ch) else nn.Identity()
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.main(x) + self.skip(x))
+
+
+class ResBlockUp(nn.Module):
+    """Upsampling residual block (decoder)."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+        self.skip = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.main(x) + self.skip(x))
+
+
 # ========================================================================== #
 #  1. JSCC ENCODER  (Variational, outputs distribution)                      #
 # ========================================================================== #
@@ -68,17 +113,10 @@ class JsccEncoder(nn.Module):
         self.latent_dim = latent_dim
 
         self.conv = nn.Sequential(
-            nn.Conv2d(obs_channels, 32,  kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32),  nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(32,  64,  kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),  nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(64,  128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128), nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
+            ResBlock(obs_channels, 32,  stride=2),
+            ResBlock(32,           64,  stride=2),
+            ResBlock(64,           128, stride=2),
+            ResBlock(128,          256, stride=2),
         )
 
         feat_h   = obs_height // 16
@@ -158,15 +196,9 @@ class Reshaper(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-
-            nn.ConvTranspose2d(128, 64,  kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),  nn.ReLU(inplace=True),
-
-            nn.ConvTranspose2d(64,  32,  kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32),  nn.ReLU(inplace=True),
-
+            ResBlockUp(256, 128),
+            ResBlockUp(128, 64),
+            ResBlockUp(64,  32),
             nn.ConvTranspose2d(32, obs_channels, kernel_size=4, stride=2, padding=1),
             nn.Sigmoid(),
         )
