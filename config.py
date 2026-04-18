@@ -66,7 +66,7 @@ CONFIG = {
     # ── Optimisation ────────────────────────────────────────────────── #
     "learning_rate": 1e-4,
     "batch_size":    4,    # per-GPU batch size (effective = 4 × 4 = 16)
-    "epochs":        50,
+    "epochs":        10,
 
     # ── Multi-GPU (DDP) ─────────────────────────────────────────────── #
     # Training is launched with:
