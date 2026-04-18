@@ -31,6 +31,7 @@ import os
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -447,15 +448,19 @@ class Stage1Trainer(BaseTrainer):
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config["epochs"], eta_min=1e-6
         )
-        self.beta1 = config.get("vib_beta1", 1.0)
+        self.beta1              = config.get("vib_beta1",          1.0)
+        self.l1_weight          = config.get("l1_weight",          5.0)
+        self.l1_anneal_epochs   = config.get("l1_anneal_epochs",   2)
+        self.task_weight        = config.get("task_weight",        1.0)
+        self.task_anneal_epochs = config.get("task_anneal_epochs", 2)
 
-    def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
+    def _run_epoch(self, loader, train: bool, epoch: int, l1_w: float = 0.0, task_w: float = 1.0) -> dict:
         self.system.jscc_encoder.train(train)
         self.system.reshaper.train(train)
         if train and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
 
-        totals    = {"task": 0.0, "kl": 0.0, "total": 0.0}
+        totals    = {"task": 0.0, "kl": 0.0, "l1": 0.0, "total": 0.0}
         n         = 0
         sample_obs   = None   # first-batch snapshots for visualisation
         sample_y_rec = None
@@ -486,7 +491,8 @@ class Stage1Trainer(BaseTrainer):
 
                 L_kl   = JsccEncoder.kl_loss(out["mu"], out["log_var"])
                 L_task = self._task_loss(out["y_rec"], act_t)
-                loss   = L_task + self.beta1 * L_kl
+                L_l1   = F.l1_loss(out["y_rec"], obs_t)
+                loss   = task_w * L_task + self.beta1 * L_kl + l1_w * L_l1
 
                 if sample_obs is None:
                     sample_obs   = obs_t.detach()
@@ -512,12 +518,14 @@ class Stage1Trainer(BaseTrainer):
 
                 totals["task"]  += L_task.item()
                 totals["kl"]    += L_kl.item()
+                totals["l1"]    += L_l1.item()
                 totals["total"] += loss.item()
                 n += 1
 
                 pbar.set_postfix(
                     task=f"{L_task.item():.4f}",
                     kl=f"{L_kl.item():.4f}",
+                    l1=f"{L_l1.item():.4f}",
                     total=f"{loss.item():.4f}",
                 )
 
@@ -545,13 +553,19 @@ class Stage1Trainer(BaseTrainer):
             dynamic_ncols=True,
         )
         for ep in epoch_bar:
-            tr, t_obs, t_yrec = self._run_epoch(self.train_loader, True,  ep)
-            vl, v_obs, v_yrec = self._run_epoch(self.val_loader,   False, ep)
+            # linear anneal: l1_weight → 0 over l1_anneal_epochs
+            l1_w   = self.l1_weight   * max(0.0, 1.0 - (ep - 1) / self.l1_anneal_epochs)
+            # linear warm-up: 0 → task_weight over task_anneal_epochs
+            task_w = self.task_weight * min(1.0, 0.01 + (ep - 1) / self.task_anneal_epochs)
+
+            tr, t_obs, t_yrec = self._run_epoch(self.train_loader, True,  ep, l1_w, task_w)
+            vl, v_obs, v_yrec = self._run_epoch(self.val_loader,   False, ep, l1_w, task_w)
             self.scheduler.step()
 
             if self.is_main:
                 self._log("Stage1", {"train_" + k: v for k, v in tr.items()}, ep)
                 self._log("Stage1", {"val_"   + k: v for k, v in vl.items()}, ep)
+                self._log("Stage1", {"l1_weight": l1_w, "task_weight": task_w}, ep)
                 self._save_samples("Stage1_train", t_obs, t_yrec, ep)
                 self._save_samples("Stage1_val",   v_obs, v_yrec, ep)
                 epoch_bar.set_postfix(
@@ -559,6 +573,7 @@ class Stage1Trainer(BaseTrainer):
                     val=f"{vl['total']:.4f}",
                     val_task=f"{vl['task']:.4f}",
                     val_kl=f"{vl['kl']:.4f}",
+                    l1_w=f"{l1_w:.3f}",
                 )
                 if vl["total"] < best:
                     best = vl["total"]
