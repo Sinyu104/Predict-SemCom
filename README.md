@@ -2,53 +2,59 @@
 
 A research implementation of a **Predictive Semantic Communication System** for bandwidth-efficient robot control over Rayleigh fading wireless channels.
 
-Targeting **IEEE Globecom 2026** and **IEEE JSAC** (Digital Twins special issue, deadline 1 May 2026).
-
 ---
 
 ## Core Idea
 
-Instead of transmitting the full robot observation at every timestep, transmit only the **innovation** — the part the receiver could not predict — using a shared GRU-based Digital Twin (World Model) running on both the robot and the edge server.
+Instead of transmitting the full robot observation at every timestep, we transmit only the **innovation** — the part the receiver could not predict — using a shared world model (Predictor) running on the edge server as Wyner-Ziv side information.
+
+The system is built on a frozen, task-fine-tuned **OpenVLA-7B** backbone. The visual encoder (ViT) and projector are reused directly; a compact latent space is learned on top.
 
 ```
-Robot side                                    Edge Server (Digital Twin)
-──────────────────────────────────            ──────────────────────────────────
-obs_t ──[VIB Encoder]──► z_t
-                           │
-           ──[Predictor]──► ẑ_t ─────────────────────────────► ẑ_t
-                           │                                       │
-           z_t − ẑ_t ──► Δz_t                                     │
-                           │                                       │
-               [Sparsifier τ]──► Δz_sparse                        │
-                           │                                       │
-               ~~Rayleigh Channel~~──► ──[Reconstructor]──► Δẑ    │
-                                                                   │
-                                              ẑ_t + Δẑ ──► z_rec  │
-                                                                   │
-                                          [Reshaper]──► y_rec      │
-                                                                   │
-                                     [OpenVLA-7B (frozen)]──► a_t ◄┘
+Device (Robot)                              Edge Server
+──────────────────────────────────          ──────────────────────────────────
+x_t ──[ViT Encoder (frozen)]──► tokens
+     ──[Token Encoder]──────────► z_t
+     ──[JSCC Encoder]──────────► s_t
+                                  │
+                    ~~Rayleigh Channel~~──► ŝ_t
+                                                │
+                                                │          (z_{t-1}, a_{t-1}) ──[Predictor]──► ẑ_t^{pred}
+                                                │                   │
+                                      (ŝ_t, ẑ_t^{pred})─────────────      
+                                      ──[JSCC Decoder]──► ẑ_t       
+                                      ──[Token Decoder]──► tokens   
+                                      ──[OpenVLA Projector]──►      
+                                      ──[LLM head (frozen)]──► â_t 
 ```
 
-When the Predictor is accurate, `‖Δz‖ ≈ 0` → near-zero bits transmitted. Interference events cause innovation spikes, naturally allocating more bandwidth when semantic novelty is high.
+The **Predictor** (action-conditioned V-JEPA 2 style) runs on the **receiver side only**, providing Wyner-Ziv side information. The JSCC Encoder has no access to `ẑ_t^{pred}` — rate is reduced because the receiver can already predict much of `z_t` from context.
+
+**Rate:** `KL( q(ŝ_t|z_t) || p(ŝ_t|ẑ_t^{pred}) )` — automatically near zero when the scene is predictable, high when the scene changes unexpectedly.
 
 ---
 
 ## Hardware
 
-| Machine | Specs | Role |
-|---|---|---|
-| Windows Desktop | RTX 3070 8 GB, IP 137.82.57.58 | Isaac Sim + data collection |
-| Linux Server | 4× NVIDIA T4 16 GB (64 GB total), IP 10.32.33.49 | OpenVLA-7B inference + training |
+
+| Machine         | Specs                            | Role                            |
+| --------------- | -------------------------------- | ------------------------------- |
+| Windows Desktop | RTX 3070 8 GB                    | Isaac Sim + data collection     |
+| Linux Server    | 4× NVIDIA T4 16 GB (64 GB total) | OpenVLA-7B inference + training |
+
 
 ---
 
 ## System Overview
 
-- **Stage 0:** Fine-tune OpenVLA-7B on Franka pick-and-place demonstrations (LoRA)
-- **Stage 1:** Train VIB Encoder + Reshaper with OpenVLA as the frozen task oracle
-- **Stage 2:** Train GRU Predictor (the Digital Twin) on clean trajectories
-- **Stage 3 (JSAC):** Learn per-dimension sparsification threshold τ
+
+| Stage       | Name                     | Goal                                                       |
+| ----------- | ------------------------ | ---------------------------------------------------------- |
+| **Stage 0** | OpenVLA Fine-tuning      | Fine-tune OpenVLA-7B on Isaac Sim task using LoRA          |
+| **Stage 1** | End-to-End Task Training | Train Token Encoder + Token Decoder with frozen OpenVLA    |
+| **Stage 2** | Predictor Training       | Train action-conditioned world model (V-JEPA 2 style)      |
+| **Stage 3** | JSCC Training            | Train JSCC Encoder, Decoder, Side Info Encoder (Wyner-Ziv) |
+
 
 ---
 
@@ -56,10 +62,12 @@ When the Predictor is accurate, `‖Δz‖ ≈ 0` → near-zero bits transmitted
 
 The Windows desktop and Linux server are on different subnets. Communication uses **ROS2** with a **Fast DDS Discovery Server** for cross-subnet node discovery.
 
-| Topic | Direction | Content |
-|---|---|---|
-| `/vla/request` | Desktop → Server | JSON: base64 JPEG + instruction |
-| `/vla/response` | Server → Desktop | JSON: 7-DoF action |
+
+| Topic           | Direction        | Content                         |
+| --------------- | ---------------- | ------------------------------- |
+| `/vla/request`  | Desktop → Server | JSON: base64 JPEG + instruction |
+| `/vla/response` | Server → Desktop | JSON: 7-DoF action              |
+
 
 ```bash
 # Required on both machines
@@ -78,7 +86,8 @@ export ROS_DISCOVERY_SERVER=10.32.33.41:11811
 ├── isaac_sim/
 │   ├── isaac_collector.py     Isaac Sim data collector (Windows)
 │   └── test_ros2_client.py    Standalone connection test (Windows side)
-├── models.py                  VIB Encoder, Reshaper, Predictor, Sparsifier, Channel
+├── models.py                  ViT Encoder, Token Encoder/Decoder, JSCC Encoder/Decoder,
+│                              Side Info Encoder, Predictor, Rayleigh Channel
 ├── trainer.py                 Stage 1/2/3 trainers with DDP
 ├── dataset.py                 HDF5 episodic dataset loader
 ├── inference.py               Evaluation metrics and figure generation
@@ -107,7 +116,7 @@ source /opt/ros/humble/setup.bash
 ```bash
 # Linux server
 export ROS_DOMAIN_ID=66
-export ROS_DISCOVERY_SERVER=10.32.33.41:11811
+export ROS_DISCOVERY_SERVER=10.32.33.49:11811
 source /opt/ros/humble/setup.bash
 python server/test_ros2_server.py
 ```
@@ -147,28 +156,33 @@ python server/vla_server.py \
 ```cmd
 set ROS_DOMAIN_ID=66
 set ROS_DISCOVERY_SERVER=10.32.33.41:11811
-<isaac_sim_root>\python.bat isaac_sim\isaac_collector.py ^
-    --output data\stage12_clean.hdf5 ^
+<isaac_sim_root>\python.bat isaac_sim\isaac_collector.py 
+    --output data\stage12_clean.hdf5 
     --num_episodes 300 --episode_length 120
 ```
 
 ### 6. Train the Semantic Communication Model (Linux server)
 
 ```bash
-# Stage 1 — VIB Encoder + Reshaper
+# Stage 1 — Token Encoder + Token Decoder (end-to-end task training)
 bash server/launch_training.sh --stage 1 \
     --stored_data data/stage12_clean.hdf5 --epoch 50
 
-# Stage 2 — GRU Predictor (Digital Twin)
+# Stage 2 — Predictor (action-conditioned V-JEPA 2)
 bash server/launch_training.sh --stage 2 \
+    --stored_data data/stage12_clean.hdf5 --epoch 30
+
+# Stage 3 — JSCC Encoder / Decoder / Side Info Encoder (Wyner-Ziv)
+bash server/launch_training.sh --stage 3 \
     --stored_data data/stage12_clean.hdf5 --epoch 30
 ```
 
 ### 7. Run Inference / Ablation
 
 ```bash
-for TAU in 0.01 0.05 0.10 0.20; do
-    python main.py --inference --tau $TAU --snr_db 10 \
+# Sweep SNR for rate-distortion curve
+for SNR in 0 5 10 15 20; do
+    python main.py --inference --snr_db $SNR \
         --stored_data data/eval_disturbed.hdf5
 done
 ```
@@ -205,6 +219,9 @@ rclpy  (via ROS2 Humble: source /opt/ros/humble/setup.bash)
 
 ---
 
-## Reference
+## References
 
-> Diao et al., "Aligning Task- and Reconstruction-Oriented Communications for Edge Intelligence," *IEEE JSAC* 2025. [arXiv:2502.15472](https://arxiv.org/abs/2502.15472)
+> Bardes et al., "V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning," Meta AI 2025.
+
+> Wyner & Ziv, "The Rate-Distortion Function for Source Coding with Side Information at the Decoder," *IEEE Trans. Inf. Theory* 1976.
+
