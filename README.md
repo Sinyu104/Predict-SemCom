@@ -111,6 +111,9 @@ pip install -r requirements.txt
 source /opt/ros/humble/setup.bash
 ```
 
+### 1b. Collect data trajectory
+See ```/isaac_sim/README.md``` for collecting data on Isaac Sim.
+
 ### 2. Test the ROS2 Connection
 
 ```bash
