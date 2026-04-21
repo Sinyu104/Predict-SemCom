@@ -346,7 +346,7 @@ class OpenVLAStub(nn.Module):
     def __init__(
         self,
         N_patches:    int = 256,
-        D_vit:        int = 2048,
+        D_vit:        int = 2176,
         action_dim:   int = 7,
         instruction:  str = "",
         unnorm_key:   str = "bridge_orig",

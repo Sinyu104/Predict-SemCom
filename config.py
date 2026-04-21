@@ -26,7 +26,7 @@ CONFIG = {
     # ── OpenVLA backbone dimensions ──────────────────────────────────── #
     # These must match the loaded OpenVLA model.
     # Verify by calling agent.encode_image(x) and checking output shape.
-    "D_vit":     2048,   # ViT patch token feature dim (DINOv2 + SigLIP combined)
+    "D_vit":     2176,   # ViT patch token feature dim (DINOv2 1024 + SigLIP 1152)
     "N_patches":  256,   # Number of ViT patch tokens (16×16 for 224×224 input)
     "D_model":   4096,   # LLM hidden dimension (LLaMA-2-7B), informational only
 
