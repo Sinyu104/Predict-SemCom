@@ -16,6 +16,7 @@ outputs/
 *.pth
 
 # Data
+data
 data/*.hdf5
 data/*.h5
 

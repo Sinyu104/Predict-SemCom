@@ -1,35 +1,38 @@
 """
 models.py  —  Neural network modules for the Predictive Semantic Communication System.
 
-Module index
+Architecture
 ------------
-1.  JsccEncoder      x → (mu, log_var, z)     Variational encoder
-2.  Reshaper         z → y                     Task-oriented decoder
-3.  Predictor        (z_{t-1}, a_{t-1}) → ẑ   GRU World Model / Digital Twin
-4.  Subtractor       Δz = z − ẑ               Fixed math
-5.  Sparsifier       Δz → sparse(Δz)           Fixed-τ or learned-τ
-6.  Reconstructor    sparse → dense Δẑ         Fixed math (identity)
-7.  RayleighChannel  Δz_sparse → received      Rayleigh fading + AWGN
-8.  Adder            z_rec = ẑ + Δẑ           Fixed math
-9.  PredictiveSemComSystem  Full pipeline
+Device (Robot):
+    x_t → [ViT (agent, frozen)] → (B, N, D_vit)
+        → [TokenEncoder] → z_t (B, latent_dim)
+        → [JsccEncoder] → s_t ~ q(s_t|z_t), shape (B, D_jscc)
+        → [RayleighChannel] → ŝ_t (B, D_jscc)
 
-VIB Encoder design
--------------------
-Following the ATROC paper, the Encoder outputs a Gaussian distribution
-q_ϕ(z|x) = N(mu_ϕ(x), sigma_ϕ(x)^2 * I).
+Edge Server:
+    (z_{t-1}, a_{t-1}) → [Predictor] → ẑ_t^{pred} (B, latent_dim)
+    ẑ_t^{pred} → [SideInfoEncoder] → p(ŝ_t|ẑ_t^{pred})   ← loss only, no data flow
+    (ŝ_t, ẑ_t^{pred}) → [JsccDecoder] → ẑ_t (B, latent_dim)
+    ẑ_t → [TokenDecoder] → (B, N, D_vit)
+        → [OpenVLA Projector (agent, frozen)] → (B, N, D_model)
+        → [LLM (agent, frozen)] → â_t
 
-During training:    z is sampled via the reparameterisation trick.
-During inference:   z = mu (no sampling — deterministic and reproducible).
+Rate Loss (Wyner-Ziv)
+---------------------
+KL( q(ŝ_t|z_t) || p(ŝ_t|ẑ_t^{pred}) )
+  q = N(μ_enc, σ²_enc + σ²_n)    σ²_n explicit: physical channel noise
+  p = N(μ_prior, σ²_prior)         σ²_n absorbed into learned σ²_prior
 
-The KL divergence KL(q_ϕ(z|x) || N(0,I)) is returned as a separate
-term so the trainer can weight it independently (VIB beta1 term).
-
-Gradient path for Stage 1
---------------------------
-OpenVLA(Reshaper(Channel(Encoder(x)))) → task_loss
-                ↑                ↑
-        gradients flow      gradients flow
-OpenVLA is frozen; only Encoder and Reshaper receive gradient updates.
+Modules
+-------
+1. TokenEncoder      (B,N,D_vit) → (B,latent_dim)
+2. JsccEncoder       (B,latent_dim) → μ_enc, log_var_enc, s_t
+3. SideInfoEncoder   (B,latent_dim) → μ_prior, log_var_prior   [loss only]
+4. JsccDecoder       (B,D_jscc)+(B,latent_dim) → (B,latent_dim)
+5. Predictor         (B,latent_dim)+(B,action_dim) → (B,latent_dim)
+6. TokenDecoder      (B,latent_dim) → (B,N,D_vit)
+7. RayleighChannel   (B,D_jscc) → (B,D_jscc)
+8. SemComSystem      container + static rate_loss()
 """
 
 import math
@@ -38,608 +41,303 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ResBlock(nn.Module):
-    """Strided residual conv block (encoder)."""
+# ========================================================================== #
+#  1. TOKEN ENCODER                                                           #
+# ========================================================================== #
 
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+class TokenEncoder(nn.Module):
+    """
+    Aggregate ViT patch tokens to compact latent: (B, N, D_vit) → (B, latent_dim)
+    Mean-pools over the patch dimension, then applies a two-layer MLP.
+    """
+
+    def __init__(self, D_vit: int, latent_dim: int, hidden_dim: int):
         super().__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+        self.net = nn.Sequential(
+            nn.Linear(D_vit, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
         )
-        self.skip = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
-            nn.BatchNorm2d(out_ch),
-        ) if (stride != 1 or in_ch != out_ch) else nn.Identity()
-        self.act = nn.LeakyReLU(0.2, inplace=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.main(x) + self.skip(x))
-
-
-class ResBlockUp(nn.Module):
-    """Upsampling residual block (decoder)."""
-
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.main = nn.Sequential(
-            nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-        )
-        self.skip = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(in_ch, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
-        )
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.main(x) + self.skip(x))
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """tokens: (B, N, D_vit) → z: (B, latent_dim)"""
+        return self.net(tokens.mean(dim=1))
 
 
 # ========================================================================== #
-#  1. JSCC ENCODER  (Variational, outputs distribution)                      #
+#  2. JSCC ENCODER                                                            #
 # ========================================================================== #
 
 class JsccEncoder(nn.Module):
     """
-    Variational JSCC Encoder: x → (mu, log_var, z).
+    Probabilistic JSCC encoder: z_t → q(s_t|z_t) = N(μ_enc, σ²_enc)
 
-    Architecture
-    ------------
-    4 × stride-2 Conv blocks  →  Flatten  →  FC → (mu, log_var) each of
-    size latent_dim.
-
-    z is sampled via the reparameterisation trick during training so that
-    gradients flow through z back to the convolutional backbone.
-    During inference, z = mu (no randomness).
-
-    Returns
-    -------
-    mu      : (B, latent_dim)   mean of the approximate posterior
-    log_var : (B, latent_dim)   log-variance of the approximate posterior
-    z       : (B, latent_dim)   sample (training) or mean (inference)
+    No access to ẑ_t^{pred} — Wyner-Ziv constraint.
+    Reparameterisation trick during training; s_t = μ_enc at inference.
     """
 
-    def __init__(self, obs_channels: int, obs_height: int,
-                 obs_width: int, latent_dim: int):
+    def __init__(self, latent_dim: int, D_jscc: int, hidden_dim: int):
         super().__init__()
-        self.latent_dim = latent_dim
-
-        self.conv = nn.Sequential(
-            ResBlock(obs_channels, 32,  stride=2),
-            ResBlock(32,           64,  stride=2),
-            ResBlock(64,           128, stride=2),
-            ResBlock(128,          256, stride=2),
-        )
-
-        feat_h   = obs_height // 16
-        feat_w   = obs_width  // 16
-        flat_dim = 256 * feat_h * feat_w
-
-        self.fc_shared = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flat_dim, latent_dim * 2),
+        self.shared = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(inplace=True),
         )
-        self.fc_mu      = nn.Linear(latent_dim * 2, latent_dim)
-        self.fc_log_var = nn.Linear(latent_dim * 2, latent_dim)
+        self.fc_mu      = nn.Linear(hidden_dim, D_jscc)
+        self.fc_log_var = nn.Linear(hidden_dim, D_jscc)
 
     def forward(
-        self, x: torch.Tensor, sample: bool = True
+        self, z: torch.Tensor, sample: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        x      : (B, C, H, W)
-        sample : True  → reparameterisation trick  (training)
-                 False → z = mu                    (inference)
-
         Returns
         -------
-        mu, log_var, z  each (B, latent_dim)
+        mu_enc      : (B, D_jscc)
+        log_var_enc : (B, D_jscc)
+        s_t         : (B, D_jscc)  sampled (training) or mean (inference)
         """
-        h       = self.conv(x)
-        shared  = self.fc_shared(h)
-        mu      = self.fc_mu(shared)
-        log_var = self.fc_log_var(shared).clamp(-10.0, 2.0)  # numerical stability
+        h       = self.shared(z)
+        mu      = self.fc_mu(h)
+        log_var = self.fc_log_var(h).clamp(-10.0, 2.0)
 
         if sample and self.training:
             std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            z   = mu + eps * std
+            s   = mu + std * torch.randn_like(std)
         else:
-            z   = mu
-
-        return mu, log_var, z
-
-    @staticmethod
-    def kl_loss(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-        """
-        Analytical KL divergence: KL(N(mu, sigma^2) || N(0, I)).
-        Returns the mean over the batch dimension.
-        """
-        return -0.5 * torch.mean(
-            1.0 + log_var - mu.pow(2) - log_var.exp()
-        )
+            s   = mu
+        return mu, log_var, s
 
 
 # ========================================================================== #
-#  2. RESHAPER  (Task-oriented decoder)                                      #
+#  3. SIDE INFORMATION ENCODER                                                #
 # ========================================================================== #
 
-class Reshaper(nn.Module):
+class SideInfoEncoder(nn.Module):
     """
-    Task-oriented decoder: z → y.
+    Conditional prior: ẑ_t^{pred} → p(ŝ_t|ẑ_t^{pred}) = N(μ_prior, σ²_prior)
 
-    Unlike a reconstruction decoder that minimises pixel MSE, the Reshaper
-    is trained to produce images y that maximise the frozen AI agent's
-    task performance.  It is NOT trained to look good to humans.
-
-    Architecture mirrors the JsccEncoder with ConvTranspose2d blocks.
-    Output is normalised to [0,1] with Sigmoid.
+    Used ONLY in the rate loss (KL term). No data flows through this module —
+    it learns to predict the distribution of ŝ_t from ẑ_t^{pred} alone,
+    enabling tight rate estimation via the variational Wyner-Ziv bound.
     """
 
-    def __init__(self, obs_channels: int, obs_height: int,
-                 obs_width: int, latent_dim: int):
+    def __init__(self, latent_dim: int, D_jscc: int, hidden_dim: int):
         super().__init__()
-        self.feat_h   = obs_height // 16
-        self.feat_w   = obs_width  // 16
-        flat_dim      = 256 * self.feat_h * self.feat_w
-
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, flat_dim),
+        self.shared = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(inplace=True),
         )
-        self.deconv = nn.Sequential(
-            ResBlockUp(256, 128),
-            ResBlockUp(128, 64),
-            ResBlockUp(64,  32),
-            nn.ConvTranspose2d(32, obs_channels, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),
-        )
+        self.fc_mu      = nn.Linear(hidden_dim, D_jscc)
+        self.fc_log_var = nn.Linear(hidden_dim, D_jscc)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, latent_dim) → y: (B, C, H, W)"""
-        h = self.fc(z).view(-1, 256, self.feat_h, self.feat_w)
-        return self.deconv(h)
+    def forward(
+        self, z_pred: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        z_pred: (B, latent_dim) — predictor output ẑ_t^{pred}
+
+        Returns
+        -------
+        mu_prior      : (B, D_jscc)
+        log_var_prior : (B, D_jscc)
+        """
+        h       = self.shared(z_pred)
+        mu      = self.fc_mu(h)
+        log_var = self.fc_log_var(h).clamp(-10.0, 2.0)
+        return mu, log_var
 
 
 # ========================================================================== #
-#  3. PREDICTOR  (World Model / Digital Twin)                                #
+#  4. JSCC DECODER                                                            #
+# ========================================================================== #
+
+class JsccDecoder(nn.Module):
+    """
+    Wyner-Ziv decoder: (ŝ_t, ẑ_t^{pred}) → ẑ_t
+
+    Conditions on both the noisy received signal and the predictor's side
+    information, learning a non-linear recovery function.
+    """
+
+    def __init__(self, D_jscc: int, latent_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(D_jscc + latent_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(
+        self, s_hat: torch.Tensor, z_pred: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        s_hat  : (B, D_jscc)    received channel signal
+        z_pred : (B, latent_dim) predictor side information ẑ_t^{pred}
+        → ẑ_t  : (B, latent_dim)
+        """
+        return self.net(torch.cat([s_hat, z_pred], dim=-1))
+
+
+# ========================================================================== #
+#  5. PREDICTOR  (action-conditioned V-JEPA 2 style)                         #
 # ========================================================================== #
 
 class Predictor(nn.Module):
     """
-    GRU-based World Model — the Digital Twin of the robot.
+    Action-conditioned world model — V-JEPA 2 style.
 
-    Runs identically on the Device and Edge Server with synchronised
-    hidden states, producing the same prediction ẑ_t on both sides
-    without any extra transmission.
+    Runs on the RECEIVER (edge server) only. Both context and target encoders
+    (ViT + TokenEncoder) are frozen from Stage 1. Only the Predictor is
+    trained in Stage 2 via L_world = ||ẑ_{t+1}^{pred} − sg(z_{t+1})||².
 
-    Input : (z_{t-1} ∥ a_{t-1}) ∈ ℝ^{latent_dim + action_dim}
-    Output: ẑ_t ∈ ℝ^{latent_dim},  h_t (updated hidden state)
+    Stateless MLP — no recurrent hidden state.
+    (z_t, a_t) → ẑ_{t+1}^{pred}
     """
 
     def __init__(self, latent_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.gru = nn.GRU(
-            input_size  = latent_dim + action_dim,
-            hidden_size = hidden_dim,
-            num_layers  = 1,
-            batch_first = True,
-        )
-        self.fc_out = nn.Sequential(
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, latent_dim),
-            nn.Tanh(),
         )
 
-    def forward(
-        self,
-        z_prev: torch.Tensor,               # (B, latent_dim)
-        a_prev: torch.Tensor,               # (B, action_dim)
-        h:      torch.Tensor | None = None, # (1, B, hidden_dim)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """
-        Returns
-        -------
-        z_pred : (B, latent_dim)
-        h_next : (1, B, hidden_dim)
+        z : (B, latent_dim)   current latent z_t
+        a : (B, action_dim)   action a_t
+        → z_pred: (B, latent_dim)   predicted next latent ẑ_{t+1}^{pred}
         """
-        inp = torch.cat([z_prev, a_prev], dim=-1).unsqueeze(1)  # (B,1,D)
-        out, h_next = self.gru(inp, h)
-        return self.fc_out(out.squeeze(1)), h_next
+        return self.net(torch.cat([z, a], dim=-1))
 
 
 # ========================================================================== #
-#  4. SUBTRACTOR  (fixed math)                                               #
+#  6. TOKEN DECODER                                                           #
 # ========================================================================== #
 
-class Subtractor(nn.Module):
+class TokenDecoder(nn.Module):
     """
-    Innovation coding: Δz = z_t − ẑ_t
+    Reconstruct ViT patch tokens from compact latent: (B, latent_dim) → (B, N, D_vit)
 
-    Transmitting only Δz instead of z_t reduces bandwidth because a good
-    Predictor (Digital Twin) makes Δz small.  Zero bandwidth cost when the
-    twin predicts perfectly.  No learnable parameters.
+    Inverse of TokenEncoder. Output feeds into the frozen OpenVLA Projector.
     """
 
-    def forward(
-        self, z_t: torch.Tensor, z_pred: torch.Tensor
-    ) -> torch.Tensor:
-        return z_t - z_pred
-
-
-# ========================================================================== #
-#  5. SPARSIFIER                                                             #
-# ========================================================================== #
-
-class Sparsifier(nn.Module):
-    """
-    Suppress Δz components whose magnitude is below the threshold τ.
-
-    Fixed mode  (tau_mode="fixed"):
-        tau is a registered buffer (scalar broadcast to latent_dim).
-        Component i is transmitted iff |Δz_i| > tau.
-        No Stage-3 training needed.  Sweep tau for Globecom ablation.
-
-    Learned mode  (tau_mode="learned"):
-        tau is an nn.Parameter of shape (latent_dim,) trained in Stage-3
-        with a soft-gate surrogate loss (differentiable approximation).
-
-    Top-k budget cap  (optional, both modes):
-        If top_k is set, only the k largest-magnitude components are
-        transmitted, enforcing a fixed per-step bit budget.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        tau_mode:   str   = "fixed",
-        tau_init:   float = 0.05,
-        top_k:      int | None = None,
-    ):
+    def __init__(self, latent_dim: int, N_patches: int, D_vit: int, hidden_dim: int):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.tau_mode   = tau_mode
-        self.top_k      = top_k
+        self.N_patches = N_patches
+        self.D_vit     = D_vit
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, N_patches * D_vit),
+        )
 
-        if tau_mode == "fixed":
-            self.register_buffer(
-                "tau", torch.full((latent_dim,), tau_init)
-            )
-        elif tau_mode == "learned":
-            self.tau = nn.Parameter(
-                torch.full((latent_dim,), tau_init)
-            )
-        else:
-            raise ValueError(
-                f"tau_mode must be 'fixed' or 'learned', got '{tau_mode}'"
-            )
-
-    def forward(
-        self,
-        delta_z:     torch.Tensor,
-        temperature: float = 1.0,
-        hard:        bool  = True,
-    ) -> dict:
-        """
-        Parameters
-        ----------
-        delta_z     : (B, latent_dim)
-        temperature : soft-gate temperature (learned mode, hard=False only)
-        hard        : True  → hard 0/1 mask (inference / Stage 1 & 2)
-                      False → soft gate ∈ (0,1) (Stage-3 training)
-
-        Returns
-        -------
-        dict with keys:
-          delta_z_sparse : (B, latent_dim)  zeroed at suppressed dims
-          mask           : (B, latent_dim)  float mask
-          rate           : scalar           mean fraction transmitted
-          nnz            : scalar           avg non-zero count (detached)
-        """
-        tau = self.tau.clamp(min=0.0)
-
-        if self.tau_mode == "fixed" or hard:
-            mask = (delta_z.abs() > tau).float()
-        else:
-            mask = torch.sigmoid(
-                (delta_z.abs() - tau) / max(temperature, 1e-6)
-            )
-
-        # Optional top-k budget cap
-        if self.top_k is not None:
-            k = min(self.top_k, self.latent_dim)
-            topk_vals, _ = delta_z.abs().topk(k, dim=-1)
-            kth_val      = topk_vals[:, -1].unsqueeze(-1)
-            budget_mask  = (delta_z.abs() >= kth_val).float()
-            mask         = mask * budget_mask
-
-        delta_z_sparse = delta_z * mask
-        rate           = mask.mean()
-        nnz            = mask.detach().sum(dim=-1).mean()
-
-        return {
-            "delta_z_sparse": delta_z_sparse,
-            "mask":           mask,
-            "rate":           rate,
-            "nnz":            nnz,
-        }
-
-    @staticmethod
-    def bits_per_step(
-        nnz: torch.Tensor, latent_dim: int, value_bits: int = 16
-    ) -> torch.Tensor:
-        """
-        Estimated bits per timestep.
-
-        Packet: [4 header bits] + nnz × (ceil(log2(latent_dim)) + value_bits)
-        """
-        index_bits = math.ceil(math.log2(max(latent_dim, 2)))
-        return 4.0 + nnz * (index_bits + value_bits)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, latent_dim) → tokens: (B, N_patches, D_vit)"""
+        B = z.size(0)
+        return self.net(z).view(B, self.N_patches, self.D_vit)
 
 
 # ========================================================================== #
-#  6. RECONSTRUCTOR  (fixed math — identity)                                 #
-# ========================================================================== #
-
-class Reconstructor(nn.Module):
-    """
-    Identity pass-through on the Edge Server.
-
-    The received sparse vector already has zeros at suppressed positions.
-    The Adder will use the Predictor's estimate at those positions, so no
-    additional processing is needed here.  Kept as an explicit module for
-    clarity and future extension (e.g. a learned denoiser).
-    """
-
-    def forward(self, received_sparse: torch.Tensor) -> torch.Tensor:
-        return received_sparse
-
-
-# ========================================================================== #
-#  7. RAYLEIGH CHANNEL                                                       #
+#  7. RAYLEIGH CHANNEL                                                        #
 # ========================================================================== #
 
 class RayleighChannel(nn.Module):
     """
-    Flat Rayleigh fading channel with complex AWGN.
+    Flat Rayleigh fading channel: y = h·x + n,  h, n ~ CN(0,1)
 
-    Model:  y = h · x + n,   h, n ~ CN(0,1)
-
-    Implemented in real arithmetic.  Coherent equalization divides by |h|².
-    Zero components (suppressed by Sparsifier) remain zero after the channel
-    so the Adder correctly falls back to the Predictor estimate at those dims.
-
-    Parameters
-    ----------
-    snr_db : float  Signal-to-Noise Ratio in dB
+    Signal power is estimated per-batch. Coherent equalization divides by |h|².
     """
 
     def __init__(self, snr_db: float = 10.0):
         super().__init__()
         self.snr_db = snr_db
 
-    def forward(self, delta_z_sparse: torch.Tensor) -> torch.Tensor:
-        """
-        delta_z_sparse : (B, latent_dim)  sparse innovation
-        →  received    : (B, latent_dim)  equalized, zero-preserved
-        """
-        nonzero_mask = (delta_z_sparse != 0).float()
-        n_nonzero    = nonzero_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        sig_power    = (
-            delta_z_sparse.pow(2).sum(dim=-1, keepdim=True) / n_nonzero
-        ).clamp(min=1e-8)
+    @property
+    def sigma_n_sq(self) -> float:
+        """Noise variance at unit signal power — used in the KL rate loss."""
+        return 1.0 / (10.0 ** (self.snr_db / 10.0))
 
-        snr_lin  = 10.0 ** (self.snr_db / 10.0)
-        noise_std = (sig_power / snr_lin).sqrt()    # (B, 1)
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """s: (B, D_jscc) → ŝ: (B, D_jscc)"""
+        B = s.size(0)
+        sig_power = s.pow(2).mean(dim=-1, keepdim=True).clamp(min=1e-8)
+        snr_lin   = 10.0 ** (self.snr_db / 10.0)
+        noise_std = (sig_power / snr_lin).sqrt()
 
-        # h ~ CN(0,1): h_re, h_im ~ N(0, 1/√2)
-        h_re = torch.randn(delta_z_sparse.size(0), 1,
-                           device=delta_z_sparse.device) / math.sqrt(2)
-        h_im = torch.randn(delta_z_sparse.size(0), 1,
-                           device=delta_z_sparse.device) / math.sqrt(2)
+        h_re = torch.randn(B, 1, device=s.device) / math.sqrt(2)
+        h_im = torch.randn(B, 1, device=s.device) / math.sqrt(2)
 
-        y_re = h_re * delta_z_sparse
-        y_im = h_im * delta_z_sparse
-        n_re = noise_std * torch.randn_like(delta_z_sparse) / math.sqrt(2)
-        n_im = noise_std * torch.randn_like(delta_z_sparse) / math.sqrt(2)
+        y_re = h_re * s
+        y_im = h_im * s
+        n_re = noise_std * torch.randn_like(s) / math.sqrt(2)
+        n_im = noise_std * torch.randn_like(s) / math.sqrt(2)
 
         h_mag_sq = (h_re.pow(2) + h_im.pow(2)).clamp(min=1e-8)
-        received = ((y_re + n_re) * h_re + (y_im + n_im) * h_im) / h_mag_sq
-
-        # Re-apply zero mask so suppressed dims stay zero
-        return received * nonzero_mask
+        return ((y_re + n_re) * h_re + (y_im + n_im) * h_im) / h_mag_sq
 
 
 # ========================================================================== #
-#  8. ADDER  (fixed math)                                                    #
+#  8. FULL SYSTEM (container)                                                 #
 # ========================================================================== #
 
-class Adder(nn.Module):
+class SemComSystem(nn.Module):
     """
-    Latent recovery on the Edge Server:  z_rec = ẑ_t + received
+    Container for all trainable SemCom modules.
 
-    Transmitted dims:  z_rec_i ≈ z_t_i  (up to channel noise)
-    Suppressed dims:   z_rec_i = ẑ_t_i  (Predictor estimate, no correction)
+    ViT Encoder, OpenVLA Projector, and LLM are NOT stored here — they
+    live in the OpenVLAAgent and are never passed to an optimiser.
 
-    No learnable parameters.
-    """
-
-    def forward(
-        self, z_pred: torch.Tensor, received: torch.Tensor
-    ) -> torch.Tensor:
-        return z_pred + received
-
-
-# ========================================================================== #
-#  9. FULL SYSTEM                                                            #
-# ========================================================================== #
-
-class PredictiveSemComSystem(nn.Module):
-    """
-    End-to-end Predictive Semantic Communication System.
-
-    Data flow (one time step t)
-    ---------------------------
-    DEVICE (Physical Robot):
-      x_t ──[JsccEncoder]──► (mu, log_var, z_t)
-      (z_{t-1}, a_{t-1}) ──[Predictor]──► ẑ_t        ← Digital Twin sync
-      z_t - ẑ_t ──[Subtractor]──► Δz_t               ← Twin gap
-      Δz_t ──[Sparsifier]──► Δz_sparse                ← Drop small dims
-      Δz_sparse ──[Channel]──► received               ← Wireless link
-
-    EDGE SERVER (Digital Twin):
-      (z_{t-1}, a_{t-1}) ──[Predictor]──► ẑ_t         ← Free (same weights)
-      received ──[Reconstructor]──► Δẑ
-      ẑ_t + Δẑ ──[Adder]──► z_rec
-      z_rec ──[Reshaper]──► y_rec
-      y_rec ──[OpenVLAAgent]──► a_t
-
-    The OpenVLAAgent is stored as a plain attribute (not nn.Module child)
-    so its parameters never appear in self.parameters() and cannot
-    accidentally be passed to an optimiser.
-
-    Parameters
-    ----------
-    config   : dict from config.py
-    agent    : OpenVLAAgent or OpenVLAStub instance (required)
-    use_stub : bool  convenience flag — if True, ignores agent argument
-                     and builds an OpenVLAStub internally
+    Each stage trainer uses a subset of these modules:
+      Stage 1: token_encoder, token_decoder
+      Stage 2: predictor  (token_encoder, token_decoder frozen)
+      Stage 3: jscc_encoder, side_info_encoder, jscc_decoder, channel
+               (all Stage 1/2 modules frozen)
     """
 
-    def __init__(self, config: dict, agent=None, use_stub: bool = False):
+    def __init__(self, config: dict):
         super().__init__()
+        D_vit      = config["D_vit"]
+        latent_dim = config["latent_dim"]
+        D_jscc     = config["D_jscc"]
+        action_dim = config["action_dim"]
+        hidden_dim = config["hidden_dim"]
+        N_patches  = config["N_patches"]
 
-        C  = config["obs_channels"]
-        H  = config["obs_height"]
-        W  = config["obs_width"]
-        ld = config["latent_dim"]
-        hd = config["hidden_dim"]
-        ad = config["action_dim"]
+        self.token_encoder     = TokenEncoder(D_vit, latent_dim, hidden_dim)
+        self.jscc_encoder      = JsccEncoder(latent_dim, D_jscc, hidden_dim)
+        self.side_info_encoder = SideInfoEncoder(latent_dim, D_jscc, hidden_dim)
+        self.jscc_decoder      = JsccDecoder(D_jscc, latent_dim, hidden_dim)
+        self.predictor         = Predictor(latent_dim, action_dim, hidden_dim)
+        self.token_decoder     = TokenDecoder(latent_dim, N_patches, D_vit, hidden_dim)
+        self.channel           = RayleighChannel(config["snr_db"])
 
-        self.jscc_encoder  = JsccEncoder(C, H, W, ld)
-        self.reshaper      = Reshaper(C, H, W, ld)
-        self.predictor     = Predictor(ld, ad, hd)
-        self.subtractor    = Subtractor()
-        self.sparsifier    = Sparsifier(
-            latent_dim = ld,
-            tau_mode   = config.get("tau_mode", "fixed"),
-            tau_init   = config.get("tau",      0.05),
-            top_k      = config.get("top_k",    None),
+    @staticmethod
+    def rate_loss(
+        mu_enc:        torch.Tensor,
+        log_var_enc:   torch.Tensor,
+        mu_prior:      torch.Tensor,
+        log_var_prior: torch.Tensor,
+        snr_db:        float,
+    ) -> torch.Tensor:
+        """
+        KL( q(ŝ_t|z_t) || p(ŝ_t|ẑ_t^{pred}) )
+
+        q: N(μ_enc,   σ²_enc + σ²_n)   — σ²_n = 1/snr_lin, explicit channel noise
+        p: N(μ_prior, σ²_prior)         — σ²_n absorbed into learned σ²_prior
+
+        Closed-form KL between two Gaussians (mean over batch and dim).
+        """
+        sigma_n_sq = 1.0 / (10.0 ** (snr_db / 10.0))
+        q_var      = log_var_enc.exp() + sigma_n_sq          # (B, D_jscc)
+        p_var      = log_var_prior.exp().clamp(min=1e-8)     # (B, D_jscc)
+
+        kl = 0.5 * (
+            p_var.log() - q_var.log()
+            + (q_var + (mu_enc - mu_prior).pow(2)) / p_var
+            - 1.0
         )
-        self.channel       = RayleighChannel(config["snr_db"])
-        self.reconstructor = Reconstructor()
-        self.adder         = Adder()
-
-        # Store agent as a plain attribute so its 7B weights are never
-        # included in self.parameters().
-        if use_stub or agent is None:
-            from openvla_agent import OpenVLAStub
-            self.agent = OpenVLAStub(
-                obs_channels = C,
-                obs_height   = H,
-                obs_width    = W,
-                action_dim   = ad,
-            )
-        else:
-            self.agent = agent
-
-        self.latent_dim = ld
-        self.tau_mode   = config.get("tau_mode", "fixed")
-
-    def forward(
-        self,
-        x_t:              torch.Tensor,
-        z_prev:           torch.Tensor,
-        a_prev:           torch.Tensor,
-        h:                torch.Tensor | None = None,
-        bypass_predictor: bool  = False,
-        sparsify:         bool  = True,
-        sample_z:         bool  = True,
-        temperature:      float = 1.0,
-        hard:             bool  = True,
-    ) -> dict:
-        """
-        Single time-step forward pass.
-
-        Parameters
-        ----------
-        x_t              : (B, C, H, W)
-        z_prev           : (B, latent_dim)
-        a_prev           : (B, action_dim)
-        h                : GRU hidden state | None
-        bypass_predictor : True during Stage 1 (z_pred = 0)
-        sparsify         : False during Stage 1 & 2 (transmit full Δz)
-        sample_z         : True during training (reparameterisation)
-        temperature      : soft-gate temperature (Stage 3)
-        hard             : True except during Stage 3 soft-gate training
-
-        Returns
-        -------
-        dict with keys:
-          mu, log_var, z_t, z_pred, delta_z, delta_z_sparse,
-          mask, rate, nnz, bits_per_step,
-          z_rec, y_rec, h_next
-        """
-        # ── Encode ────────────────────────────────────────────────────── #
-        mu, log_var, z_t = self.jscc_encoder(x_t, sample=sample_z)
-
-        # ── Predict (Digital Twin) ────────────────────────────────────── #
-        if bypass_predictor:
-            z_pred = torch.zeros_like(z_t)
-            h_next = h
-        else:
-            z_pred, h_next = self.predictor(z_prev, a_prev, h)
-
-        # ── Innovation ───────────────────────────────────────────────── #
-        delta_z = self.subtractor(z_t, z_pred)
-
-        # ── Sparsify ─────────────────────────────────────────────────── #
-        if sparsify:
-            sp = self.sparsifier(delta_z, temperature=temperature, hard=hard)
-        else:
-            ones = torch.ones_like(delta_z)
-            sp   = {
-                "delta_z_sparse": delta_z,
-                "mask":           ones,
-                "rate":           torch.tensor(1.0, device=delta_z.device),
-                "nnz":            torch.tensor(
-                    float(self.latent_dim), device=delta_z.device
-                ),
-            }
-
-        # ── Channel ───────────────────────────────────────────────────── #
-        received    = self.channel(sp["delta_z_sparse"])
-
-        # ── Recover latent ────────────────────────────────────────────── #
-        delta_z_hat = self.reconstructor(received)
-        z_rec       = self.adder(z_pred, delta_z_hat)
-
-        # ── Decode ───────────────────────────────────────────────────── #
-        y_rec = self.reshaper(z_rec)
-
-        # ── Bit-rate ─────────────────────────────────────────────────── #
-        bits = Sparsifier.bits_per_step(sp["nnz"], self.latent_dim)
-
-        return {
-            "mu":              mu,
-            "log_var":         log_var,
-            "z_t":             z_t,
-            "z_pred":          z_pred,
-            "delta_z":         delta_z,
-            "delta_z_sparse":  sp["delta_z_sparse"],
-            "mask":            sp["mask"],
-            "rate":            sp["rate"],
-            "nnz":             sp["nnz"],
-            "bits_per_step":   bits,
-            "z_rec":           z_rec,
-            "y_rec":           y_rec,
-            "h_next":          h_next,
-        }
+        return kl.mean()
