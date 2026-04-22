@@ -30,6 +30,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import datetime
 
 from models import SemComSystem
 from dataset import GNMTrajectoryDataset, ClipDataset
@@ -157,7 +158,7 @@ class BaseTrainer:
         )
         self.writer = None
         if self.is_main:
-            self.writer = SummaryWriter(log_dir=os.path.join(self.out_dir, "tb_logs"))
+            self.writer = SummaryWriter(log_dir=os.path.join(self.out_dir, "tb_logs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
 
         self.mse = nn.MSELoss()
 
@@ -179,30 +180,40 @@ class BaseTrainer:
 
     def _encode_all_ranks(self, obs: torch.Tensor) -> torch.Tensor:
         """
-        Encode images to ViT tokens across DDP ranks.
+        Encode images to ViT tokens across DDP ranks, then layer-normalise.
 
         Only rank 0 has the real VLA.  All ranks gather their obs to rank 0,
         rank 0 encodes the full batch, then tokens are broadcast back.
-        Returns detached tokens on self.device.
+        Returns detached, layer-normalised tokens on self.device.
+
+        LayerNorm is applied per patch token across D_vit dimensions so that
+        raw DINOv2 and SigLIP features (which have very different scales and
+        spiky distributions) are brought to zero mean / unit variance before
+        the predictor or JSCC modules see them.
         """
         if not dist.is_initialized() or self.world_size == 1:
-            return self.agent.encode_image(obs).to(self.device)
+            tokens = self.agent.encode_image(obs).to(self.device)
+        else:
+            B = obs.size(0)
+            all_obs_buf = [torch.empty_like(obs) for _ in range(self.world_size)]
+            dist.all_gather(all_obs_buf, obs.contiguous())
 
-        B = obs.size(0)
-        all_obs_buf = [torch.empty_like(obs) for _ in range(self.world_size)]
-        dist.all_gather(all_obs_buf, obs.contiguous())
+            N = self.config["N_patches"]
+            D = self.config["D_vit"]
+            all_tokens = torch.zeros(
+                self.world_size * B, N, D, device=self.device, dtype=obs.dtype
+            )
+            if self.rank == 0:
+                all_obs    = torch.cat(all_obs_buf, dim=0).to(self.device)
+                all_tokens = self.agent.encode_image(all_obs).to(self.device)
 
-        N = self.config["N_patches"]
-        D = self.config["D_vit"]
-        all_tokens = torch.zeros(
-            self.world_size * B, N, D, device=self.device, dtype=obs.dtype
-        )
-        if self.rank == 0:
-            all_obs    = torch.cat(all_obs_buf, dim=0).to(self.device)
-            all_tokens = self.agent.encode_image(all_obs).to(self.device)
+            dist.broadcast(all_tokens, src=0)
+            tokens = all_tokens[self.rank * B : (self.rank + 1) * B]
 
-        dist.broadcast(all_tokens, src=0)
-        return all_tokens[self.rank * B : (self.rank + 1) * B].detach()
+        # Normalise each patch token across D_vit so the predictor sees a
+        # consistent scale regardless of DINOv2 / SigLIP magnitude differences.
+        tokens = F.layer_norm(tokens, [tokens.shape[-1]])
+        return tokens.detach()
 
     def save_checkpoint(self, filename: str, extra: dict | None = None):
         if not self.is_main:
@@ -280,7 +291,7 @@ class Stage1Trainer(BaseTrainer):
             lr=config["learning_rate"], weight_decay=0.05,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config["epochs"], eta_min=1e-6
+            self.optimizer, T_max=config["epochs"], eta_min=1e-5
         )
         self.start_epoch = 1
         self.best        = math.inf

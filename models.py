@@ -215,11 +215,10 @@ def _rope_rotate(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     D     = x.shape[-1]
     omega = 1.0 / (10000.0 ** (torch.arange(D // 2, dtype=x.dtype, device=x.device) / (D / 2.0)))
     freq  = pos.unsqueeze(-1) * omega              # (..., N, D/2)
-    cos   = freq.cos().repeat(1, 1, 1, 2)          # (..., N, D)
-    sin   = freq.sin().repeat(1, 1, 1, 2)
-    y     = x.unflatten(-1, (-1, 2))
-    y1, y2 = y.unbind(dim=-1)
-    rot   = torch.stack((-y2, y1), dim=-1).flatten(-2)
+    cos      = freq.cos().repeat(1, 1, 1, 2)           # (..., N, D) — half-split convention
+    sin      = freq.sin().repeat(1, 1, 1, 2)
+    x1, x2  = x.chunk(2, dim=-1)                      # first half, second half
+    rot      = torch.cat((-x2, x1), dim=-1)
     return x * cos + rot * sin
 
 
@@ -449,6 +448,11 @@ class Predictor(nn.Module):
         B, T, N, _ = tokens_T.shape
         x_p = self.input_proj(tokens_T.reshape(B * T, N, -1)).reshape(B, T, N, -1)
         a   = self.action_embed(actions_T)                           # (B, T, d_pred)
+
+        # Broadcast action into every patch token so all 8 layers see the
+        # action signal directly, rather than relying on attention to propagate
+        # it from a single prepended token across 256 patches.
+        x_p = x_p + a.unsqueeze(2)                                  # (B, T, N, d_pred)
 
         if self.pose_dim > 0 and poses_T is not None:
             p      = self.pose_embed(poses_T)                        # (B, T, d_pred)

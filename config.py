@@ -51,6 +51,7 @@ CONFIG = {
     "pred_mlp_ratio":  4.0,   # GELU MLP expansion ratio
     "pred_drop_path":  0.0,   # stochastic depth; try 0.1 if overfitting
     "pose_dim":          0,   # end-effector state dim; 0 = not in dataset
+    "grid_size":        16,   # sqrt(N_patches): 224/14=16 for DINOv2 patch_size=14
     "jscc_d_pred":     384,   # narrower working dim for JsccEncoder/Decoder
 
     # ── Clip length for Stage 1 training ─────────────────────────────── #
@@ -67,7 +68,7 @@ CONFIG = {
     "lambda_rate": 0.01, # λ weighting L_rate = KL(q||p) in Stage 3
 
     # ── Optimisation ─────────────────────────────────────────────────── #
-    "learning_rate": 1e-4,
+    "learning_rate": 3e-4,
     "batch_size":    8,      # per-GPU batch size
     "epochs":       10,
 
