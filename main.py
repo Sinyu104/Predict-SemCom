@@ -21,7 +21,7 @@ import torch
 
 from config  import CONFIG
 from trainer import (
-    Stage1Trainer, Stage2Trainer, Stage3Trainer,
+    Stage1Trainer, Stage2Trainer,
     init_distributed, cleanup_distributed,
 )
 from inference import run_inference
@@ -157,7 +157,7 @@ def main():
 
         if args.stage == 1:
             if is_main:
-                print("\n[main] ===== STAGE 1: TokenEncoder + TokenDecoder =====")
+                print("\n[main] ===== STAGE 1: Predictor (V-JEPA 2) =====")
             Stage1Trainer(
                 CONFIG, data_path, device, agent, rank, world_size,
                 resume_ckpt=args.resume,
@@ -171,31 +171,18 @@ def main():
                     "Run --train --stage 1 first."
                 )
             if is_main:
-                print("\n[main] ===== STAGE 2: Predictor (V-JEPA 2) =====")
+                print("\n[main] ===== STAGE 2: JSCC (Wyner-Ziv) =====")
             Stage2Trainer(
                 CONFIG, data_path, ckpt, device, agent, rank, world_size,
                 resume_ckpt=args.resume,
             ).train()
 
-        elif args.stage == 3:
-            ckpt = os.path.join(out, "stage2_best.pt")
-            if not os.path.exists(ckpt):
-                raise FileNotFoundError(
-                    f"Stage-2 checkpoint not found at '{ckpt}'."
-                )
-            if is_main:
-                print("\n[main] ===== STAGE 3: JSCC (Wyner-Ziv) =====")
-            Stage3Trainer(
-                CONFIG, data_path, ckpt, device, agent, rank, world_size,
-                resume_ckpt=args.resume,
-            ).train()
-
         else:
-            raise ValueError(f"--stage must be 1, 2, or 3. Got {args.stage}.")
+            raise ValueError(f"--stage must be 1 or 2. Got {args.stage}.")
 
     # ── INFERENCE ────────────────────────────────────────────────────── #
     elif args.inference:
-        for candidate in ["stage3_best.pt", "stage2_best.pt", "stage1_best.pt"]:
+        for candidate in ["stage2_best.pt", "stage1_best.pt"]:
             ckpt = os.path.join(out, candidate)
             if os.path.exists(ckpt):
                 break

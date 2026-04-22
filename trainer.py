@@ -2,23 +2,20 @@
 trainer.py  —  Multi-GPU training pipeline (4 × T4 on Linux server).
 
 Launch with torchrun, NOT python:
-    torchrun --nproc_per_node=4 main.py --train --stage 1 ...
+    torchrun --nproc_per_node=4 main.py --train --stage 2 ...
 
 DDP design
 -----------
-1. SemCom modules are DDP-wrapped per stage (only the trainable ones).
+1. Only trainable SemCom modules are DDP-wrapped per stage.
 2. The OpenVLAAgent is NEVER DDP-wrapped — only rank 0 has the real VLA.
-3. encode_image is called on rank 0 and the tokens are broadcast to all ranks
-   before entering the forward pass (since only rank 0 has the real ViT).
-4. task_loss_from_tokens (Stage 1) is computed on rank 0 over the gathered
-   tokens_rec from all ranks; gradients are broadcast back.
-5. Checkpoints are saved only from rank 0.
+3. encode_image is called on rank 0 and tokens are broadcast to all ranks
+   before the forward pass (only rank 0 has the real ViT).
+4. Checkpoints are saved only from rank 0.
 
 Stage overview
 --------------
-Stage 1  TokenEncoder + TokenDecoder   L_task (cross-entropy via OpenVLA LLM)
-Stage 2  Predictor                     L_world = MSE(ẑ_{t+1}, sg(z_{t+1}))
-Stage 3  JsccEncoder + JsccDecoder +   L = L_distortion + λ·L_rate
+Stage 1  Predictor                     L_world = MSE(ẑ_t^{pred}, sg(tokens_t))
+Stage 2  JsccEncoder + JsccDecoder +   L = L_distortion + λ·L_rate
          SideInfoEncoder
 """
 
@@ -26,7 +23,6 @@ import os
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -193,62 +189,6 @@ class BaseTrainer:
         dist.broadcast(all_tokens, src=0)
         return all_tokens[self.rank * B : (self.rank + 1) * B].detach()
 
-    def _task_loss_ddp(
-        self,
-        tokens_rec:  torch.Tensor,   # (B, N, D_vit) — output of TokenDecoder
-        actions_gt:  torch.Tensor,   # (B, 7)
-        instruction: str,
-        training:    bool = True,
-    ) -> torch.Tensor:
-        """
-        Task loss computed on rank 0, gradients broadcast back to all ranks.
-        Gradient flows through tokens_rec → TokenDecoder → z_t → TokenEncoder.
-        """
-        if not dist.is_initialized() or self.world_size == 1:
-            return self.agent.task_loss_from_tokens(
-                tokens_rec, instruction, actions_gt.to(tokens_rec.device)
-            )
-
-        B          = tokens_rec.size(0)
-        actions_gt = actions_gt.to(self.device)
-
-        # Gather detached tokens_rec and actions from all ranks
-        all_tok_buf = [torch.empty_like(tokens_rec) for _ in range(self.world_size)]
-        all_a_buf   = [torch.empty_like(actions_gt) for _ in range(self.world_size)]
-        dist.all_gather(all_tok_buf, tokens_rec.detach())
-        dist.all_gather(all_a_buf,   actions_gt.detach())
-
-        loss_tensor = torch.zeros(1, device=self.device)
-        N, D = tokens_rec.shape[1], tokens_rec.shape[2]
-
-        if self.rank == 0:
-            all_tok = torch.cat(all_tok_buf, dim=0).requires_grad_(True)
-            all_a   = torch.cat(all_a_buf,   dim=0)
-            if training:
-                L = self.agent.task_loss_from_tokens(all_tok, instruction, all_a)
-                L.backward()
-                grad_all    = all_tok.grad.contiguous()
-                loss_tensor = (L.detach() / self.world_size).reshape(1)
-            else:
-                with torch.no_grad():
-                    L = self.agent.task_loss_from_tokens(all_tok, instruction, all_a)
-                grad_all    = torch.zeros_like(all_tok)
-                loss_tensor = (L.detach() / self.world_size).reshape(1)
-        else:
-            grad_all = torch.empty(
-                self.world_size * B, N, D, device=self.device
-            )
-
-        dist.broadcast(grad_all,    src=0)
-        dist.broadcast(loss_tensor, src=0)
-
-        if not training:
-            return loss_tensor.squeeze()
-
-        grad_local = grad_all[self.rank * B : (self.rank + 1) * B].detach()
-        surrogate  = (tokens_rec * grad_local).sum()
-        return surrogate - surrogate.detach() + loss_tensor.squeeze()
-
     def save_checkpoint(self, filename: str, extra: dict | None = None):
         if not self.is_main:
             return
@@ -277,7 +217,7 @@ class BaseTrainer:
         if "scheduler_state" in ckpt and hasattr(self, "scheduler"):
             self.scheduler.load_state_dict(ckpt["scheduler_state"])
         if self.is_main:
-            print(f"  [ckpt] Resuming from epoch {start_epoch}  best={best:.4f}")
+            print(f"  [ckpt] Resuming from epoch {start_epoch}  best={best:.6f}")
         del ckpt
         torch.cuda.empty_cache()
         return start_epoch, best
@@ -289,17 +229,20 @@ class BaseTrainer:
 
 
 # ========================================================================== #
-#  Stage 1  —  TokenEncoder + TokenDecoder                                   #
+#  Stage 2  —  Predictor (action-conditioned V-JEPA 2)                       #
 # ========================================================================== #
 
 class Stage1Trainer(BaseTrainer):
     """
-    Train TokenEncoder and TokenDecoder end-to-end via the frozen OpenVLA
-    task loss.  Gradient path:
-        loss → logits → LLM → projector → tokens_rec
-             → TokenDecoder → z_t → TokenEncoder
+    Train the narrow transformer Predictor in V-JEPA 2 style.
 
-    Loss: L_task = CrossEntropy(LLM(Projector(tokens_rec)), a_gt)
+    Both context and target encoders are the frozen ViT.
+    The dataset triplet (obs_t, action_t, obs_tp1) maps to:
+        obs_t    → tokens_{t-1}  (context)
+        action_t → a_{t-1}       (action taken)
+        obs_tp1  → tokens_t      (target, stop-gradient)
+
+    Loss: L_world = ||ẑ_t^{pred} − sg(tokens_t)||²
     """
 
     def __init__(
@@ -313,150 +256,6 @@ class Stage1Trainer(BaseTrainer):
         resume_ckpt: str | None = None,
     ):
         super().__init__(config, data_path, device, agent, rank, world_size)
-
-        self.system.token_encoder = self._wrap_ddp(self.system.token_encoder)
-        self.system.token_decoder = self._wrap_ddp(self.system.token_decoder)
-
-        params = (
-            list(self._unwrap(self.system.token_encoder).parameters()) +
-            list(self._unwrap(self.system.token_decoder).parameters())
-        )
-        self.optimizer = optim.Adam(params, lr=config["learning_rate"])
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config["epochs"], eta_min=1e-6
-        )
-        self.instruction = config.get("openvla_instruction", "")
-
-        self.start_epoch = 1
-        self.best        = math.inf
-        if resume_ckpt:
-            self.start_epoch, self.best = self._load_resume(resume_ckpt)
-
-    def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
-        self.system.token_encoder.train(train)
-        self.system.token_decoder.train(train)
-        if train and hasattr(loader.sampler, "set_epoch"):
-            loader.sampler.set_epoch(epoch)
-
-        totals = {"task": 0.0, "total": 0.0}
-        n      = 0
-        phase  = "train" if train else "val"
-        pbar   = tqdm(loader, desc=f"  {phase} ep {epoch}",
-                      disable=not self.is_main, leave=False, dynamic_ncols=True)
-
-        with torch.set_grad_enabled(train):
-            for obs_t, act_t, _ in pbar:
-                obs_t = obs_t.to(self.device)
-                act_t = act_t.to(self.device)
-
-                # Encode images on rank 0, broadcast tokens to all ranks
-                vit_tokens = self._encode_all_ranks(obs_t)   # (B, N, D_vit), detached
-
-                # Forward through trainable modules
-                z_t        = self.system.token_encoder(vit_tokens)
-                tokens_rec = self.system.token_decoder(z_t)
-
-                # Task loss via frozen OpenVLA
-                L_task = self._task_loss_ddp(tokens_rec, act_t, self.instruction, train)
-
-                if train:
-                    self.optimizer.zero_grad()
-                    L_task.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(self._unwrap(self.system.token_encoder).parameters()) +
-                        list(self._unwrap(self.system.token_decoder).parameters()),
-                        max_norm=5.0,
-                    )
-                    self.optimizer.step()
-
-                totals["task"]  += L_task.item()
-                totals["total"] += L_task.item()
-                n += 1
-                pbar.set_postfix(task=f"{L_task.item():.4f}")
-
-        avg = {}
-        for k, v in totals.items():
-            t      = torch.tensor(v / max(n, 1), device=self.device)
-            avg[k] = reduce_mean(t).item()
-        return avg
-
-    def train(self):
-        best   = self.best
-        epochs = self.config["epochs"]
-        if self.is_main:
-            print(f"\n[Stage1] TokenEncoder + TokenDecoder for {epochs} epochs "
-                  f"on {self.world_size} GPU(s) …")
-
-        for ep in range(self.start_epoch, epochs + 1):
-            tr = self._run_epoch(self.train_loader, True,  ep)
-            vl = self._run_epoch(self.val_loader,   False, ep)
-            self.scheduler.step()
-
-            if self.is_main:
-                self._log("Stage1", {"train_" + k: v for k, v in tr.items()}, ep)
-                self._log("Stage1", {"val_"   + k: v for k, v in vl.items()}, ep)
-                print(
-                    f"[Stage1] ep {ep:3d}/{epochs}  "
-                    f"train={tr['total']:.4f}  val={vl['total']:.4f}"
-                )
-                ckpt_payload = {
-                    "epoch": ep, "best": best,
-                    "optimizer_state": self.optimizer.state_dict(),
-                    "scheduler_state": self.scheduler.state_dict(),
-                    **vl,
-                }
-                self.save_checkpoint(f"stage1_ep{ep:04d}.pt", ckpt_payload)
-                if vl["total"] < best:
-                    best = vl["total"]
-                    ckpt_payload["best"] = best
-                    self.save_checkpoint("stage1_best.pt", ckpt_payload)
-
-        self.save_checkpoint("stage1_final.pt", {
-            "epoch": epochs, "best": best,
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.scheduler.state_dict(),
-        })
-        if self.is_main and self.writer:
-            self.writer.close()
-        if self.is_main:
-            print(f"[Stage1] Done. Best val={best:.4f}")
-
-
-# ========================================================================== #
-#  Stage 2  —  Predictor (action-conditioned V-JEPA 2)                       #
-# ========================================================================== #
-
-class Stage2Trainer(BaseTrainer):
-    """
-    Train the Predictor in JEPA style.
-
-    Both context and target encoders (ViT + TokenEncoder) are frozen.
-    The dataset triplet (obs_t, action_t, obs_tp1) is used as:
-        obs_t   → z_{t-1}  (context / previous latent)
-        action_t → a_{t-1} (action taken)
-        obs_tp1 → z_t      (target / current latent, stop-gradient)
-
-    Loss: L_world = ||ẑ_t^{pred} − sg(z_t)||²
-    """
-
-    def __init__(
-        self,
-        config:      dict,
-        data_path:   str,
-        stage1_ckpt: str,
-        device:      torch.device,
-        agent,
-        rank:        int,
-        world_size:  int,
-        resume_ckpt: str | None = None,
-    ):
-        super().__init__(config, data_path, device, agent, rank, world_size)
-        self.load_checkpoint(stage1_ckpt)
-
-        for p in self.system.token_encoder.parameters(): p.requires_grad_(False)
-        for p in self.system.token_decoder.parameters(): p.requires_grad_(False)
-        if self.is_main:
-            print("[Stage2] TokenEncoder + TokenDecoder frozen.")
 
         self.system.predictor = self._wrap_ddp(self.system.predictor)
         self.optimizer = optim.Adam(
@@ -488,18 +287,14 @@ class Stage2Trainer(BaseTrainer):
                 act_t   = act_t.to(self.device)
                 obs_tp1 = obs_tp1.to(self.device)
 
-                # Encode both frames; tokens are stop-gradient
-                tok_prev = self._encode_all_ranks(obs_t)    # z_{t-1} context
-                tok_curr = self._encode_all_ranks(obs_tp1)  # z_t target
+                # Encode both frames (frozen ViT, broadcast across ranks)
+                tok_prev = self._encode_all_ranks(obs_t)    # (B, N, D_vit) context
+                tok_curr = self._encode_all_ranks(obs_tp1)  # (B, N, D_vit) target
 
-                with torch.no_grad():
-                    z_prev = self.system.token_encoder(tok_prev)   # (B, latent_dim)
-                    z_t    = self.system.token_encoder(tok_curr)   # (B, latent_dim)
+                # Predictor forward
+                z_pred = self.system.predictor(tok_prev, act_t)  # (B, N, D_vit)
 
-                # Predictor forward (only these parameters receive gradient)
-                z_pred = self.system.predictor(z_prev, act_t)
-
-                L_world = self.mse(z_pred, z_t.detach())
+                L_world = self.mse(z_pred, tok_curr.detach())
 
                 if train:
                     self.optimizer.zero_grad()
@@ -512,7 +307,7 @@ class Stage2Trainer(BaseTrainer):
                 totals["world"] += L_world.item()
                 totals["total"] += L_world.item()
                 n += 1
-                pbar.set_postfix(world=f"{L_world.item():.5f}")
+                pbar.set_postfix(world=f"{L_world.item():.6f}")
 
         avg = {}
         for k, v in totals.items():
@@ -524,7 +319,7 @@ class Stage2Trainer(BaseTrainer):
         best   = self.best
         epochs = self.config["epochs"]
         if self.is_main:
-            print(f"\n[Stage2] Predictor training for {epochs} epochs "
+            print(f"\n[Stage1] Predictor training for {epochs} epochs "
                   f"on {self.world_size} GPU(s) …")
 
         for ep in range(self.start_epoch, epochs + 1):
@@ -533,22 +328,22 @@ class Stage2Trainer(BaseTrainer):
             self.scheduler.step()
 
             if self.is_main:
-                self._log("Stage2", {"train_" + k: v for k, v in tr.items()}, ep)
-                self._log("Stage2", {"val_"   + k: v for k, v in vl.items()}, ep)
+                self._log("Stage1", {"train_" + k: v for k, v in tr.items()}, ep)
+                self._log("Stage1", {"val_"   + k: v for k, v in vl.items()}, ep)
                 print(
-                    f"[Stage2] ep {ep:3d}/{epochs}  "
-                    f"train={tr['total']:.5f}  val={vl['total']:.5f}"
+                    f"[Stage1] ep {ep:3d}/{epochs}  "
+                    f"train={tr['total']:.6f}  val={vl['total']:.6f}"
                 )
                 if vl["total"] < best:
                     best = vl["total"]
-                    self.save_checkpoint("stage2_best.pt", {
+                    self.save_checkpoint("stage1_best.pt", {
                         "epoch": ep, "best": best,
                         "optimizer_state": self.optimizer.state_dict(),
                         "scheduler_state": self.scheduler.state_dict(),
                         **vl,
                     })
 
-        self.save_checkpoint("stage2_final.pt", {
+        self.save_checkpoint("stage1_final.pt", {
             "epoch": epochs, "best": best,
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
@@ -556,28 +351,27 @@ class Stage2Trainer(BaseTrainer):
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
-            print(f"[Stage2] Done. Best val={best:.5f}")
+            print(f"[Stage1] Done. Best val={best:.6f}")
 
 
 # ========================================================================== #
 #  Stage 3  —  JSCC (Wyner-Ziv)                                              #
 # ========================================================================== #
 
-class Stage3Trainer(BaseTrainer):
+class Stage2Trainer(BaseTrainer):
     """
     Train JsccEncoder, JsccDecoder, and SideInfoEncoder.
 
-    All Stage 1/2 modules are frozen.  The Predictor provides side information
-    ẑ_t^{pred} — the receiver's prior estimate of z_t.
+    Predictor is frozen and provides side information ẑ_t^{pred}.
 
-    Loss: L = ||z_t − ẑ_t||² + λ · KL(q(ŝ_t|z_t) || p(ŝ_t|ẑ_t^{pred}))
+    Loss: L = MSE(token_hat, tokens_t) + λ · KL(q(ŝ_t|tokens_t) || p(ŝ_t|ẑ_t^{pred}))
     """
 
     def __init__(
         self,
         config:      dict,
         data_path:   str,
-        stage2_ckpt: str,
+        stage1_ckpt: str,
         device:      torch.device,
         agent,
         rank:        int,
@@ -585,16 +379,13 @@ class Stage3Trainer(BaseTrainer):
         resume_ckpt: str | None = None,
     ):
         super().__init__(config, data_path, device, agent, rank, world_size)
-        self.load_checkpoint(stage2_ckpt)
+        self.load_checkpoint(stage1_ckpt)
 
-        # Freeze everything from Stages 1 and 2
-        for p in self.system.token_encoder.parameters():  p.requires_grad_(False)
-        for p in self.system.token_decoder.parameters():  p.requires_grad_(False)
-        for p in self.system.predictor.parameters():      p.requires_grad_(False)
+        for p in self.system.predictor.parameters():
+            p.requires_grad_(False)
         if self.is_main:
-            print("[Stage3] TokenEncoder, TokenDecoder, Predictor frozen.")
+            print("[Stage3] Predictor frozen.")
 
-        # Wrap trainable modules in DDP
         self.system.jscc_encoder      = self._wrap_ddp(self.system.jscc_encoder)
         self.system.jscc_decoder      = self._wrap_ddp(self.system.jscc_decoder)
         self.system.side_info_encoder = self._wrap_ddp(self.system.side_info_encoder)
@@ -635,30 +426,27 @@ class Stage3Trainer(BaseTrainer):
                 act_t   = act_t.to(self.device)
                 obs_tp1 = obs_tp1.to(self.device)
 
-                # Encode frames; all stop-gradient (frozen encoders)
-                tok_prev = self._encode_all_ranks(obs_t)
-                tok_curr = self._encode_all_ranks(obs_tp1)
+                tok_prev = self._encode_all_ranks(obs_t)    # (B, N, D_vit)
+                tok_curr = self._encode_all_ranks(obs_tp1)  # (B, N, D_vit)
 
+                # Frozen predictor provides side information
                 with torch.no_grad():
-                    z_prev     = self.system.token_encoder(tok_prev)
-                    z_t        = self.system.token_encoder(tok_curr)
-                    # Predictor side information (receiver's prior estimate of z_t)
-                    z_pred_si  = self.system.predictor(z_prev, act_t)
+                    z_pred_si = self.system.predictor(tok_prev, act_t)  # (B, N, D_vit)
 
-                # JSCC encoding (trainable, gradient flows here)
-                mu_enc, log_var_enc, s_t = self.system.jscc_encoder(z_t, sample=train)
-
-                # Wireless channel
+                # JSCC encoding (trainable)
+                mu_enc, log_var_enc, s_t = self.system.jscc_encoder(
+                    tok_curr, sample=train
+                )
                 s_hat = self.system.channel(s_t)
 
                 # Conditional prior (trainable, loss only)
                 mu_prior, log_var_prior = self.system.side_info_encoder(z_pred_si)
 
-                # JSCC decoding (trainable, gradient flows here)
-                z_hat = self.system.jscc_decoder(s_hat, z_pred_si)
+                # JSCC decoding (trainable)
+                token_hat = self.system.jscc_decoder(s_hat, z_pred_si)
 
                 # Losses
-                L_distortion = self.mse(z_hat, z_t.detach())
+                L_distortion = self.mse(token_hat, tok_curr.detach())
                 L_rate       = SemComSystem.rate_loss(
                     mu_enc, log_var_enc, mu_prior, log_var_prior, self.snr_db
                 )
@@ -695,7 +483,7 @@ class Stage3Trainer(BaseTrainer):
         epochs = self.config["epochs"]
         if self.is_main:
             print(
-                f"\n[Stage3] JSCC (Wyner-Ziv) training for {epochs} epochs "
+                f"\n[Stage2] JSCC (Wyner-Ziv) training for {epochs} epochs "
                 f"on {self.world_size} GPU(s) …  λ={self.lambda_rate}"
             )
 
@@ -705,24 +493,24 @@ class Stage3Trainer(BaseTrainer):
             self.scheduler.step()
 
             if self.is_main:
-                self._log("Stage3", {"train_" + k: v for k, v in tr.items()}, ep)
-                self._log("Stage3", {"val_"   + k: v for k, v in vl.items()}, ep)
+                self._log("Stage2", {"train_" + k: v for k, v in tr.items()}, ep)
+                self._log("Stage2", {"val_"   + k: v for k, v in vl.items()}, ep)
                 print(
-                    f"[Stage3] ep {ep:3d}/{epochs}  "
+                    f"[Stage2] ep {ep:3d}/{epochs}  "
                     f"val_dist={vl['distortion']:.5f}  "
                     f"val_rate={vl['rate']:.5f}  "
                     f"val_total={vl['total']:.5f}"
                 )
                 if vl["total"] < best:
                     best = vl["total"]
-                    self.save_checkpoint("stage3_best.pt", {
+                    self.save_checkpoint("stage2_best.pt", {
                         "epoch": ep, "best": best,
                         "optimizer_state": self.optimizer.state_dict(),
                         "scheduler_state": self.scheduler.state_dict(),
                         **vl,
                     })
 
-        self.save_checkpoint("stage3_final.pt", {
+        self.save_checkpoint("stage2_final.pt", {
             "epoch": epochs, "best": best,
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
@@ -730,4 +518,4 @@ class Stage3Trainer(BaseTrainer):
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
-            print(f"[Stage3] Done. Best val={best:.5f}")
+            print(f"[Stage2] Done. Best val={best:.5f}")

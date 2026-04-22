@@ -30,11 +30,10 @@ CONFIG = {
     "N_patches":  256,   # Number of ViT patch tokens (16×16 for 224×224 input)
     "D_model":   4096,   # LLM hidden dimension (LLaMA-2-7B), informational only
 
-    # ── Latent / JSCC ────────────────────────────────────────────────── #
-    "latent_dim": 512,   # TokenEncoder / TokenDecoder bottleneck
-    "D_jscc":     256,   # JSCC channel dimension (s_t transmitted symbols)
-    "hidden_dim": 512,   # MLP hidden size shared across TokenEncoder, Predictor, etc.
-    "action_dim":   7,   # OpenVLA: [x, y, z, rx, ry, rz, gripper]
+    # ── JSCC / Predictor ─────────────────────────────────────────────── #
+    "D_jscc":   512,   # JSCC channel dimension (s_t transmitted symbols)
+    "d_pred":   384,   # Narrow working dim for Predictor transformer and JsccDecoder
+    "action_dim":  7,  # OpenVLA: [x, y, z, rx, ry, rz, gripper]
 
     # ── Channel ──────────────────────────────────────────────────────── #
     "snr_db": 10.0,      # Rayleigh channel SNR in dB; sweep for ablation
