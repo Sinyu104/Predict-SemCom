@@ -31,9 +31,34 @@ CONFIG = {
     "D_model":   4096,   # LLM hidden dimension (LLaMA-2-7B), informational only
 
     # ── JSCC / Predictor ─────────────────────────────────────────────── #
-    "D_jscc":   512,   # JSCC channel dimension (s_t transmitted symbols)
-    "d_pred":   384,   # Narrow working dim for Predictor transformer and JsccDecoder
-    "action_dim":  7,  # OpenVLA: [x, y, z, rx, ry, rz, gripper]
+    "D_jscc":      512,   # JSCC channel dimension (s_t transmitted symbols)
+    "action_dim":    7,   # OpenVLA: [x, y, z, rx, ry, rz, gripper]
+
+    # ── Predictor architecture ───────────────────────────────────────── #
+    # Paper spec is 1024d/24L/16H (~300M), designed for large-scale training.
+    # For our single-task Franka dataset (~24K clips), a much smaller model
+    # trains faster and generalises better.  Gradient only flows through the
+    # predictor (frozen ViT + frozen OpenVLA), so iteration is very fast.
+    #
+    # Chosen: 512d / 8L / 8H  (~27M params)
+    #   head_dim = 512/8 = 64; 3D-RoPE: d_dim=h_dim=w_dim=20, remainder=4.
+    #
+    # To scale up (e.g. on A100 with more data):
+    #   "d_pred": 1024, "pred_n_layers": 24, "pred_n_heads": 16  (~307M)
+    "d_pred":          512,   # predictor hidden dim
+    "pred_n_layers":     8,   # transformer depth
+    "pred_n_heads":      8,   # attention heads  (head_dim = 64)
+    "pred_mlp_ratio":  4.0,   # GELU MLP expansion ratio
+    "pred_drop_path":  0.0,   # stochastic depth; try 0.1 if overfitting
+    "pose_dim":          0,   # end-effector state dim; 0 = not in dataset
+    "jscc_d_pred":     384,   # narrower working dim for JsccEncoder/Decoder
+
+    # ── Clip length for Stage 1 training ─────────────────────────────── #
+    # Paper: T=16 frames (4 sec at 4 fps). Memory note for 4×T4 (16 GB):
+    #   T=16 → seq_len=4128, requires Flash Attention (Ampere+) or reduce T.
+    #   T=4  → seq_len=1028, safe on T4 with batch_size=2.
+    #   T=8  → seq_len=2056, tight but feasible with batch_size=1.
+    "clip_length": 4,   # set to 16 to match paper if using A100/H100
 
     # ── Channel ──────────────────────────────────────────────────────── #
     "snr_db": 10.0,      # Rayleigh channel SNR in dB; sweep for ablation
@@ -43,7 +68,7 @@ CONFIG = {
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 1e-4,
-    "batch_size":    2,      # per-GPU batch size
+    "batch_size":    8,      # per-GPU batch size
     "epochs":       10,
 
     # ── Multi-GPU (DDP) ──────────────────────────────────────────────── #

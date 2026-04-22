@@ -6,26 +6,33 @@ HDF5 layouts supported (auto-detected)
 Layout A — flat arrays (all episodes concatenated):
     /observations   (N, H, W, C)    uint8 or float32 RGB images
     /actions        (N, action_dim)  float32
+    /poses          (N, pose_dim)    float32  [optional]
 
 Layout B — episodic groups (produced by isaac_collector.py):
     /episode_0/observations  (T, H, W, C)
     /episode_0/actions       (T, action_dim)
+    /episode_0/poses         (T, pose_dim)   [optional]
     /episode_1/...
 
-For each valid index i the dataset returns a triplet:
-    obs_t    : (C, H, W)      float32 [0,1]  — observation at time t
-    action_t : (action_dim,)  float32        — action taken at time t
-    obs_tp1  : (C, H, W)      float32 [0,1]  — observation at time t+1
+Two dataset classes
+--------------------
+GNMTrajectoryDataset  — single-step pairs (obs_t, action_t, obs_tp1).
+                        Used by Stage 2 (JSCC) trainer.
+
+ClipDataset           — T-frame clips for multi-frame predictor training
+                        (V-JEPA 2-AC, paper §3.1).
+                        Returns (frames, actions, poses) where:
+                          frames  : (T, C, H, W)  float32 [0,1]
+                          actions : (T, action_dim) float32 — a_k at step k;
+                                    a_T = 0 (dummy, padded internally)
+                          poses   : (T, pose_dim) float32, or zeros if absent
 
 Notes
 -----
 • Images are always returned as (C, H, W) float32 normalised to [0, 1].
 • Images are auto-resized to (obs_height, obs_width) if needed.
 • Alpha channels are silently dropped.
-• The action vector length is validated against config["action_dim"]
-  when build_dataloaders() is called, catching mismatches early.
 • num_workers defaults to 0 to avoid h5py multiprocessing issues.
-  Increase if your h5py is built with thread-safe HDF5.
 """
 
 import os
@@ -34,6 +41,25 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 import h5py
+
+
+def _preprocess_obs(
+    obs_np:      np.ndarray,
+    obs_height:  int,
+    obs_width:   int,
+) -> torch.Tensor:
+    """(H,W,C) or (C,H,W) uint8/float32 → (C,H,W) float32 [0,1], resized."""
+    if obs_np.ndim == 3 and obs_np.shape[0] in (1, 3, 4):
+        obs_np = obs_np.transpose(1, 2, 0)
+    obs_np = obs_np.astype(np.float32) / 255.0 if obs_np.dtype == np.uint8 \
+             else np.clip(obs_np.astype(np.float32), 0.0, 1.0)
+    if obs_np.ndim == 3 and obs_np.shape[2] == 4:
+        obs_np = obs_np[..., :3]
+    t = torch.from_numpy(obs_np).permute(2, 0, 1).contiguous()
+    if t.shape[1] != obs_height or t.shape[2] != obs_width:
+        t = TF.resize(t, [obs_height, obs_width],
+                      interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
+    return t
 
 
 class GNMTrajectoryDataset(Dataset):
@@ -108,36 +134,7 @@ class GNMTrajectoryDataset(Dataset):
     # ------------------------------------------------------------------ #
 
     def _preprocess_obs(self, obs_np: np.ndarray) -> torch.Tensor:
-        """
-        (H,W,C) or (C,H,W) uint8/float32 numpy → (C,H,W) float32 [0,1]
-        """
-        # Ensure HWC layout
-        if obs_np.ndim == 3 and obs_np.shape[0] in (1, 3, 4):
-            obs_np = obs_np.transpose(1, 2, 0)
-
-        # Normalise to [0, 1]
-        if obs_np.dtype == np.uint8:
-            obs_np = obs_np.astype(np.float32) / 255.0
-        else:
-            obs_np = np.clip(obs_np.astype(np.float32), 0.0, 1.0)
-
-        # Drop alpha channel
-        if obs_np.ndim == 3 and obs_np.shape[2] == 4:
-            obs_np = obs_np[..., :3]
-
-        # HWC → CHW
-        t = torch.from_numpy(obs_np).permute(2, 0, 1).contiguous()
-
-        # Resize if needed
-        if t.shape[1] != self.obs_height or t.shape[2] != self.obs_width:
-            t = TF.resize(
-                t,
-                [self.obs_height, self.obs_width],
-                interpolation=TF.InterpolationMode.BILINEAR,
-                antialias=True,
-            )
-
-        return t   # (C, H, W) float32
+        return _preprocess_obs(obs_np, self.obs_height, self.obs_width)
 
     # ------------------------------------------------------------------ #
     #  Dataset interface                                                   #
@@ -171,6 +168,106 @@ class GNMTrajectoryDataset(Dataset):
         obs_tp1 = self._preprocess_obs(obs_tp1)
 
         return obs_t, torch.from_numpy(action_t), obs_tp1
+
+
+# ========================================================================== #
+#  ClipDataset — T-frame clips for V-JEPA 2-AC Stage 1 training             #
+# ========================================================================== #
+
+class ClipDataset(Dataset):
+    """
+    Returns T-frame clips sampled from the same episode.
+
+    Returns
+    -------
+    frames  : (T, C, H, W)      float32 [0,1]
+    actions : (T, action_dim)   float32  — a_k at step k (clip has T steps)
+    poses   : (T, pose_dim)     float32  — zeros if /poses absent in HDF5
+    """
+
+    def __init__(
+        self,
+        hdf5_path:    str,
+        obs_height:   int = 224,
+        obs_width:    int = 224,
+        obs_channels: int = 3,
+        clip_length:  int = 16,
+    ):
+        super().__init__()
+        self.hdf5_path   = hdf5_path
+        self.obs_height  = obs_height
+        self.obs_width   = obs_width
+        self.clip_length = clip_length
+
+        self._index      = []   # (layout_key, start_idx)
+        self._action_dim = None
+        self._pose_dim   = 0
+        self._load_index()
+
+    def _load_index(self):
+        T = self.clip_length
+        if not os.path.exists(self.hdf5_path):
+            raise FileNotFoundError(f"HDF5 not found: '{self.hdf5_path}'")
+
+        with h5py.File(self.hdf5_path, "r") as f:
+            if "observations" in f:
+                n = len(f["observations"])
+                self._index = [("flat", i) for i in range(n - T + 1)]
+                if "actions" in f and f["actions"].ndim > 1:
+                    self._action_dim = f["actions"].shape[1]
+                if "poses" in f and f["poses"].ndim > 1:
+                    self._pose_dim = f["poses"].shape[1]
+            else:
+                for ep_key in sorted(f.keys()):
+                    grp = f[ep_key]
+                    if "observations" not in grp or "actions" not in grp:
+                        continue
+                    n = len(grp["observations"])
+                    if n < T:
+                        continue
+                    for i in range(n - T + 1):
+                        self._index.append((ep_key, i))
+                    if self._action_dim is None and grp["actions"].ndim > 1:
+                        self._action_dim = grp["actions"].shape[1]
+                    if self._pose_dim == 0 and "poses" in grp and grp["poses"].ndim > 1:
+                        self._pose_dim = grp["poses"].shape[1]
+
+        if not self._index:
+            raise ValueError(
+                f"No clips of length {T} found in '{self.hdf5_path}'. "
+                "Check clip_length or episode lengths."
+            )
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int):
+        layout_key, start = self._index[idx]
+        T = self.clip_length
+        end = start + T
+
+        with h5py.File(self.hdf5_path, "r") as f:
+            if layout_key == "flat":
+                obs_arr    = np.array(f["observations"][start:end])
+                action_arr = np.array(f["actions"][start:end], dtype=np.float32)
+                pose_arr   = np.array(f["poses"][start:end], dtype=np.float32) \
+                             if "poses" in f else None
+            else:
+                grp        = f[layout_key]
+                obs_arr    = np.array(grp["observations"][start:end])
+                action_arr = np.array(grp["actions"][start:end], dtype=np.float32)
+                pose_arr   = np.array(grp["poses"][start:end], dtype=np.float32) \
+                             if "poses" in grp else None
+
+        frames  = torch.stack([
+            _preprocess_obs(obs_arr[k], self.obs_height, self.obs_width)
+            for k in range(T)
+        ])                                                    # (T, C, H, W)
+        actions = torch.from_numpy(action_arr)                # (T, action_dim)
+        poses   = torch.from_numpy(pose_arr) if pose_arr is not None \
+                  else torch.zeros(T, max(self._pose_dim, 1)) # (T, pose_dim) or zeros
+
+        return frames, actions, poses
 
 
 # ========================================================================== #

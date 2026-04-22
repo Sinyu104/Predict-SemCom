@@ -23,6 +23,7 @@ import os
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,7 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models import SemComSystem
-from dataset import GNMTrajectoryDataset
+from dataset import GNMTrajectoryDataset, ClipDataset
 
 
 # ========================================================================== #
@@ -66,16 +67,27 @@ def reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def build_ddp_loaders(
-    config: dict, hdf5_path: str, rank: int, world_size: int
+    config: dict, hdf5_path: str, rank: int, world_size: int,
+    clip_length: int = 1,
 ) -> tuple[DataLoader, DataLoader]:
     from torch.utils.data import random_split
 
-    full_ds = GNMTrajectoryDataset(
-        hdf5_path    = hdf5_path,
-        obs_height   = config["obs_height"],
-        obs_width    = config["obs_width"],
-        obs_channels = config["obs_channels"],
-    )
+    if clip_length > 1:
+        full_ds = ClipDataset(
+            hdf5_path    = hdf5_path,
+            obs_height   = config["obs_height"],
+            obs_width    = config["obs_width"],
+            obs_channels = config["obs_channels"],
+            clip_length  = clip_length,
+        )
+    else:
+        full_ds = GNMTrajectoryDataset(
+            hdf5_path    = hdf5_path,
+            obs_height   = config["obs_height"],
+            obs_width    = config["obs_width"],
+            obs_channels = config["obs_channels"],
+        )
+
     if full_ds._action_dim is not None:
         expected = config.get("action_dim", 7)
         if full_ds._action_dim != expected:
@@ -140,7 +152,7 @@ class BaseTrainer:
 
         self.system = SemComSystem(config).to(device)
 
-        self.train_loader, self.val_loader = build_ddp_loaders(
+        self.train_loader, self.val_loader = self._build_loaders(
             config, data_path, rank, world_size
         )
         self.writer = None
@@ -148,6 +160,9 @@ class BaseTrainer:
             self.writer = SummaryWriter(log_dir=os.path.join(self.out_dir, "tb_logs"))
 
         self.mse = nn.MSELoss()
+
+    def _build_loaders(self, config, data_path, rank, world_size):
+        return build_ddp_loaders(config, data_path, rank, world_size)
 
     def _wrap_ddp(self, module: nn.Module) -> nn.Module:
         if self.world_size > 1:
@@ -234,15 +249,16 @@ class BaseTrainer:
 
 class Stage1Trainer(BaseTrainer):
     """
-    Train the narrow transformer Predictor in V-JEPA 2 style.
+    Train the Predictor following V-JEPA 2-AC (paper §3.1).
 
-    Both context and target encoders are the frozen ViT.
-    The dataset triplet (obs_t, action_t, obs_tp1) maps to:
-        obs_t    → tokens_{t-1}  (context)
-        action_t → a_{t-1}       (action taken)
-        obs_tp1  → tokens_t      (target, stop-gradient)
+    Training uses T-frame clips (default T=16 at 4 fps = 4 sec).
+    Two losses are combined (both L1):
+      Eq. 2 — teacher-forcing : (1/T) Σ_k ||ẑ_{k+1} - z_{k+1}||_1
+      Eq. 3 — rollout (2-step): ||ẑ_3^{AR} - z_3||_1
+      Total : L = L_tf + L_rollout
 
-    Loss: L_world = ||ẑ_t^{pred} − sg(tokens_t)||²
+    The frozen ViT encodes each frame independently.
+    Only the Predictor is trained.
     """
 
     def __init__(
@@ -255,12 +271,13 @@ class Stage1Trainer(BaseTrainer):
         world_size:  int,
         resume_ckpt: str | None = None,
     ):
+        self.clip_length = config.get("clip_length", 16)
         super().__init__(config, data_path, device, agent, rank, world_size)
 
         self.system.predictor = self._wrap_ddp(self.system.predictor)
-        self.optimizer = optim.Adam(
+        self.optimizer = optim.AdamW(
             self._unwrap(self.system.predictor).parameters(),
-            lr=config["learning_rate"],
+            lr=config["learning_rate"], weight_decay=0.05,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config["epochs"], eta_min=1e-6
@@ -270,44 +287,78 @@ class Stage1Trainer(BaseTrainer):
         if resume_ckpt:
             self.start_epoch, self.best = self._load_resume(resume_ckpt)
 
+    def _build_loaders(self, config, data_path, rank, world_size):
+        return build_ddp_loaders(config, data_path, rank, world_size,
+                                 clip_length=self.clip_length)
+
+    def _encode_clip(self, frames: torch.Tensor) -> torch.Tensor:
+        """
+        frames : (B, T, C, H, W)
+        Returns tokens : (B, T, N, D_vit)  — each frame encoded independently.
+        """
+        B, T, C, H, W = frames.shape
+        flat   = frames.reshape(B * T, C, H, W)
+        tokens = self._encode_all_ranks(flat)                # (B*T, N, D_vit)
+        return tokens.reshape(B, T, tokens.size(1), tokens.size(2))
+
     def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
         self._unwrap(self.system.predictor).train(train)
         if train and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
 
-        totals = {"world": 0.0, "total": 0.0}
+        totals = {"tf": 0.0, "rollout": 0.0, "cosine": 0.0, "total": 0.0}
         n      = 0
         phase  = "train" if train else "val"
         pbar   = tqdm(loader, desc=f"  {phase} ep {epoch}",
                       disable=not self.is_main, leave=False, dynamic_ncols=True)
 
         with torch.set_grad_enabled(train):
-            for obs_t, act_t, obs_tp1 in pbar:
-                obs_t   = obs_t.to(self.device)
-                act_t   = act_t.to(self.device)
-                obs_tp1 = obs_tp1.to(self.device)
+            for frames, actions, poses in pbar:
+                frames  = frames.to(self.device)              # (B, T, C, H, W)
+                actions = actions.to(self.device)             # (B, T, action_dim)
+                # poses not used when pose_dim=0
 
-                # Encode both frames (frozen ViT, broadcast across ranks)
-                tok_prev = self._encode_all_ranks(obs_t)    # (B, N, D_vit) context
-                tok_curr = self._encode_all_ranks(obs_tp1)  # (B, N, D_vit) target
+                # Encode all T frames with frozen ViT
+                tokens = self._encode_clip(frames).detach()   # (B, T, N, D_vit)
+                B, T   = tokens.shape[:2]
 
-                # Predictor forward
-                z_pred = self.system.predictor(tok_prev, act_t)  # (B, N, D_vit)
+                pred = self._unwrap(self.system.predictor)
 
-                L_world = self.mse(z_pred, tok_curr.detach())
+                # ── Teacher-forcing loss (Eq. 2, L1) ────────────────── #
+                preds_tf = pred.forward_clip(
+                    tokens, actions[:, :-1]                   # T-1 actions a_1..a_{T-1}
+                )                                             # (B, T-1, N, D_vit)
+                targets  = tokens[:, 1:].detach()             # (B, T-1, N, D_vit)
+                L_tf     = F.l1_loss(preds_tf, targets)
+
+                # ── Rollout loss (Eq. 3, L1, 2-step AR) ─────────────── #
+                z_hat_3  = pred.rollout_2step(tokens, actions[:, :2])
+                L_roll   = F.l1_loss(z_hat_3, tokens[:, 2].detach())
+
+                loss = L_tf + L_roll
 
                 if train:
                     self.optimizer.zero_grad()
-                    L_world.backward()
-                    nn.utils.clip_grad_norm_(
-                        self._unwrap(self.system.predictor).parameters(), 5.0
-                    )
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
                     self.optimizer.step()
 
-                totals["world"] += L_world.item()
-                totals["total"] += L_world.item()
+                with torch.no_grad():
+                    cos_sim = F.cosine_similarity(
+                        preds_tf.detach().float(),
+                        targets.float(), dim=-1
+                    ).mean().item()
+
+                totals["tf"]     += L_tf.item()
+                totals["rollout"] += L_roll.item()
+                totals["cosine"] += cos_sim
+                totals["total"]  += loss.item()
                 n += 1
-                pbar.set_postfix(world=f"{L_world.item():.6f}")
+                pbar.set_postfix(
+                    tf=f"{L_tf.item():.4f}",
+                    ro=f"{L_roll.item():.4f}",
+                    cos=f"{cos_sim:.3f}",
+                )
 
         avg = {}
         for k, v in totals.items():
@@ -319,8 +370,9 @@ class Stage1Trainer(BaseTrainer):
         best   = self.best
         epochs = self.config["epochs"]
         if self.is_main:
-            print(f"\n[Stage1] Predictor training for {epochs} epochs "
-                  f"on {self.world_size} GPU(s) …")
+            print(f"\n[Stage1] V-JEPA 2-AC predictor training  "
+                  f"T={self.clip_length} frames  {epochs} epochs  "
+                  f"{self.world_size} GPU(s)")
 
         for ep in range(self.start_epoch, epochs + 1):
             tr = self._run_epoch(self.train_loader, True,  ep)
@@ -328,11 +380,14 @@ class Stage1Trainer(BaseTrainer):
             self.scheduler.step()
 
             if self.is_main:
+                lr = self.optimizer.param_groups[0]["lr"]
                 self._log("Stage1", {"train_" + k: v for k, v in tr.items()}, ep)
                 self._log("Stage1", {"val_"   + k: v for k, v in vl.items()}, ep)
+                self._log("Stage1", {"lr": lr}, ep)
                 print(
                     f"[Stage1] ep {ep:3d}/{epochs}  "
-                    f"train={tr['total']:.6f}  val={vl['total']:.6f}"
+                    f"val_tf={vl['tf']:.4f}  val_ro={vl['rollout']:.4f}  "
+                    f"val_cos={vl['cosine']:.3f}  lr={lr:.2e}"
                 )
                 if vl["total"] < best:
                     best = vl["total"]
@@ -351,7 +406,7 @@ class Stage1Trainer(BaseTrainer):
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
-            print(f"[Stage1] Done. Best val={best:.6f}")
+            print(f"[Stage1] Done. Best val_total={best:.4f}")
 
 
 # ========================================================================== #

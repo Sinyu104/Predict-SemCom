@@ -236,13 +236,17 @@ class _PredMLP(nn.Module):
 
 
 class _PredAttention(nn.Module):
-    """Self-attention with factored 3D RoPE (frame × height × width per head)."""
+    """Self-attention with factored 3D RoPE.
+    Position IDs are computed externally by Predictor and passed in,
+    so this module is agnostic to clip length / sequence layout.
+    Uses F.scaled_dot_product_attention for memory efficiency (Flash Attention
+    when available, otherwise math kernel).
+    """
 
     def __init__(
         self,
         hidden_size: int,
         n_heads:     int,
-        grid_size:   int,
         qkv_bias:    bool  = True,
         attn_drop:   float = 0.0,
     ):
@@ -251,7 +255,6 @@ class _PredAttention(nn.Module):
         self.n_heads   = n_heads
         self.head_dim  = hidden_size // n_heads
         self.scale     = self.head_dim ** -0.5
-        self.grid_size = grid_size
         self.attn_drop = attn_drop
 
         self.q    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
@@ -259,33 +262,15 @@ class _PredAttention(nn.Module):
         self.v    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
         self.proj = nn.Linear(hidden_size, hidden_size)
 
-        # Allocate equal head-dim budget to each spatial axis (rounded to even)
         self.d_dim = 2 * ((self.head_dim // 3) // 2)
         self.h_dim = 2 * ((self.head_dim // 3) // 2)
         self.w_dim = 2 * ((self.head_dim // 3) // 2)
 
-    @torch.no_grad()
-    def _pos_ids(self, N_total: int, device: torch.device):
-        """(frame_ids, height_ids, width_ids) — shape (1, 1, N_total).
-        Token 0 is the action token, assigned position (0, 0, 0).
-        Tokens 1..N are patch tokens in raster scan order.
-        """
-        N_patch = N_total - 1
-        tpf     = self.grid_size * self.grid_size
-        idx     = torch.arange(N_patch, device=device)
-        f_ids   = idx // tpf
-        h_ids   = (idx % tpf) // self.grid_size
-        w_ids   = idx % self.grid_size
-        zero    = idx.new_zeros(1)
-        def prepend(t):
-            return torch.cat([zero, t]).view(1, 1, -1)
-        return prepend(f_ids), prepend(h_ids), prepend(w_ids)
-
     def _apply_rope(self, qk: torch.Tensor, pos_ids: tuple) -> torch.Tensor:
         f_ids, h_ids, w_ids = pos_ids
-        s1  = self.d_dim
-        s2  = s1 + self.h_dim
-        s3  = s2 + self.w_dim
+        s1 = self.d_dim
+        s2 = s1 + self.h_dim
+        s3 = s2 + self.w_dim
         out = [
             _rope_rotate(qk[..., :s1], f_ids),
             _rope_rotate(qk[..., s1:s2], h_ids),
@@ -295,22 +280,33 @@ class _PredAttention(nn.Module):
             out.append(qk[..., s3:])
         return torch.cat(out, dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x:         torch.Tensor,
+        pos_ids:   tuple,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        x         : (B, N, C)
+        pos_ids   : (f_ids, h_ids, w_ids), each (1, 1, N) — from Predictor
+        attn_mask : (1, 1, N, N) bool, True=attend — None for full attention
+        """
         B, N, C = x.shape
         def to_heads(lin):
             return lin(x).view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
         q, k, v = to_heads(self.q), to_heads(self.k), to_heads(self.v)
 
-        pos = self._pos_ids(N, x.device)
-        q   = self._apply_rope(q, pos)
-        k   = self._apply_rope(k, pos)
+        q = self._apply_rope(q, pos_ids)
+        k = self._apply_rope(k, pos_ids)
 
-        attn = F.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1,
-                         dtype=torch.float32).to(x.dtype)
-        if self.training and self.attn_drop > 0.0:
-            attn = F.dropout(attn, p=self.attn_drop)
-
-        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        dropout_p = self.attn_drop if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask  = attn_mask,
+            dropout_p  = dropout_p,
+            scale      = self.scale,
+        )
+        out = out.transpose(1, 2).reshape(B, N, C)
         return self.proj(out)
 
 
@@ -321,7 +317,6 @@ class _PredBlock(nn.Module):
         self,
         hidden_size:    int,
         n_heads:        int,
-        grid_size:      int,
         mlp_ratio:      float = 4.0,
         drop_path_rate: float = 0.0,
         qkv_bias:       bool  = True,
@@ -329,13 +324,18 @@ class _PredBlock(nn.Module):
     ):
         super().__init__()
         self.norm1     = nn.LayerNorm(hidden_size)
-        self.attn      = _PredAttention(hidden_size, n_heads, grid_size, qkv_bias, attn_drop)
+        self.attn      = _PredAttention(hidden_size, n_heads, qkv_bias, attn_drop)
         self.drop_path = _DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         self.norm2     = nn.LayerNorm(hidden_size)
         self.mlp       = _PredMLP(hidden_size, mlp_ratio)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+    def forward(
+        self,
+        x:         torch.Tensor,
+        pos_ids:   tuple,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x + self.drop_path(self.attn(self.norm1(x), pos_ids, attn_mask))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -346,71 +346,217 @@ class _PredBlock(nn.Module):
 
 class Predictor(nn.Module):
     """
-    Action-conditioned V-JEPA 2 predictor with factored 3D RoPE attention.
+    V-JEPA 2-AC predictor — robotics paper spec (~300M, 24L, 16H, 1024d).
 
-    Tokens are projected to d_pred, processed by narrow transformer blocks
-    with per-head factored rotary embeddings (frame × height × width), then
-    projected back to D_vit with a residual connection.
+    Training uses multi-frame clips with block-causal attention (paper §3.1):
+      - forward_clip()   : teacher-forcing over T frames (paper Eq. 2)
+      - rollout_2step()  : 2-step autoregressive prediction (paper Eq. 3)
 
-    The action is embedded as a conditioning token prepended to the patch
-    sequence.  It receives RoPE position (0, 0, 0) and is discarded after
-    the transformer.
+    Block-causal attention: frame k attends to frames 1..k only.
+    RoPE: full 3D (frame × height × width) for patch tokens;
+          temporal-only (h=w=0) for action/pose tokens — paper §3.1.
 
-    Architecture:
-        input_proj  : D_vit → d_pred
-        action_embed: action_dim → d_pred  (prepended; position 0,0,0)
-        blocks      : n_layers × _PredBlock(d_pred, 3D-RoPE, drop-path)
-        norm        : LayerNorm(d_pred)
-        output_proj : d_pred → D_vit
-        residual    : tokens + output_proj(norm_out[1:])
+    Single-frame forward() is kept for Stage 2 (JSCC) where the predictor
+    provides side information one step at a time.
 
-    Config keys added vs. original:
-        grid_size  — spatial patch grid side length (default 14 for 224/16)
-        grid_depth — temporal depth = frames_per_clip // tubelet_size (default 1)
+    Architecture per frame block:
+        [a_tok, (pose_tok,) patch_0 .. patch_{N-1}]
+    Position IDs computed in Predictor and passed to each _PredBlock.
     """
 
     def __init__(
         self,
         D_vit:          int,
         action_dim:     int,
-        d_pred:         int   = 384,
-        n_layers:       int   = 6,
-        n_heads:        int   = 8,
-        grid_size:      int   = 14,
+        d_pred:         int   = 1024,
+        n_layers:       int   = 24,
+        n_heads:        int   = 16,
+        grid_size:      int   = 16,
         grid_depth:     int   = 1,
         mlp_ratio:      float = 4.0,
         drop_path_rate: float = 0.0,
+        pose_dim:       int   = 0,
     ):
         super().__init__()
-        self.input_proj   = nn.Linear(D_vit, d_pred)
-        self.action_embed = nn.Linear(action_dim, d_pred)
+        self.action_dim = action_dim
+        self.pose_dim   = pose_dim
+        self.grid_size  = grid_size
 
-        dp_rates = [
-            drop_path_rate * i / max(n_layers - 1, 1)
-            for i in range(n_layers)
-        ]
+        self.input_proj   = nn.Linear(D_vit,      d_pred)
+        self.action_embed = nn.Linear(action_dim, d_pred)
+        if pose_dim > 0:
+            self.pose_embed = nn.Linear(pose_dim, d_pred)
+
+        dp_rates = [drop_path_rate * i / max(n_layers - 1, 1) for i in range(n_layers)]
         self.blocks = nn.ModuleList([
-            _PredBlock(d_pred, n_heads, grid_size, mlp_ratio, dp_rates[i])
+            _PredBlock(d_pred, n_heads, mlp_ratio, dp_rates[i])
             for i in range(n_layers)
         ])
         self.norm        = nn.LayerNorm(d_pred)
         self.output_proj = nn.Linear(d_pred, D_vit)
 
-    def forward(self, tokens: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------ #
+    #  Position IDs and causal mask (computed once per forward call)      #
+    # ------------------------------------------------------------------ #
+
+    @torch.no_grad()
+    def _pos_ids(self, n_cond: int, N: int, T: int, device: torch.device):
         """
-        tokens : (B, N, D_vit)   context patch tokens (previous frame)
-        a      : (B, action_dim) action taken
-        → z_pred : (B, N, D_vit) predicted next-frame patch tokens
+        Returns (f_ids, h_ids, w_ids), each (1, 1, T*n_per_frame).
+        Conditioning tokens (action, pose): temporal position k, h=w=0.
+        Patch tokens: full 3D position (frame k, row, col).
         """
-        x     = self.input_proj(tokens)                        # (B, N, d_pred)
-        a_tok = self.action_embed(a).unsqueeze(1)              # (B, 1, d_pred)
-        x     = torch.cat([a_tok, x], dim=1)                  # (B, N+1, d_pred)
+        patch_idx = torch.arange(N, device=device)
+        ph = patch_idx // self.grid_size
+        pw = patch_idx % self.grid_size
+        f_list, h_list, w_list = [], [], []
+        for k in range(T):
+            f_list += [torch.full((n_cond,), k, device=device), torch.full((N,), k, device=device)]
+            h_list += [torch.zeros(n_cond, device=device, dtype=ph.dtype), ph]
+            w_list += [torch.zeros(n_cond, device=device, dtype=pw.dtype), pw]
+        f = torch.cat(f_list).view(1, 1, -1)
+        h = torch.cat(h_list).view(1, 1, -1)
+        w = torch.cat(w_list).view(1, 1, -1)
+        return f, h, w
+
+    @torch.no_grad()
+    def _causal_mask(self, T: int, n_per_frame: int, device: torch.device):
+        """
+        Block-causal bool mask (1, 1, N_total, N_total).
+        True = attend: frame k attends to all tokens in frames 0..k.
+        """
+        N_total  = T * n_per_frame
+        frame_of = torch.arange(N_total, device=device) // n_per_frame
+        mask = frame_of.unsqueeze(1) >= frame_of.unsqueeze(0)   # (N, N)
+        return mask.unsqueeze(0).unsqueeze(0)                    # (1, 1, N, N)
+
+    # ------------------------------------------------------------------ #
+    #  Sequence builder                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _build_seq(
+        self,
+        tokens_T:  torch.Tensor,
+        actions_T: torch.Tensor,
+        poses_T:   torch.Tensor | None,
+    ):
+        """
+        tokens_T  : (B, T, N, D_vit)
+        actions_T : (B, T, action_dim)  — a_T is zeros (dummy for last frame)
+        poses_T   : (B, T, pose_dim) optional
+        Returns: x (B, T*n_per_frame, d_pred), n_cond, n_per_frame
+        """
+        B, T, N, _ = tokens_T.shape
+        x_p = self.input_proj(tokens_T.reshape(B * T, N, -1)).reshape(B, T, N, -1)
+        a   = self.action_embed(actions_T)                           # (B, T, d_pred)
+
+        if self.pose_dim > 0 and poses_T is not None:
+            p      = self.pose_embed(poses_T)                        # (B, T, d_pred)
+            blocks = torch.cat([a.unsqueeze(2), p.unsqueeze(2), x_p], dim=2)
+            n_cond = 2
+        else:
+            blocks = torch.cat([a.unsqueeze(2), x_p], dim=2)
+            n_cond = 1
+
+        n_per_frame = n_cond + N
+        return blocks.reshape(B, T * n_per_frame, -1), n_cond, n_per_frame
+
+    # ------------------------------------------------------------------ #
+    #  Forward passes                                                      #
+    # ------------------------------------------------------------------ #
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        a:      torch.Tensor,
+        pose:   torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Single-frame prediction — used in Stage 2 (JSCC side information).
+        tokens : (B, N, D_vit)
+        a      : (B, action_dim)
+        → z_pred : (B, N, D_vit)
+        """
+        B, N, _ = tokens.shape
+        x_p  = self.input_proj(tokens)
+        cond = [self.action_embed(a).unsqueeze(1)]
+        if self.pose_dim > 0 and pose is not None:
+            cond.append(self.pose_embed(pose).unsqueeze(1))
+        n_cond = len(cond)
+        x = torch.cat(cond + [x_p], dim=1)                          # (B, n_cond+N, d_pred)
+
+        pos_ids = self._pos_ids(n_cond, N, T=1, device=x.device)
+        for blk in self.blocks:
+            x = blk(x, pos_ids)                                      # no causal mask: T=1
+        x = self.norm(x)[:, n_cond:]                                 # (B, N, d_pred)
+        return tokens + self.output_proj(x)                          # (B, N, D_vit)
+
+    def forward_clip(
+        self,
+        tokens:  torch.Tensor,
+        actions: torch.Tensor,
+        poses:   torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Multi-frame teacher-forcing forward (paper Eq. 2).
+
+        tokens  : (B, T, N, D_vit)
+        actions : (B, T-1, action_dim)  — a_1 .. a_{T-1}
+        poses   : (B, T, pose_dim) optional
+
+        Returns ẑ_{2..T} : (B, T-1, N, D_vit)
+        """
+        B, T, N, D_vit = tokens.shape
+
+        a_pad     = tokens.new_zeros(B, 1, self.action_dim)
+        actions_T = torch.cat([actions, a_pad], dim=1)               # (B, T, action_dim)
+
+        x, n_cond, n_per_frame = self._build_seq(tokens, actions_T, poses)
+        pos_ids    = self._pos_ids(n_cond, N, T, x.device)
+        causal_msk = self._causal_mask(T, n_per_frame, x.device)
 
         for blk in self.blocks:
-            x = blk(x)                                         # (B, N+1, d_pred)
+            x = blk(x, pos_ids, causal_msk)
 
-        x = self.norm(x)[:, 1:]                                # (B, N, d_pred)  drop action token
-        return tokens + self.output_proj(x)                    # (B, N, D_vit)
+        x = self.norm(x).reshape(B, T, n_per_frame, -1)
+        patch_out = x[:, :, n_cond:, :]                              # (B, T, N, d_pred)
+        preds     = tokens + self.output_proj(patch_out)             # (B, T, N, D_vit)
+        return preds[:, :-1]                                         # (B, T-1, N, D_vit)
+
+    def rollout_2step(
+        self,
+        tokens:  torch.Tensor,
+        actions: torch.Tensor,
+        poses:   torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        2-step autoregressive rollout (paper Eq. 3).
+
+        tokens  : (B, T≥3, N, D_vit)
+        actions : (B, 2, action_dim)    — a_1, a_2
+        poses   : (B, 3, pose_dim) optional
+
+        Step 1: ẑ_2 = Predictor(z_1, a_1)
+        Step 2: ẑ_3 = Predictor(z_1, ẑ_2, a_1, a_2)   ← ẑ_2 not detached → grad flows
+        Returns ẑ_3 : (B, N, D_vit)
+        """
+        # Step 1 — predict ẑ_2 from z_1
+        z_hat_2 = self.forward_clip(
+            tokens[:, :2],
+            actions[:, :1],
+            poses[:, :2] if poses is not None else None,
+        )[:, 0]                                                      # (B, N, D_vit)
+
+        # Step 2 — predict ẑ_3 using ẑ_2 as input for frame 2
+        tokens_ar = torch.cat(
+            [tokens[:, :1], z_hat_2.unsqueeze(1), tokens[:, 2:3]], dim=1
+        )                                                            # (B, 3, N, D_vit)
+        preds_ar = self.forward_clip(
+            tokens_ar,
+            actions[:, :2],
+            poses[:, :3] if poses is not None else None,
+        )                                                            # (B, 2, N, D_vit)
+        return preds_ar[:, 1]                                        # (B, N, D_vit) — ẑ_3
 
 
 # ========================================================================== #
@@ -470,18 +616,27 @@ class SemComSystem(nn.Module):
 
     def __init__(self, config: dict):
         super().__init__()
-        D_vit      = config["D_vit"]
-        D_jscc     = config["D_jscc"]
-        d_pred     = config["d_pred"]
-        action_dim = config["action_dim"]
-        grid_size  = config.get("grid_size", 14)
-        grid_depth = config.get("grid_depth", 1)
+        D_vit       = config["D_vit"]
+        D_jscc      = config["D_jscc"]
+        d_pred      = config["d_pred"]                       # predictor hidden dim (1024)
+        jscc_d_pred = config.get("jscc_d_pred", 384)        # JSCC MLP working dim
+        action_dim  = config["action_dim"]
+        pose_dim    = config.get("pose_dim",       0)
+        grid_size   = config.get("grid_size",     14)
+        grid_depth  = config.get("grid_depth",     1)
+        n_layers    = config.get("pred_n_layers", 24)
+        n_heads     = config.get("pred_n_heads",  16)
+        mlp_ratio   = config.get("pred_mlp_ratio", 4.0)
+        drop_path   = config.get("pred_drop_path", 0.0)
 
-        self.jscc_encoder      = JsccEncoder(D_vit, D_jscc, d_pred)
-        self.side_info_encoder = SideInfoEncoder(D_vit, D_jscc, d_pred)
-        self.jscc_decoder      = JsccDecoder(D_jscc, D_vit, d_pred)
+        self.jscc_encoder      = JsccEncoder(D_vit, D_jscc, jscc_d_pred)
+        self.side_info_encoder = SideInfoEncoder(D_vit, D_jscc, jscc_d_pred)
+        self.jscc_decoder      = JsccDecoder(D_jscc, D_vit, jscc_d_pred)
         self.predictor         = Predictor(D_vit, action_dim, d_pred,
-                                           grid_size=grid_size, grid_depth=grid_depth)
+                                           n_layers=n_layers, n_heads=n_heads,
+                                           grid_size=grid_size, grid_depth=grid_depth,
+                                           mlp_ratio=mlp_ratio, drop_path_rate=drop_path,
+                                           pose_dim=pose_dim)
         self.channel           = RayleighChannel(config["snr_db"])
 
     @staticmethod
