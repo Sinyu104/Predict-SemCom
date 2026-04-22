@@ -15,12 +15,12 @@ Edge Server:
         → [OpenVLA Projector (agent, frozen)] → (B, N, D_model)
         → [LLM (agent, frozen)] → â_t
 
-Predictor design — narrow transformer (V-JEPA 2)
--------------------------------------------------
-The predictor works at full patch token resolution (B, N, D_vit).
-It is intentionally narrow: tokens are projected to d_pred ≪ D_vit,
-attention operates at d_pred (e.g. 384), then projected back.
-The action is embedded and prepended as a conditioning token.
+Predictor design — narrow transformer (V-JEPA 2 style with 3D RoPE)
+----------------------------------------------------------------------
+Full patch resolution (B, N, D_vit); narrow working dim d_pred ≪ D_vit.
+Transformer blocks use factored 3D RoPE (frame × height × width per head),
+Pre-LN, and stochastic-depth drop-path.
+The action is embedded and prepended as a conditioning token (position 0,0,0).
 
 JsccDecoder design — cross-attention
 -------------------------------------
@@ -39,7 +39,7 @@ Modules
 1. JsccEncoder      (B,N,D_vit) → μ_enc, log_var_enc, s_t  [via mean pool + MLP]
 2. SideInfoEncoder  (B,N,D_vit) → μ_prior, log_var_prior    [loss only, mean pool + MLP]
 3. JsccDecoder      (B,D_jscc) + (B,N,D_vit) → (B,N,D_vit) [cross-attention]
-4. Predictor        (B,N,D_vit) + (B,action_dim) → (B,N,D_vit) [narrow transformer]
+4. Predictor        (B,N,D_vit) + (B,action_dim) → (B,N,D_vit) [V-JEPA2 narrow transformer, 3D RoPE]
 5. RayleighChannel  (B,D_jscc) → (B,D_jscc)
 6. SemComSystem     container + static rate_loss()
 """
@@ -184,49 +184,216 @@ class JsccDecoder(nn.Module):
 
 
 # ========================================================================== #
-#  4. PREDICTOR  (narrow transformer — V-JEPA 2 style)                        #
+#  PREDICTOR HELPERS (V-JEPA 2 style)                                        #
+# ========================================================================== #
+
+def _drop_path(
+    x: torch.Tensor, drop_prob: float, training: bool
+) -> torch.Tensor:
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    mask  = torch.rand(shape, dtype=x.dtype, device=x.device).add_(keep_prob).floor_()
+    return x.div(keep_prob) * mask
+
+
+class _DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _drop_path(x, self.drop_prob, self.training)
+
+
+def _rope_rotate(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """Factored RoPE rotation matching V-JEPA 2's rotate_queries_or_keys.
+    x   : (B, n_heads, N, D_chunk)
+    pos : broadcastable to (B, n_heads, N)  — integer position indices
+    """
+    D     = x.shape[-1]
+    omega = 1.0 / (10000.0 ** (torch.arange(D // 2, dtype=x.dtype, device=x.device) / (D / 2.0)))
+    freq  = pos.unsqueeze(-1) * omega              # (..., N, D/2)
+    cos   = freq.cos().repeat(1, 1, 1, 2)          # (..., N, D)
+    sin   = freq.sin().repeat(1, 1, 1, 2)
+    y     = x.unflatten(-1, (-1, 2))
+    y1, y2 = y.unbind(dim=-1)
+    rot   = torch.stack((-y2, y1), dim=-1).flatten(-2)
+    return x * cos + rot * sin
+
+
+class _PredMLP(nn.Module):
+    def __init__(self, hidden_size: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        inner    = int(hidden_size * mlp_ratio)
+        self.fc1 = nn.Linear(hidden_size, inner)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(inner, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _PredAttention(nn.Module):
+    """Self-attention with factored 3D RoPE (frame × height × width per head)."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        n_heads:     int,
+        grid_size:   int,
+        qkv_bias:    bool  = True,
+        attn_drop:   float = 0.0,
+    ):
+        super().__init__()
+        assert hidden_size % n_heads == 0
+        self.n_heads   = n_heads
+        self.head_dim  = hidden_size // n_heads
+        self.scale     = self.head_dim ** -0.5
+        self.grid_size = grid_size
+        self.attn_drop = attn_drop
+
+        self.q    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.k    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.v    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+
+        # Allocate equal head-dim budget to each spatial axis (rounded to even)
+        self.d_dim = 2 * ((self.head_dim // 3) // 2)
+        self.h_dim = 2 * ((self.head_dim // 3) // 2)
+        self.w_dim = 2 * ((self.head_dim // 3) // 2)
+
+    @torch.no_grad()
+    def _pos_ids(self, N_total: int, device: torch.device):
+        """(frame_ids, height_ids, width_ids) — shape (1, 1, N_total).
+        Token 0 is the action token, assigned position (0, 0, 0).
+        Tokens 1..N are patch tokens in raster scan order.
+        """
+        N_patch = N_total - 1
+        tpf     = self.grid_size * self.grid_size
+        idx     = torch.arange(N_patch, device=device)
+        f_ids   = idx // tpf
+        h_ids   = (idx % tpf) // self.grid_size
+        w_ids   = idx % self.grid_size
+        zero    = idx.new_zeros(1)
+        def prepend(t):
+            return torch.cat([zero, t]).view(1, 1, -1)
+        return prepend(f_ids), prepend(h_ids), prepend(w_ids)
+
+    def _apply_rope(self, qk: torch.Tensor, pos_ids: tuple) -> torch.Tensor:
+        f_ids, h_ids, w_ids = pos_ids
+        s1  = self.d_dim
+        s2  = s1 + self.h_dim
+        s3  = s2 + self.w_dim
+        out = [
+            _rope_rotate(qk[..., :s1], f_ids),
+            _rope_rotate(qk[..., s1:s2], h_ids),
+            _rope_rotate(qk[..., s2:s3], w_ids),
+        ]
+        if s3 < self.head_dim:
+            out.append(qk[..., s3:])
+        return torch.cat(out, dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        def to_heads(lin):
+            return lin(x).view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        q, k, v = to_heads(self.q), to_heads(self.k), to_heads(self.v)
+
+        pos = self._pos_ids(N, x.device)
+        q   = self._apply_rope(q, pos)
+        k   = self._apply_rope(k, pos)
+
+        attn = F.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1,
+                         dtype=torch.float32).to(x.dtype)
+        if self.training and self.attn_drop > 0.0:
+            attn = F.dropout(attn, p=self.attn_drop)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
+
+
+class _PredBlock(nn.Module):
+    """V-JEPA 2 transformer block: Pre-LN, 3D-RoPE self-attention, drop-path."""
+
+    def __init__(
+        self,
+        hidden_size:    int,
+        n_heads:        int,
+        grid_size:      int,
+        mlp_ratio:      float = 4.0,
+        drop_path_rate: float = 0.0,
+        qkv_bias:       bool  = True,
+        attn_drop:      float = 0.0,
+    ):
+        super().__init__()
+        self.norm1     = nn.LayerNorm(hidden_size)
+        self.attn      = _PredAttention(hidden_size, n_heads, grid_size, qkv_bias, attn_drop)
+        self.drop_path = _DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.norm2     = nn.LayerNorm(hidden_size)
+        self.mlp       = _PredMLP(hidden_size, mlp_ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+# ========================================================================== #
+#  4. PREDICTOR  (V-JEPA 2 — narrow transformer with factored 3D RoPE)       #
 # ========================================================================== #
 
 class Predictor(nn.Module):
     """
-    Action-conditioned narrow transformer predictor (V-JEPA 2 style).
+    Action-conditioned V-JEPA 2 predictor with factored 3D RoPE attention.
 
-    Operates at full patch token resolution (B, N, D_vit) but with a
-    narrow working dimension d_pred ≪ D_vit (e.g. 384 vs 2176).
-    The action is embedded and prepended as a conditioning token.
+    Tokens are projected to d_pred, processed by narrow transformer blocks
+    with per-head factored rotary embeddings (frame × height × width), then
+    projected back to D_vit with a residual connection.
 
-    Runs on the RECEIVER (edge server) only.  Both context and target
-    encoders are the frozen ViT.  Only the Predictor is trained (Stage 2).
+    The action is embedded as a conditioning token prepended to the patch
+    sequence.  It receives RoPE position (0, 0, 0) and is discarded after
+    the transformer.
 
     Architecture:
         input_proj  : D_vit → d_pred
-        action_embed: action_dim → d_pred  (prepended as 1 token)
-        transformer : n_layers × TransformerEncoderLayer(d_pred)
+        action_embed: action_dim → d_pred  (prepended; position 0,0,0)
+        blocks      : n_layers × _PredBlock(d_pred, 3D-RoPE, drop-path)
+        norm        : LayerNorm(d_pred)
         output_proj : d_pred → D_vit
-        residual    : output = tokens + output_proj(transformer_out)
+        residual    : tokens + output_proj(norm_out[1:])
+
+    Config keys added vs. original:
+        grid_size  — spatial patch grid side length (default 14 for 224/16)
+        grid_depth — temporal depth = frames_per_clip // tubelet_size (default 1)
     """
 
     def __init__(
         self,
-        D_vit:      int,
-        action_dim: int,
-        d_pred:     int = 384,
-        n_layers:   int = 6,
-        n_heads:    int = 8,
+        D_vit:          int,
+        action_dim:     int,
+        d_pred:         int   = 384,
+        n_layers:       int   = 6,
+        n_heads:        int   = 8,
+        grid_size:      int   = 14,
+        grid_depth:     int   = 1,
+        mlp_ratio:      float = 4.0,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.input_proj   = nn.Linear(D_vit, d_pred)
         self.action_embed = nn.Linear(action_dim, d_pred)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model        = d_pred,
-            nhead          = n_heads,
-            dim_feedforward = d_pred * 4,
-            dropout        = 0.0,
-            batch_first    = True,
-            norm_first     = True,   # Pre-LN (more stable)
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        dp_rates = [
+            drop_path_rate * i / max(n_layers - 1, 1)
+            for i in range(n_layers)
+        ]
+        self.blocks = nn.ModuleList([
+            _PredBlock(d_pred, n_heads, grid_size, mlp_ratio, dp_rates[i])
+            for i in range(n_layers)
+        ])
+        self.norm        = nn.LayerNorm(d_pred)
         self.output_proj = nn.Linear(d_pred, D_vit)
 
     def forward(self, tokens: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
@@ -235,18 +402,14 @@ class Predictor(nn.Module):
         a      : (B, action_dim) action taken
         → z_pred : (B, N, D_vit) predicted next-frame patch tokens
         """
-        # Project tokens to narrow working dim
-        x = self.input_proj(tokens)                            # (B, N, d_pred)
-
-        # Embed action, prepend as extra conditioning token
+        x     = self.input_proj(tokens)                        # (B, N, d_pred)
         a_tok = self.action_embed(a).unsqueeze(1)              # (B, 1, d_pred)
         x     = torch.cat([a_tok, x], dim=1)                  # (B, N+1, d_pred)
 
-        # Narrow transformer
-        x = self.transformer(x)                                # (B, N+1, d_pred)
+        for blk in self.blocks:
+            x = blk(x)                                         # (B, N+1, d_pred)
 
-        # Drop action token, project back to D_vit
-        x = x[:, 1:, :]                                        # (B, N, d_pred)
+        x = self.norm(x)[:, 1:]                                # (B, N, d_pred)  drop action token
         return tokens + self.output_proj(x)                    # (B, N, D_vit)
 
 
@@ -311,11 +474,14 @@ class SemComSystem(nn.Module):
         D_jscc     = config["D_jscc"]
         d_pred     = config["d_pred"]
         action_dim = config["action_dim"]
+        grid_size  = config.get("grid_size", 14)
+        grid_depth = config.get("grid_depth", 1)
 
         self.jscc_encoder      = JsccEncoder(D_vit, D_jscc, d_pred)
         self.side_info_encoder = SideInfoEncoder(D_vit, D_jscc, d_pred)
         self.jscc_decoder      = JsccDecoder(D_jscc, D_vit, d_pred)
-        self.predictor         = Predictor(D_vit, action_dim, d_pred)
+        self.predictor         = Predictor(D_vit, action_dim, d_pred,
+                                           grid_size=grid_size, grid_depth=grid_depth)
         self.channel           = RayleighChannel(config["snr_db"])
 
     @staticmethod
