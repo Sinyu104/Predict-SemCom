@@ -70,6 +70,7 @@ CONFIG = {
     # ── Loss weights ─────────────────────────────────────────────────── #
     "lambda_tf":   0.1,   # weight for teacher-forcing loss L_tf
     "lambda_roll": 1.0,   # weight for 3-step rollout loss L_roll
+    "gamma_delta": 50.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 3e-4,

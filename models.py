@@ -494,7 +494,7 @@ class Predictor(nn.Module):
         for blk in self.blocks:
             x = blk(x, pos_ids)                                      # no causal mask: T=1
         x = self.norm(x)[:, n_cond:]                                 # (B, N, d_pred)
-        return tokens + self.output_proj(x)                          # (B, N, D_vit)
+        return self.output_proj(x)                                    # (B, N, D_vit) — γΔ
 
     def forward_clip(
         self,
@@ -525,7 +525,7 @@ class Predictor(nn.Module):
 
         x = self.norm(x).reshape(B, T, n_per_frame, -1)
         patch_out = x[:, :, n_cond:, :]                              # (B, T, N, d_pred)
-        preds     = tokens + self.output_proj(patch_out)             # (B, T, N, D_vit)
+        preds     = self.output_proj(patch_out)                      # (B, T, N, D_vit) — γΔ
         return preds[:, :-1]                                         # (B, T-1, N, D_vit)
 
     def rollout_2step(
@@ -533,42 +533,42 @@ class Predictor(nn.Module):
         tokens:  torch.Tensor,
         actions: torch.Tensor,
         poses:   torch.Tensor | None = None,
+        gamma:   float = 1.0,
     ) -> torch.Tensor:
         """
-        2-step autoregressive rollout (paper Eq. 3).
+        2-step autoregressive rollout.
+        Model outputs γΔ; divide by gamma to recover Δ and reconstruct absolute tokens.
 
         tokens  : (B, T≥3, N, D_vit)
-        actions : (B, 2, action_dim)    — a_1, a_2
-        poses   : (B, 3, pose_dim) optional
-
-        Step 1: ẑ_2 = Predictor(z_1, a_1)
-        Step 2: ẑ_3 = Predictor(z_1, ẑ_2, a_1, a_2)   ← ẑ_2 not detached → grad flows
-        Returns ẑ_3 : (B, N, D_vit)
+        actions : (B, 2, action_dim)
+        Returns ẑ_3 : (B, N, D_vit)  — absolute token
         """
-        # Step 1 — predict ẑ_2 from z_1
-        z_hat_2 = self.forward_clip(
+        # Step 1 — predict γΔ_2, reconstruct ẑ_2
+        delta_2 = self.forward_clip(
             tokens[:, :2],
             actions[:, :1],
             poses[:, :2] if poses is not None else None,
         )[:, 0]                                                      # (B, N, D_vit)
+        z_hat_2 = tokens[:, 0] + delta_2 / gamma
 
-        # Step 2 — predict ẑ_3 from z_1, ẑ_2
+        # Step 2 — predict γΔ_3, reconstruct ẑ_3
         dummy = torch.zeros_like(tokens[:, :1])
         tokens_ar = torch.cat(
             [tokens[:, :1], z_hat_2.unsqueeze(1), dummy], dim=1
         )                                                            # (B, 3, N, D_vit)
-        preds_ar = self.forward_clip(
+        delta_3 = self.forward_clip(
             tokens_ar,
             actions[:, :2],
             poses[:, :3] if poses is not None else None,
-        )                                                            # (B, 2, N, D_vit)
-        return preds_ar[:, 1]                                        # (B, N, D_vit) — ẑ_3
+        )[:, 1]                                                      # (B, N, D_vit)
+        return z_hat_2 + delta_3 / gamma                             # (B, N, D_vit) — ẑ_3
 
     def rollout_3step(
         self,
         tokens:  torch.Tensor,
         actions: torch.Tensor,
         poses:   torch.Tensor | None = None,
+        gamma:   float = 1.0,
     ) -> torch.Tensor:
         """
         3-step autoregressive rollout.
@@ -576,41 +576,45 @@ class Predictor(nn.Module):
         tokens  : (B, T≥4, N, D_vit)
         actions : (B, 3, action_dim)    — a_1, a_2, a_3
         poses   : (B, 4, pose_dim) optional
+        gamma   : scaling factor used during training (model outputs γΔ)
 
-        Step 1: ẑ_2 = Predictor(z_1, a_1)
-        Step 2: ẑ_3 = Predictor(z_1, ẑ_2, a_1, a_2)
-        Step 3: ẑ_4 = Predictor(z_1, ẑ_2, ẑ_3, a_1, a_2, a_3)
-        Returns ẑ_4 : (B, N, D_vit)
+        Step 1: ẑ_2 = z_1 + pred/γ
+        Step 2: ẑ_3 = ẑ_2 + pred/γ
+        Step 3: predict γΔ_4  (raw model output, same space as L_tf)
+        Returns (ẑ_3, γΔ_4) : absolute token before last step, and raw final prediction
         """
-        # Step 1 — predict ẑ_2 from z_1
-        z_hat_2 = self.forward_clip(
+        dummy = torch.zeros_like(tokens[:, :1])
+
+        # Step 1 — predict γΔ_2, reconstruct ẑ_2
+        delta_2 = self.forward_clip(
             tokens[:, :2],
             actions[:, :1],
             poses[:, :2] if poses is not None else None,
         )[:, 0]                                                      # (B, N, D_vit)
+        z_hat_2 = tokens[:, 0] + delta_2 / gamma
 
-        # Step 2 — predict ẑ_3 from z_1, ẑ_2
-        dummy = torch.zeros_like(tokens[:, :1])
+        # Step 2 — predict γΔ_3, reconstruct ẑ_3
         tokens_ar2 = torch.cat(
             [tokens[:, :1], z_hat_2.unsqueeze(1), dummy], dim=1
         )                                                            # (B, 3, N, D_vit)
-        z_hat_3 = self.forward_clip(
+        delta_3 = self.forward_clip(
             tokens_ar2,
             actions[:, :2],
             poses[:, :3] if poses is not None else None,
         )[:, 1]                                                      # (B, N, D_vit)
+        z_hat_3 = z_hat_2 + delta_3 / gamma
 
-        # Step 3 — predict ẑ_4 from z_1, ẑ_2, ẑ_3
+        # Step 3 — predict γΔ_4, reconstruct ẑ_4
         tokens_ar3 = torch.cat(
             [tokens[:, :1], z_hat_2.unsqueeze(1),
              z_hat_3.unsqueeze(1), dummy], dim=1
         )                                                            # (B, 4, N, D_vit)
-        preds_ar = self.forward_clip(
+        delta_4 = self.forward_clip(
             tokens_ar3,
             actions[:, :3],
             poses[:, :4] if poses is not None else None,
-        )                                                            # (B, 3, N, D_vit)
-        return preds_ar[:, 2]                                        # (B, N, D_vit) — ẑ_4
+        )[:, 2]                                                      # (B, N, D_vit)
+        return z_hat_3, delta_4                                      # ẑ_3, γΔ_4
 
 
 # ========================================================================== #

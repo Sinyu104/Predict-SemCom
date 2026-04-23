@@ -383,11 +383,12 @@ class Stage1Trainer(BaseTrainer):
                 preds_tf = pred.forward_clip(
                     tokens, actions[:, :-1]                   # T-1 actions a_1..a_{T-1}
                 )                                             # (B, T-1, N, D_vit)
-                targets  = tokens[:, 1:].detach()                    # (B, T-1, N, D_vit)
+                gamma    = self.config.get("gamma_delta", 10.0)
+                targets  = (gamma * (tokens[:, 1:] - tokens[:, :-1])).detach()  # (B, T-1, N, D_vit)
 
                 if self.is_main and self.config.get("verbose", False) and self._diff_step % 100 == 1:
                     with torch.no_grad():
-                        pd = (preds_tf - tokens[:, :-1]).abs().float()  # implicit Δ
+                        pd = (preds_tf / gamma).abs().float()           # predicted Δ
                         pp = torch.quantile(pd.flatten(),
                                             torch.tensor([.25,.50,.75,.90,.99],
                                                          device=pd.device))
@@ -403,11 +404,11 @@ class Stage1Trainer(BaseTrainer):
                 L_tf     = (w_tf * (preds_tf - targets).pow(2)).mean()
 
                 # ── Rollout loss (Eq. 3, weighted MSE, 3-step AR) ────── #
-                z_hat_3  = pred.rollout_3step(tokens, actions[:, :3])
-                tgt_roll = tokens[:, 3].detach()
+                z_hat_3, delta_4 = pred.rollout_3step(tokens, actions[:, :3], gamma=gamma)
+                tgt_roll = (gamma * (tokens[:, 3] - z_hat_3)).detach()
                 w_roll   = (tokens[:, 3] - tokens[:, 0]).pow(2).sum(dim=-1, keepdim=True).detach()
                 w_roll   = w_roll / (w_roll.mean() + 1e-8)
-                L_roll   = (w_roll * (z_hat_3 - tgt_roll).pow(2)).mean()
+                L_roll   = (w_roll * (delta_4 - tgt_roll).pow(2)).mean()
 
                 lambda_tf   = self.config.get("lambda_tf",   1.0)
                 lambda_roll = self.config.get("lambda_roll", 1.0)
@@ -420,12 +421,13 @@ class Stage1Trainer(BaseTrainer):
                     self.optimizer.step()
 
                 with torch.no_grad():
+                    preds_abs = tokens[:, :-1] + preds_tf.detach() / gamma
                     cos_sim = F.cosine_similarity(
-                        preds_tf.detach().float(),
+                        preds_abs.float(),
                         tokens[:, 1:].float(), dim=-1
                     ).mean().item()
                     cos_sim_orig = F.cosine_similarity(
-                        preds_tf.detach().float(),
+                        preds_abs.float(),
                         tokens[:, :-1].float(), dim=-1
                     ).mean().item()
 
@@ -437,7 +439,7 @@ class Stage1Trainer(BaseTrainer):
                 if not train:
                     with torch.no_grad():
                         totals["tf_plain"]     += F.mse_loss(preds_tf.detach(), targets).item()
-                        totals["rollout_plain"] += F.mse_loss(z_hat_3.detach(), tgt_roll).item()
+                        totals["rollout_plain"] += F.mse_loss(delta_4.detach(), tgt_roll).item()
                 n += 1
                 pbar.set_postfix(
                     tf=f"{L_tf.item():.4f}",
