@@ -317,7 +317,8 @@ class Stage1Trainer(BaseTrainer):
         if train and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
 
-        totals = {"tf": 0.0, "rollout": 0.0, "cosine": 0.0, "total": 0.0}
+        totals = {"tf": 0.0, "rollout": 0.0, "cosine": 0.0, "total": 0.0,
+                  "tf_plain": 0.0, "rollout_plain": 0.0}
         n      = 0
         phase  = "train" if train else "val"
         pbar   = tqdm(loader, desc=f"  {phase} ep {epoch}",
@@ -338,11 +339,8 @@ class Stage1Trainer(BaseTrainer):
                         self._diff_step = 0
                     self._diff_step += 1
                     if self._diff_step % 100 == 1:
-                        import torchvision.utils as vutils
-                        # Latent-space diff
-                        diff = (tokens[:, 1:] - tokens[:, :-1]).abs()  # (B, T-1, N, D_vit)
-                        # Pixel-space diff: frames in [0,1], shape (B, T, C, H, W)
-                        pdiff = (frames[:, 1:] - frames[:, :-1]).abs()  # (B, T-1, C, H, W)
+                        diff  = (tokens[:, 1:] - tokens[:, :-1]).abs()
+                        pdiff = (frames[:, 1:] - frames[:, :-1]).abs()
                         print(f"\n[frame-diff step={self._diff_step}]"
                               f"\n  latent : mean={diff.mean().item():.5f}  "
                               f"std={diff.std().item():.5f}  "
@@ -351,33 +349,24 @@ class Stage1Trainer(BaseTrainer):
                               f"std={pdiff.std().item():.5f}  "
                               f"max={pdiff.max().item():.5f}  "
                               f"(×255: mean={pdiff.mean().item()*255:.2f})")
-                        # Save frames and amplified diffs for visual inspection
-                        save_dir = os.path.join(
-                            self.out_dir, "frame_diag", f"step_{self._diff_step:05d}"
-                        )
-                        os.makedirs(save_dir, exist_ok=True)
-                        sample = frames[0].cpu()                  # (T, C, H, W)
-                        for t in range(T):
-                            vutils.save_image(sample[t],
-                                os.path.join(save_dir, f"frame_{t:02d}.png"))
-                        for t in range(T - 1):
-                            amp = (pdiff[0, t] * 10).clamp(0, 1).cpu()
-                            vutils.save_image(amp,
-                                os.path.join(save_dir, f"diff_{t:02d}_{t+1:02d}_10x.png"))
-                        print(f"  [saved frames] {save_dir}")
 
                 pred = self._unwrap(self.system.predictor)
 
-                # ── Teacher-forcing loss (Eq. 2, L1) ────────────────── #
+                # ── Teacher-forcing loss (Eq. 2, weighted L1) ───────── #
                 preds_tf = pred.forward_clip(
                     tokens, actions[:, :-1]                   # T-1 actions a_1..a_{T-1}
                 )                                             # (B, T-1, N, D_vit)
                 targets  = tokens[:, 1:].detach()             # (B, T-1, N, D_vit)
-                L_tf     = F.l1_loss(preds_tf, targets)
+                w_tf     = (tokens[:, 1:] - tokens[:, :-1]).abs().mean(dim=-1, keepdim=True).detach()
+                w_tf     = w_tf / (w_tf.mean() + 1e-8)
+                L_tf     = (w_tf * (preds_tf - targets).abs()).mean()
 
-                # ── Rollout loss (Eq. 3, L1, 2-step AR) ─────────────── #
+                # ── Rollout loss (Eq. 3, weighted L1, 2-step AR) ─────── #
                 z_hat_3  = pred.rollout_2step(tokens, actions[:, :2])
-                L_roll   = F.l1_loss(z_hat_3, tokens[:, 2].detach())
+                tgt_roll = tokens[:, 2].detach()
+                w_roll   = (tokens[:, 2] - tokens[:, 0]).abs().mean(dim=-1, keepdim=True).detach()
+                w_roll   = w_roll / (w_roll.mean() + 1e-8)
+                L_roll   = (w_roll * (z_hat_3 - tgt_roll).abs()).mean()
 
                 loss = L_tf + L_roll
 
@@ -397,6 +386,10 @@ class Stage1Trainer(BaseTrainer):
                 totals["rollout"] += L_roll.item()
                 totals["cosine"] += cos_sim
                 totals["total"]  += loss.item()
+                if not train:
+                    with torch.no_grad():
+                        totals["tf_plain"]     += F.l1_loss(preds_tf.detach(), targets).item()
+                        totals["rollout_plain"] += F.l1_loss(z_hat_3.detach(), tgt_roll).item()
                 n += 1
                 pbar.set_postfix(
                     tf=f"{L_tf.item():.4f}",
@@ -430,7 +423,8 @@ class Stage1Trainer(BaseTrainer):
                 self._log("Stage1", {"lr": lr}, ep)
                 print(
                     f"[Stage1] ep {ep:3d}/{epochs}  "
-                    f"val_tf={vl['tf']:.4f}  val_ro={vl['rollout']:.4f}  "
+                    f"val_tf={vl['tf']:.4f} (plain={vl['tf_plain']:.4f})  "
+                    f"val_ro={vl['rollout']:.4f} (plain={vl['rollout_plain']:.4f})  "
                     f"val_cos={vl['cosine']:.3f}  lr={lr:.2e}"
                 )
                 if vl["total"] < best:
