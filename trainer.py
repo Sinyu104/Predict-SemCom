@@ -317,8 +317,8 @@ class Stage1Trainer(BaseTrainer):
         if train and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
 
-        totals = {"tf": 0.0, "rollout": 0.0, "cosine": 0.0, "total": 0.0,
-                  "tf_plain": 0.0, "rollout_plain": 0.0}
+        totals = {"tf": 0.0, "rollout": 0.0, "cosine": 0.0, "cosine_orig": 0.0,
+                  "total": 0.0, "tf_plain": 0.0, "rollout_plain": 0.0}
         n      = 0
         phase  = "train" if train else "val"
         pbar   = tqdm(loader, desc=f"  {phase} ep {epoch}",
@@ -341,58 +341,20 @@ class Stage1Trainer(BaseTrainer):
                     if self._diff_step % 100 == 1:
                         diff  = (tokens[:, 1:] - tokens[:, :-1]).abs()
                         pdiff = (frames[:, 1:] - frames[:, :-1]).abs()
+                        lp = torch.quantile(diff.flatten().float(),
+                                            torch.tensor([.25,.50,.75,.90,.99],
+                                                         device=diff.device))
+                        near0 = (diff < 0.01).float().mean().item() * 100
                         print(f"\n[frame-diff step={self._diff_step}]"
                               f"\n  latent : mean={diff.mean().item():.5f}  "
-                              f"std={diff.std().item():.5f}  "
-                              f"max={diff.max().item():.5f}"
+                              f"max={diff.max().item():.5f}  "
+                              f"near-zero(<0.01)={near0:.1f}%"
+                              f"\n           p25={lp[0]:.5f}  p50={lp[1]:.5f}  "
+                              f"p75={lp[2]:.5f}  p90={lp[3]:.5f}  p99={lp[4]:.5f}"
                               f"\n  pixel  : mean={pdiff.mean().item():.5f}  "
-                              f"std={pdiff.std().item():.5f}  "
                               f"max={pdiff.max().item():.5f}  "
                               f"(×255: mean={pdiff.mean().item()*255:.2f})")
 
-                        # ── w_tf heatmap ─────────────────────────────── #
-                        import matplotlib
-                        matplotlib.use("Agg")
-                        import matplotlib.pyplot as plt
-
-                        grid  = 16
-                        H_img = frames.shape[-2]
-                        W_img = frames.shape[-1]
-                        # diff: (B, T-1, N, D_vit) → w_tf: (T-1, 16, 16)
-                        w_vis = diff.mean(dim=-1).float()       # (B, T-1, N)
-                        w_vis = w_vis / (w_vis.mean() + 1e-8)
-                        w_vis = w_vis.mean(dim=0)               # (T-1, N) avg over batch
-                        w_vis = w_vis.reshape(-1, grid, grid)   # (T-1, 16, 16)
-                        # upsample to frame resolution for overlay
-                        w_up  = F.interpolate(
-                            w_vis.unsqueeze(1),                 # (T-1, 1, 16, 16)
-                            size=(H_img, W_img), mode="bilinear", align_corners=False,
-                        ).squeeze(1).cpu().numpy()              # (T-1, H, W)
-                        w_vis = w_vis.cpu().numpy()
-
-                        n_steps = w_vis.shape[0]
-                        fig, axes = plt.subplots(1, n_steps, figsize=(4 * n_steps, 3.5),
-                                                 squeeze=False)
-                        axes = axes[0]
-                        vmin, vmax = w_up.min(), w_up.max()
-                        for i, ax in enumerate(axes):
-                            # background: frame i from the first batch item
-                            frame_np = frames[0, i].cpu().float().numpy()  # (C, H, W)
-                            ax.imshow(frame_np.transpose(1, 2, 0).clip(0, 1))
-                            im = ax.imshow(w_up[i], cmap="hot", alpha=0.5,
-                                           vmin=vmin, vmax=vmax)
-                            ax.set_title(f"frame {i}→{i+1}", fontsize=9)
-                            ax.set_xticks([])
-                            ax.set_yticks([])
-                        fig.colorbar(im, ax=axes[-1], fraction=0.046, pad=0.04,
-                                     label="w_tf (norm.)")
-                        fig.suptitle(f"w_tf heatmap  step={self._diff_step}", fontsize=10)
-                        out_path = os.path.join(
-                            self.out_dir, f"w_tf_step{self._diff_step:06d}.png"
-                        )
-                        fig.savefig(out_path, dpi=120, bbox_inches="tight")
-                        plt.close(fig)
-                        print(f"  [w_tf heatmap] saved → {out_path}")
 
                 pred = self._unwrap(self.system.predictor)
 
@@ -400,8 +362,23 @@ class Stage1Trainer(BaseTrainer):
                 preds_tf = pred.forward_clip(
                     tokens, actions[:, :-1]                   # T-1 actions a_1..a_{T-1}
                 )                                             # (B, T-1, N, D_vit)
-                targets  = tokens[:, 1:].detach()             # (B, T-1, N, D_vit)
+                targets  = (tokens[:, 1:] - tokens[:, :-1]).detach()  # (B, T-1, N, D_vit)
+
+                if self.is_main and self._diff_step % 100 == 1:
+                    with torch.no_grad():
+                        pd = preds_tf.abs().float()
+                        pp = torch.quantile(pd.flatten(),
+                                            torch.tensor([.25,.50,.75,.90,.99],
+                                                         device=pd.device))
+                        pnear0 = (pd < 0.01).float().mean().item() * 100
+                        print(f"  pred Δ : mean={pd.mean().item():.5f}  "
+                              f"max={pd.max().item():.5f}  "
+                              f"near-zero(<0.01)={pnear0:.1f}%"
+                              f"\n           p25={pp[0]:.5f}  p50={pp[1]:.5f}  "
+                              f"p75={pp[2]:.5f}  p90={pp[3]:.5f}  p99={pp[4]:.5f}")
+
                 w_tf     = (tokens[:, 1:] - tokens[:, :-1]).abs().mean(dim=-1, keepdim=True).detach()
+                w_tf     = torch.pow(w_tf, 2)
                 w_tf     = w_tf / (w_tf.mean() + 1e-8)
                 L_tf     = (w_tf * (preds_tf - targets).abs()).mean()
 
@@ -409,6 +386,7 @@ class Stage1Trainer(BaseTrainer):
                 z_hat_3  = pred.rollout_2step(tokens, actions[:, :2])
                 tgt_roll = tokens[:, 2].detach()
                 w_roll   = (tokens[:, 2] - tokens[:, 0]).abs().mean(dim=-1, keepdim=True).detach()
+                w_roll   = torch.pow(w_roll, 2)
                 w_roll   = w_roll / (w_roll.mean() + 1e-8)
                 L_roll   = (w_roll * (z_hat_3 - tgt_roll).abs()).mean()
 
@@ -421,15 +399,21 @@ class Stage1Trainer(BaseTrainer):
                     self.optimizer.step()
 
                 with torch.no_grad():
+                    preds_tf_abs = (tokens[:, :-1] + preds_tf.detach()).float()
                     cos_sim = F.cosine_similarity(
-                        preds_tf.detach().float(),
-                        targets.float(), dim=-1
+                        preds_tf_abs,
+                        tokens[:, 1:].float(), dim=-1
+                    ).mean().item()
+                    cos_sim_orig = F.cosine_similarity(
+                        preds_tf_abs,
+                        tokens[:, :-1].float(), dim=-1
                     ).mean().item()
 
-                totals["tf"]     += L_tf.item()
-                totals["rollout"] += L_roll.item()
-                totals["cosine"] += cos_sim
-                totals["total"]  += loss.item()
+                totals["tf"]          += L_tf.item()
+                totals["rollout"]     += L_roll.item()
+                totals["cosine"]      += cos_sim
+                totals["cosine_orig"] += cos_sim_orig
+                totals["total"]       += loss.item()
                 if not train:
                     with torch.no_grad():
                         totals["tf_plain"]     += F.l1_loss(preds_tf.detach(), targets).item()
@@ -439,6 +423,7 @@ class Stage1Trainer(BaseTrainer):
                     tf=f"{L_tf.item():.4f}",
                     ro=f"{L_roll.item():.4f}",
                     cos=f"{cos_sim:.3f}",
+                    cos_orig=f"{cos_sim_orig:.3f}",
                 )
 
         avg = {}
