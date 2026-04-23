@@ -506,7 +506,7 @@ class Predictor(nn.Module):
         for blk in self.blocks:
             x = blk(x, pos_ids)                                      # no causal mask: T=1
         x = self.norm(x)[:, n_cond:]                                 # (B, N, d_pred)
-        return self.output_proj(x)                                    # (B, N, D_vit) — Δ
+        return tokens + self.output_proj(x)                          # (B, N, D_vit)
 
     def forward_clip(
         self,
@@ -537,7 +537,7 @@ class Predictor(nn.Module):
 
         x = self.norm(x).reshape(B, T, n_per_frame, -1)
         patch_out = x[:, :, n_cond:, :]                              # (B, T, N, d_pred)
-        preds     = self.output_proj(patch_out)                      # (B, T, N, D_vit) — Δ
+        preds     = tokens + self.output_proj(patch_out)             # (B, T, N, D_vit)
         return preds[:, :-1]                                         # (B, T-1, N, D_vit)
 
     def rollout_2step(
@@ -557,15 +557,14 @@ class Predictor(nn.Module):
         Step 2: ẑ_3 = Predictor(z_1, ẑ_2, a_1, a_2)   ← ẑ_2 not detached → grad flows
         Returns ẑ_3 : (B, N, D_vit)
         """
-        # Step 1 — predict Δ_2 = ẑ_2 - z_1, reconstruct absolute ẑ_2
-        delta_2 = self.forward_clip(
+        # Step 1 — predict ẑ_2 from z_1
+        z_hat_2 = self.forward_clip(
             tokens[:, :2],
             actions[:, :1],
             poses[:, :2] if poses is not None else None,
         )[:, 0]                                                      # (B, N, D_vit)
-        z_hat_2 = tokens[:, 0] + delta_2                            # (B, N, D_vit)
 
-        # Step 2 — predict Δ_3 = ẑ_3 - ẑ_2, reconstruct absolute ẑ_3
+        # Step 2 — predict ẑ_3 using ẑ_2 as input for frame 2
         tokens_ar = torch.cat(
             [tokens[:, :1], z_hat_2.unsqueeze(1), tokens[:, 2:3]], dim=1
         )                                                            # (B, 3, N, D_vit)
@@ -574,8 +573,7 @@ class Predictor(nn.Module):
             actions[:, :2],
             poses[:, :3] if poses is not None else None,
         )                                                            # (B, 2, N, D_vit)
-        delta_3 = preds_ar[:, 1]                                    # (B, N, D_vit)
-        return z_hat_2 + delta_3                                     # (B, N, D_vit) — ẑ_3
+        return preds_ar[:, 1]                                        # (B, N, D_vit) — ẑ_3
 
 
 # ========================================================================== #

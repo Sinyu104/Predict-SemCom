@@ -59,6 +59,9 @@ def parse_args():
     p.add_argument("--latent_dim", type=int, default=None)
     p.add_argument("--D_jscc",     type=int, default=None)
 
+    p.add_argument("--verbose", action="store_true",
+                   help="Print latent/pred diff stats and save w_tf heatmaps every 100 steps")
+
     return p.parse_args()
 
 
@@ -127,6 +130,7 @@ def main():
     if args.learning_rate is not None: CONFIG["learning_rate"] = args.learning_rate
     if args.openvla_device_map is not None:
         CONFIG["openvla_device_map"] = args.openvla_device_map
+    CONFIG["verbose"] = args.verbose
     CONFIG["output_dir"] = args.output_data_dir
 
     # ── Distributed setup ─────────────────────────────────────────────── #

@@ -126,6 +126,7 @@ def build_ddp_loaders(
     return train_loader, val_loader
 
 
+
 # ========================================================================== #
 #  Base Trainer                                                               #
 # ========================================================================== #
@@ -338,7 +339,7 @@ class Stage1Trainer(BaseTrainer):
                     if not hasattr(self, '_diff_step'):
                         self._diff_step = 0
                     self._diff_step += 1
-                    if self._diff_step % 100 == 1:
+                if self.is_main and self.config.get("verbose", False) and self._diff_step % 100 == 1:
                         diff  = (tokens[:, 1:] - tokens[:, :-1]).abs()
                         pdiff = (frames[:, 1:] - frames[:, :-1]).abs()
                         lp = torch.quantile(diff.flatten().float(),
@@ -362,11 +363,11 @@ class Stage1Trainer(BaseTrainer):
                 preds_tf = pred.forward_clip(
                     tokens, actions[:, :-1]                   # T-1 actions a_1..a_{T-1}
                 )                                             # (B, T-1, N, D_vit)
-                targets  = (tokens[:, 1:] - tokens[:, :-1]).detach()  # (B, T-1, N, D_vit)
+                targets  = tokens[:, 1:].detach()                    # (B, T-1, N, D_vit)
 
-                if self.is_main and self._diff_step % 100 == 1:
+                if self.is_main and self.config.get("verbose", False) and self._diff_step % 100 == 1:
                     with torch.no_grad():
-                        pd = preds_tf.abs().float()
+                        pd = (preds_tf - tokens[:, :-1]).abs().float()  # implicit Δ
                         pp = torch.quantile(pd.flatten(),
                                             torch.tensor([.25,.50,.75,.90,.99],
                                                          device=pd.device))
@@ -399,13 +400,12 @@ class Stage1Trainer(BaseTrainer):
                     self.optimizer.step()
 
                 with torch.no_grad():
-                    preds_tf_abs = (tokens[:, :-1] + preds_tf.detach()).float()
                     cos_sim = F.cosine_similarity(
-                        preds_tf_abs,
+                        preds_tf.detach().float(),
                         tokens[:, 1:].float(), dim=-1
                     ).mean().item()
                     cos_sim_orig = F.cosine_similarity(
-                        preds_tf_abs,
+                        preds_tf.detach().float(),
                         tokens[:, :-1].float(), dim=-1
                     ).mean().item()
 
