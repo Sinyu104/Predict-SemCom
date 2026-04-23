@@ -383,6 +383,7 @@ class Predictor(nn.Module):
 
         self.input_proj   = nn.Linear(D_vit,      d_pred)
         self.action_embed = nn.Linear(action_dim, d_pred)
+        self.action_scale = nn.Parameter(torch.tensor(3.0))
         if pose_dim > 0:
             self.pose_embed = nn.Linear(pose_dim, d_pred)
 
@@ -449,10 +450,22 @@ class Predictor(nn.Module):
         x_p = self.input_proj(tokens_T.reshape(B * T, N, -1)).reshape(B, T, N, -1)
         a   = self.action_embed(actions_T)                           # (B, T, d_pred)
 
+        if not hasattr(self, '_diag_step'):
+            self._diag_step = 0
+        self._diag_step += 1
+        if self._diag_step % 200 == 1:
+            scaled_std = (a * self.action_scale).std().item()
+            print(f"[diag step={self._diag_step}] "
+                  f"x_p.std={x_p.std().item():.4f}  "
+                  f"a.std={a.std().item():.4f}  "
+                  f"action_scale={self.action_scale.item():.3f}  "
+                  f"scaled_a.std={scaled_std:.4f}  "
+                  f"ratio={x_p.std().item()/scaled_std:.2f}x")
+
         # Broadcast action into every patch token so all 8 layers see the
         # action signal directly, rather than relying on attention to propagate
         # it from a single prepended token across 256 patches.
-        x_p = x_p + a.unsqueeze(2)                                  # (B, T, N, d_pred)
+        x_p = x_p + a.unsqueeze(2) * self.action_scale              # (B, T, N, d_pred)
 
         if self.pose_dim > 0 and poses_T is not None:
             p      = self.pose_embed(poses_T)                        # (B, T, d_pred)

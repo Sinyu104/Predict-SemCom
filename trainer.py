@@ -291,7 +291,7 @@ class Stage1Trainer(BaseTrainer):
             lr=config["learning_rate"], weight_decay=0.05,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config["epochs"], eta_min=1e-5
+            self.optimizer, T_max=config["epochs"], eta_min=1e-4
         )
         self.start_epoch = 1
         self.best        = math.inf
@@ -332,6 +332,39 @@ class Stage1Trainer(BaseTrainer):
                 # Encode all T frames with frozen ViT
                 tokens = self._encode_clip(frames).detach()   # (B, T, N, D_vit)
                 B, T   = tokens.shape[:2]
+
+                if self.is_main:
+                    if not hasattr(self, '_diff_step'):
+                        self._diff_step = 0
+                    self._diff_step += 1
+                    if self._diff_step % 100 == 1:
+                        import torchvision.utils as vutils
+                        # Latent-space diff
+                        diff = (tokens[:, 1:] - tokens[:, :-1]).abs()  # (B, T-1, N, D_vit)
+                        # Pixel-space diff: frames in [0,1], shape (B, T, C, H, W)
+                        pdiff = (frames[:, 1:] - frames[:, :-1]).abs()  # (B, T-1, C, H, W)
+                        print(f"\n[frame-diff step={self._diff_step}]"
+                              f"\n  latent : mean={diff.mean().item():.5f}  "
+                              f"std={diff.std().item():.5f}  "
+                              f"max={diff.max().item():.5f}"
+                              f"\n  pixel  : mean={pdiff.mean().item():.5f}  "
+                              f"std={pdiff.std().item():.5f}  "
+                              f"max={pdiff.max().item():.5f}  "
+                              f"(×255: mean={pdiff.mean().item()*255:.2f})")
+                        # Save frames and amplified diffs for visual inspection
+                        save_dir = os.path.join(
+                            self.out_dir, "frame_diag", f"step_{self._diff_step:05d}"
+                        )
+                        os.makedirs(save_dir, exist_ok=True)
+                        sample = frames[0].cpu()                  # (T, C, H, W)
+                        for t in range(T):
+                            vutils.save_image(sample[t],
+                                os.path.join(save_dir, f"frame_{t:02d}.png"))
+                        for t in range(T - 1):
+                            amp = (pdiff[0, t] * 10).clamp(0, 1).cpu()
+                            vutils.save_image(amp,
+                                os.path.join(save_dir, f"diff_{t:02d}_{t+1:02d}_10x.png"))
+                        print(f"  [saved frames] {save_dir}")
 
                 pred = self._unwrap(self.system.predictor)
 
