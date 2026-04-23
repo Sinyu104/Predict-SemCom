@@ -350,6 +350,50 @@ class Stage1Trainer(BaseTrainer):
                               f"max={pdiff.max().item():.5f}  "
                               f"(×255: mean={pdiff.mean().item()*255:.2f})")
 
+                        # ── w_tf heatmap ─────────────────────────────── #
+                        import matplotlib
+                        matplotlib.use("Agg")
+                        import matplotlib.pyplot as plt
+
+                        grid  = 16
+                        H_img = frames.shape[-2]
+                        W_img = frames.shape[-1]
+                        # diff: (B, T-1, N, D_vit) → w_tf: (T-1, 16, 16)
+                        w_vis = diff.mean(dim=-1).float()       # (B, T-1, N)
+                        w_vis = w_vis / (w_vis.mean() + 1e-8)
+                        w_vis = w_vis.mean(dim=0)               # (T-1, N) avg over batch
+                        w_vis = w_vis.reshape(-1, grid, grid)   # (T-1, 16, 16)
+                        # upsample to frame resolution for overlay
+                        w_up  = F.interpolate(
+                            w_vis.unsqueeze(1),                 # (T-1, 1, 16, 16)
+                            size=(H_img, W_img), mode="bilinear", align_corners=False,
+                        ).squeeze(1).cpu().numpy()              # (T-1, H, W)
+                        w_vis = w_vis.cpu().numpy()
+
+                        n_steps = w_vis.shape[0]
+                        fig, axes = plt.subplots(1, n_steps, figsize=(4 * n_steps, 3.5),
+                                                 squeeze=False)
+                        axes = axes[0]
+                        vmin, vmax = w_up.min(), w_up.max()
+                        for i, ax in enumerate(axes):
+                            # background: frame i from the first batch item
+                            frame_np = frames[0, i].cpu().float().numpy()  # (C, H, W)
+                            ax.imshow(frame_np.transpose(1, 2, 0).clip(0, 1))
+                            im = ax.imshow(w_up[i], cmap="hot", alpha=0.5,
+                                           vmin=vmin, vmax=vmax)
+                            ax.set_title(f"frame {i}→{i+1}", fontsize=9)
+                            ax.set_xticks([])
+                            ax.set_yticks([])
+                        fig.colorbar(im, ax=axes[-1], fraction=0.046, pad=0.04,
+                                     label="w_tf (norm.)")
+                        fig.suptitle(f"w_tf heatmap  step={self._diff_step}", fontsize=10)
+                        out_path = os.path.join(
+                            self.out_dir, f"w_tf_step{self._diff_step:06d}.png"
+                        )
+                        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+                        plt.close(fig)
+                        print(f"  [w_tf heatmap] saved → {out_path}")
+
                 pred = self._unwrap(self.system.predictor)
 
                 # ── Teacher-forcing loss (Eq. 2, weighted L1) ───────── #
