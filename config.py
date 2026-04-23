@@ -67,6 +67,10 @@ CONFIG = {
     # ── Stage 3 loss ─────────────────────────────────────────────────── #
     "lambda_rate": 0.01, # λ weighting L_rate = KL(q||p) in Stage 3
 
+    # ── Loss weights ─────────────────────────────────────────────────── #
+    "lambda_tf":   0.1,   # weight for teacher-forcing loss L_tf
+    "lambda_roll": 1.0,   # weight for 3-step rollout loss L_roll
+
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 3e-4,
     "batch_size":    8,      # per-GPU batch size

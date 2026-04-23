@@ -346,13 +346,33 @@ class Stage1Trainer(BaseTrainer):
                                             torch.tensor([.25,.50,.75,.90,.99],
                                                          device=diff.device))
                         near0 = (diff < 0.01).float().mean().item() * 100
+                        diff2  = (tokens[:, 2:] - tokens[:, :-2]).abs()
+                        diff3  = (tokens[:, 3:] - tokens[:, :-3]).abs()
+                        lp2    = torch.quantile(diff2.flatten().float(),
+                                                torch.tensor([.25,.50,.75,.90,.99],
+                                                             device=diff2.device))
+                        lp3    = torch.quantile(diff3.flatten().float(),
+                                                torch.tensor([.25,.50,.75,.90,.99],
+                                                             device=diff3.device))
+                        near0_2 = (diff2 < 0.01).float().mean().item() * 100
+                        near0_3 = (diff3 < 0.01).float().mean().item() * 100
                         print(f"\n[frame-diff step={self._diff_step}]"
-                              f"\n  latent : mean={diff.mean().item():.5f}  "
+                              f"\n  latent 1-step : mean={diff.mean().item():.5f}  "
                               f"max={diff.max().item():.5f}  "
                               f"near-zero(<0.01)={near0:.1f}%"
-                              f"\n           p25={lp[0]:.5f}  p50={lp[1]:.5f}  "
+                              f"\n                 p25={lp[0]:.5f}  p50={lp[1]:.5f}  "
                               f"p75={lp[2]:.5f}  p90={lp[3]:.5f}  p99={lp[4]:.5f}"
-                              f"\n  pixel  : mean={pdiff.mean().item():.5f}  "
+                              f"\n  latent 2-step : mean={diff2.mean().item():.5f}  "
+                              f"max={diff2.max().item():.5f}  "
+                              f"near-zero(<0.01)={near0_2:.1f}%"
+                              f"\n                 p25={lp2[0]:.5f}  p50={lp2[1]:.5f}  "
+                              f"p75={lp2[2]:.5f}  p90={lp2[3]:.5f}  p99={lp2[4]:.5f}"
+                              f"\n  latent 3-step : mean={diff3.mean().item():.5f}  "
+                              f"max={diff3.max().item():.5f}  "
+                              f"near-zero(<0.01)={near0_3:.1f}%"
+                              f"\n                 p25={lp3[0]:.5f}  p50={lp3[1]:.5f}  "
+                              f"p75={lp3[2]:.5f}  p90={lp3[3]:.5f}  p99={lp3[4]:.5f}"
+                              f"\n  pixel         : mean={pdiff.mean().item():.5f}  "
                               f"max={pdiff.max().item():.5f}  "
                               f"(×255: mean={pdiff.mean().item()*255:.2f})")
 
@@ -378,20 +398,20 @@ class Stage1Trainer(BaseTrainer):
                               f"\n           p25={pp[0]:.5f}  p50={pp[1]:.5f}  "
                               f"p75={pp[2]:.5f}  p90={pp[3]:.5f}  p99={pp[4]:.5f}")
 
-                w_tf     = (tokens[:, 1:] - tokens[:, :-1]).abs().mean(dim=-1, keepdim=True).detach()
-                w_tf     = torch.pow(w_tf, 2)
+                w_tf     = (tokens[:, 1:] - tokens[:, :-1]).pow(2).sum(dim=-1, keepdim=True).detach()
                 w_tf     = w_tf / (w_tf.mean() + 1e-8)
-                L_tf     = (w_tf * (preds_tf - targets).abs()).mean()
+                L_tf     = (w_tf * (preds_tf - targets).pow(2)).mean()
 
-                # ── Rollout loss (Eq. 3, weighted L1, 2-step AR) ─────── #
-                z_hat_3  = pred.rollout_2step(tokens, actions[:, :2])
-                tgt_roll = tokens[:, 2].detach()
-                w_roll   = (tokens[:, 2] - tokens[:, 0]).abs().mean(dim=-1, keepdim=True).detach()
-                w_roll   = torch.pow(w_roll, 2)
+                # ── Rollout loss (Eq. 3, weighted MSE, 3-step AR) ────── #
+                z_hat_3  = pred.rollout_3step(tokens, actions[:, :3])
+                tgt_roll = tokens[:, 3].detach()
+                w_roll   = (tokens[:, 3] - tokens[:, 0]).pow(2).sum(dim=-1, keepdim=True).detach()
                 w_roll   = w_roll / (w_roll.mean() + 1e-8)
-                L_roll   = (w_roll * (z_hat_3 - tgt_roll).abs()).mean()
+                L_roll   = (w_roll * (z_hat_3 - tgt_roll).pow(2)).mean()
 
-                loss = L_tf + L_roll
+                lambda_tf   = self.config.get("lambda_tf",   1.0)
+                lambda_roll = self.config.get("lambda_roll", 1.0)
+                loss = lambda_tf * L_tf + lambda_roll * L_roll
 
                 if train:
                     self.optimizer.zero_grad()
@@ -416,8 +436,8 @@ class Stage1Trainer(BaseTrainer):
                 totals["total"]       += loss.item()
                 if not train:
                     with torch.no_grad():
-                        totals["tf_plain"]     += F.l1_loss(preds_tf.detach(), targets).item()
-                        totals["rollout_plain"] += F.l1_loss(z_hat_3.detach(), tgt_roll).item()
+                        totals["tf_plain"]     += F.mse_loss(preds_tf.detach(), targets).item()
+                        totals["rollout_plain"] += F.mse_loss(z_hat_3.detach(), tgt_roll).item()
                 n += 1
                 pbar.set_postfix(
                     tf=f"{L_tf.item():.4f}",

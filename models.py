@@ -450,18 +450,6 @@ class Predictor(nn.Module):
         x_p = self.input_proj(tokens_T.reshape(B * T, N, -1)).reshape(B, T, N, -1)
         a   = self.action_embed(actions_T)                           # (B, T, d_pred)
 
-        if not hasattr(self, '_diag_step'):
-            self._diag_step = 0
-        self._diag_step += 1
-        if self._diag_step % 200 == 1:
-            scaled_std = (a * self.action_scale).std().item()
-            print(f"[diag step={self._diag_step}] "
-                  f"x_p.std={x_p.std().item():.4f}  "
-                  f"a.std={a.std().item():.4f}  "
-                  f"action_scale={self.action_scale.item():.3f}  "
-                  f"scaled_a.std={scaled_std:.4f}  "
-                  f"ratio={x_p.std().item()/scaled_std:.2f}x")
-
         # Broadcast action into every patch token so all 8 layers see the
         # action signal directly, rather than relying on attention to propagate
         # it from a single prepended token across 256 patches.
@@ -564,9 +552,10 @@ class Predictor(nn.Module):
             poses[:, :2] if poses is not None else None,
         )[:, 0]                                                      # (B, N, D_vit)
 
-        # Step 2 — predict ẑ_3 using ẑ_2 as input for frame 2
+        # Step 2 — predict ẑ_3 from z_1, ẑ_2
+        dummy = torch.zeros_like(tokens[:, :1])
         tokens_ar = torch.cat(
-            [tokens[:, :1], z_hat_2.unsqueeze(1), tokens[:, 2:3]], dim=1
+            [tokens[:, :1], z_hat_2.unsqueeze(1), dummy], dim=1
         )                                                            # (B, 3, N, D_vit)
         preds_ar = self.forward_clip(
             tokens_ar,
@@ -574,6 +563,54 @@ class Predictor(nn.Module):
             poses[:, :3] if poses is not None else None,
         )                                                            # (B, 2, N, D_vit)
         return preds_ar[:, 1]                                        # (B, N, D_vit) — ẑ_3
+
+    def rollout_3step(
+        self,
+        tokens:  torch.Tensor,
+        actions: torch.Tensor,
+        poses:   torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        3-step autoregressive rollout.
+
+        tokens  : (B, T≥4, N, D_vit)
+        actions : (B, 3, action_dim)    — a_1, a_2, a_3
+        poses   : (B, 4, pose_dim) optional
+
+        Step 1: ẑ_2 = Predictor(z_1, a_1)
+        Step 2: ẑ_3 = Predictor(z_1, ẑ_2, a_1, a_2)
+        Step 3: ẑ_4 = Predictor(z_1, ẑ_2, ẑ_3, a_1, a_2, a_3)
+        Returns ẑ_4 : (B, N, D_vit)
+        """
+        # Step 1 — predict ẑ_2 from z_1
+        z_hat_2 = self.forward_clip(
+            tokens[:, :2],
+            actions[:, :1],
+            poses[:, :2] if poses is not None else None,
+        )[:, 0]                                                      # (B, N, D_vit)
+
+        # Step 2 — predict ẑ_3 from z_1, ẑ_2
+        dummy = torch.zeros_like(tokens[:, :1])
+        tokens_ar2 = torch.cat(
+            [tokens[:, :1], z_hat_2.unsqueeze(1), dummy], dim=1
+        )                                                            # (B, 3, N, D_vit)
+        z_hat_3 = self.forward_clip(
+            tokens_ar2,
+            actions[:, :2],
+            poses[:, :3] if poses is not None else None,
+        )[:, 1]                                                      # (B, N, D_vit)
+
+        # Step 3 — predict ẑ_4 from z_1, ẑ_2, ẑ_3
+        tokens_ar3 = torch.cat(
+            [tokens[:, :1], z_hat_2.unsqueeze(1),
+             z_hat_3.unsqueeze(1), dummy], dim=1
+        )                                                            # (B, 4, N, D_vit)
+        preds_ar = self.forward_clip(
+            tokens_ar3,
+            actions[:, :3],
+            poses[:, :4] if poses is not None else None,
+        )                                                            # (B, 3, N, D_vit)
+        return preds_ar[:, 2]                                        # (B, N, D_vit) — ẑ_4
 
 
 # ========================================================================== #
