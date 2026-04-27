@@ -292,7 +292,7 @@ class Stage1Trainer(BaseTrainer):
             lr=config["learning_rate"], weight_decay=0.05,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config["epochs"], eta_min=1e-4
+            self.optimizer, T_max=config["epochs"], eta_min=1e-5
         )
         self.start_epoch = 1
         self.best        = math.inf

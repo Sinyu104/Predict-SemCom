@@ -73,9 +73,9 @@ CONFIG = {
     "gamma_delta": 50.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
 
     # ── Optimisation ─────────────────────────────────────────────────── #
-    "learning_rate": 3e-4,
+    "learning_rate": 1e-4,
     "batch_size":    8,      # per-GPU batch size
-    "epochs":       10,
+    "epochs":       50,
 
     # ── Multi-GPU (DDP) ──────────────────────────────────────────────── #
     "num_gpus":        4,
