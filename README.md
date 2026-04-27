@@ -72,7 +72,7 @@ The Windows desktop and Linux server are on different subnets. Communication use
 ```bash
 # Required on both machines
 export ROS_DOMAIN_ID=66
-export ROS_DISCOVERY_SERVER=10.32.33.41:11811
+export ROS_DISCOVERY_SERVER=10.32.33.49:11811
 ```
 
 ---
