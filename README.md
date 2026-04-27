@@ -127,7 +127,7 @@ python server/test_ros2_server.py
 ```cmd
 :: Windows desktop
 set ROS_DOMAIN_ID=66
-set ROS_DISCOVERY_SERVER=10.32.33.41:11811
+set ROS_DISCOVERY_SERVER=10.32.33.49:11811
 python isaac_sim\test_ros2_client.py --num_requests 5
 ```
 
