@@ -128,9 +128,10 @@ def evaluate(args):
     system = SemComSystem(CONFIG).to(device)
     system.load_state_dict(ckpt["system_state"], strict=False)
     system.eval()
+    tok_enc   = system.token_encoder
     predictor = system.predictor
-    gamma     = CONFIG["gamma_delta"]
-    print(f"[eval] Checkpoint : {args.ckpt}  (gamma={gamma})")
+    tok_dec   = system.token_decoder
+    print(f"[eval] Checkpoint : {args.ckpt}")
 
     # ── Agent ────────────────────────────────────────────────────────────── #
     agent = build_agent(args.use_stub, CONFIG, unnorm_key_override=args.unnorm_key)
@@ -184,18 +185,20 @@ def evaluate(args):
 
         # Single-step prediction for every consecutive pair (t → t+1)
         for t in range(T - 1):
-            z_t    = tokens[t]          # (B, N, D_vit) — current frame
-            z_real = tokens[t + 1]      # (B, N, D_vit) — next frame (ground truth)
-            a_t    = actions[:, t]      # (B, action_dim) — action taken at step t
+            z_t    = tokens[t]      # (B, N, D_vit) — current frame
+            z_real = tokens[t + 1]  # (B, N, D_vit) — next frame (ground truth)
+            a_t    = actions[:, t]  # (B, action_dim)
 
-            # Predictor: outputs γΔ, recover absolute tokens
-            gamma_delta = predictor(z_t, a_t)                # (B, N, D_vit)
-            z_pred      = z_t + gamma_delta / gamma          # (B, N, D_vit)
+            # Compact pipeline: encode → predict → decode
+            c_t             = tok_enc(z_t)                   # (B, N, D_compact)
+            delta_pred      = predictor(c_t, a_t)            # (B, N, D_compact)
+            c_pred          = c_t + delta_pred               # absolute compact token
+            z_pred          = tok_dec(c_pred)                # (B, N, D_vit)
 
             # Actions from the three paths
-            a_real   = agent.predict_action_from_tokens(z_real, instruction)   # (B, 7)
-            a_pred   = agent.predict_action_from_tokens(z_pred, instruction)   # (B, 7)
-            a_repeat = agent.predict_action_from_tokens(z_t,    instruction)   # (B, 7)
+            a_real   = agent.predict_action_from_tokens(z_real,  instruction)
+            a_pred   = agent.predict_action_from_tokens(z_pred,  instruction)
+            a_repeat = agent.predict_action_from_tokens(z_t,     instruction)
 
             mse_pred.append(action_mse(a_pred,   a_real))
             mse_repeat.append(action_mse(a_repeat, a_real))

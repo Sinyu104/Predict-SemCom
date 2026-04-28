@@ -67,10 +67,19 @@ CONFIG = {
     # ── Stage 3 loss ─────────────────────────────────────────────────── #
     "lambda_rate": 0.01, # λ weighting L_rate = KL(q||p) in Stage 3
 
-    # ── Loss weights ─────────────────────────────────────────────────── #
-    "lambda_tf":   0.1,   # weight for teacher-forcing loss L_tf
-    "lambda_roll": 1.0,   # weight for 3-step rollout loss L_roll
-    "gamma_delta": 50.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
+    # ── Stage 1 compact latent (LeWorldModel) ────────────────────────── #
+    # TokenEncoder/Decoder project per-patch between D_vit and D_compact.
+    # The V-JEPA 2 predictor runs in D_compact space (much cheaper).
+    "D_compact": 1024,  # per-patch compact dim; predictor input/output dim
+
+    # ── Loss weights (Stage 1) ───────────────────────────────────────── #
+    "lambda_pred":  1.0,   # teacher-forcing prediction loss (compact space)
+    "lambda_sig":   0.01,  # SIGReg weight — Sketched Isotropic Gaussian Regularization
+    "sigreg_M":     64,    # number of random sketch directions for SIGReg
+    "lambda_recon": 1.0,   # TokenDecoder(c_t) ≈ z_t  reconstruction
+
+    # Phase 2 only — add rollout once Phase 1 converges (set > 0 to enable)
+    "lambda_roll":  0.0,   # 2-step autoregressive rollout loss
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 1e-4,

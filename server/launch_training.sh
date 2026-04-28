@@ -25,6 +25,13 @@
 
 set -euo pipefail
 
+# ── Activate virtual environment ───────────────────────────────────── #
+VENV_DIR="$(dirname "$(realpath "$0")")/../venv"
+if [ -f "${VENV_DIR}/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "${VENV_DIR}/bin/activate"
+fi
+
 # ── Validate we are in the right directory ─────────────────────────── #
 if [ ! -f "main.py" ]; then
     echo "ERROR: Run this script from the project root (where main.py lives)."
