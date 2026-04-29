@@ -120,18 +120,6 @@ class OpenVLAAgent(nn.Module):
         for p in self._vla.parameters():
             p.requires_grad_(False)
         self._vla.eval()
-
-        # Inject custom norm_stats (e.g. "franka_isaac") saved during fine-tuning.
-        # Mirrors the same logic in vla_server.py.
-        import json as _json, os as _os
-        stats_path = _os.path.join(self._model_name, "dataset_statistics.json")
-        if _os.path.isfile(stats_path):
-            with open(stats_path) as _f:
-                extra_stats = _json.load(_f)
-            if hasattr(self._vla, "norm_stats"):
-                self._vla.norm_stats.update(extra_stats)
-                print(f"[OpenVLAAgent] Loaded norm_stats from {stats_path}")
-
         self._loaded = True
         print("[OpenVLAAgent] Loaded and frozen.")
 
@@ -314,27 +302,26 @@ class OpenVLAAgent(nn.Module):
         )
         vit_tokens_dev = vit_tokens.to(self._vla_device, dtype=torch.float16)
 
-        actions = []
-        for i in range(B):
-            # Hook must inject only the i-th sample; the loop processes one at a time.
-            def _inject(module, inp, output, _i=i):
-                return vit_tokens_dev[_i:_i+1]
+        def _inject(module, inp, output):
+            return vit_tokens_dev
 
-            handle = self._vla.vision_backbone.register_forward_hook(_inject)
-            single_input = {
-                "input_ids":      input_ids[i:i+1],
-                "attention_mask": attention_mask[i:i+1],
-            }
-            try:
+        handle = self._vla.vision_backbone.register_forward_hook(_inject)
+        try:
+            actions = []
+            for i in range(B):
+                single_input = {
+                    "input_ids":      input_ids[i:i+1],
+                    "attention_mask": attention_mask[i:i+1],
+                }
                 action_np = self._vla.predict_action(
                     **single_input,
                     pixel_values = dummy_pv[i:i+1],
                     unnorm_key   = self.unnorm_key,
                     do_sample    = False,
                 )
-            finally:
-                handle.remove()
-            actions.append(torch.from_numpy(action_np).float())
+                actions.append(torch.from_numpy(action_np).float())
+        finally:
+            handle.remove()
 
         return torch.stack(actions, dim=0)
 

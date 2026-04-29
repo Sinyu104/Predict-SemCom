@@ -60,6 +60,7 @@ CONFIG = {
     #   T=4  → seq_len=1028, safe on T4 with batch_size=2.
     #   T=8  → seq_len=2056, tight but feasible with batch_size=1.
     "clip_length": 4,   # set to 16 to match paper if using A100/H100
+    "clip_stride": 4,   # sample every k-th frame; actions are summed over k steps
 
     # ── Channel ──────────────────────────────────────────────────────── #
     "snr_db": 10.0,      # Rayleigh channel SNR in dB; sweep for ablation
@@ -67,19 +68,10 @@ CONFIG = {
     # ── Stage 3 loss ─────────────────────────────────────────────────── #
     "lambda_rate": 0.01, # λ weighting L_rate = KL(q||p) in Stage 3
 
-    # ── Stage 1 compact latent (LeWorldModel) ────────────────────────── #
-    # TokenEncoder/Decoder project per-patch between D_vit and D_compact.
-    # The V-JEPA 2 predictor runs in D_compact space (much cheaper).
-    "D_compact": 1024,  # per-patch compact dim; predictor input/output dim
-
-    # ── Loss weights (Stage 1) ───────────────────────────────────────── #
-    "lambda_pred":  1.0,   # teacher-forcing prediction loss (compact space)
-    "lambda_sig":   0.01,  # SIGReg weight — Sketched Isotropic Gaussian Regularization
-    "sigreg_M":     64,    # number of random sketch directions for SIGReg
-    "lambda_recon": 1.0,   # TokenDecoder(c_t) ≈ z_t  reconstruction
-
-    # Phase 2 only — add rollout once Phase 1 converges (set > 0 to enable)
-    "lambda_roll":  0.0,   # 2-step autoregressive rollout loss
+    # ── Loss weights ─────────────────────────────────────────────────── #
+    "lambda_tf":   0.1,   # weight for teacher-forcing loss L_tf
+    "lambda_roll": 1.0,   # weight for 3-step rollout loss L_roll
+    "gamma_delta": 50.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 1e-4,

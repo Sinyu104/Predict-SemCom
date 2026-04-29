@@ -192,12 +192,14 @@ class ClipDataset(Dataset):
         obs_width:    int = 224,
         obs_channels: int = 3,
         clip_length:  int = 16,
+        stride:       int = 1,
     ):
         super().__init__()
         self.hdf5_path   = hdf5_path
         self.obs_height  = obs_height
         self.obs_width   = obs_width
         self.clip_length = clip_length
+        self.stride      = stride
 
         self._index      = []   # (layout_key, start_idx)
         self._action_dim = None
@@ -205,14 +207,17 @@ class ClipDataset(Dataset):
         self._load_index()
 
     def _load_index(self):
-        T = self.clip_length
+        T      = self.clip_length
+        stride = self.stride
+        # Need start + stride*(T-1) < n  →  n - stride*(T-1) valid starts
+        window = stride * (T - 1) + 1
         if not os.path.exists(self.hdf5_path):
             raise FileNotFoundError(f"HDF5 not found: '{self.hdf5_path}'")
 
         with h5py.File(self.hdf5_path, "r") as f:
             if "observations" in f:
                 n = len(f["observations"])
-                self._index = [("flat", i) for i in range(n - T + 1)]
+                self._index = [("flat", i) for i in range(n - window + 1)]
                 if "actions" in f and f["actions"].ndim > 1:
                     self._action_dim = f["actions"].shape[1]
                 if "poses" in f and f["poses"].ndim > 1:
@@ -223,9 +228,9 @@ class ClipDataset(Dataset):
                     if "observations" not in grp or "actions" not in grp:
                         continue
                     n = len(grp["observations"])
-                    if n < T:
+                    if n < window:
                         continue
-                    for i in range(n - T + 1):
+                    for i in range(n - window + 1):
                         self._index.append((ep_key, i))
                     if self._action_dim is None and grp["actions"].ndim > 1:
                         self._action_dim = grp["actions"].shape[1]
@@ -234,8 +239,8 @@ class ClipDataset(Dataset):
 
         if not self._index:
             raise ValueError(
-                f"No clips of length {T} found in '{self.hdf5_path}'. "
-                "Check clip_length or episode lengths."
+                f"No clips of length {T} (stride={stride}) found in '{self.hdf5_path}'. "
+                "Check clip_length, clip_stride, or episode lengths."
             )
 
     def __len__(self) -> int:
@@ -243,29 +248,36 @@ class ClipDataset(Dataset):
 
     def __getitem__(self, idx: int):
         layout_key, start = self._index[idx]
-        T = self.clip_length
-        end = start + T
+        T      = self.clip_length
+        stride = self.stride
+        frame_indices = [start + k * stride for k in range(T)]
+        # Actions between t and t+(T-1)*stride: stride*(T-1) raw actions
+        raw_end = start + stride * (T - 1)
 
         with h5py.File(self.hdf5_path, "r") as f:
             if layout_key == "flat":
-                obs_arr    = np.array(f["observations"][start:end])
-                action_arr = np.array(f["actions"][start:end], dtype=np.float32)
-                pose_arr   = np.array(f["poses"][start:end], dtype=np.float32) \
+                obs_arr    = np.array(f["observations"][frame_indices])
+                action_raw = np.array(f["actions"][start:raw_end], dtype=np.float32)
+                pose_arr   = np.array(f["poses"][frame_indices], dtype=np.float32) \
                              if "poses" in f else None
             else:
                 grp        = f[layout_key]
-                obs_arr    = np.array(grp["observations"][start:end])
-                action_arr = np.array(grp["actions"][start:end], dtype=np.float32)
-                pose_arr   = np.array(grp["poses"][start:end], dtype=np.float32) \
+                obs_arr    = np.array(grp["observations"][frame_indices])
+                action_raw = np.array(grp["actions"][start:raw_end], dtype=np.float32)
+                pose_arr   = np.array(grp["poses"][frame_indices], dtype=np.float32) \
                              if "poses" in grp else None
+
+        # Sum stride raw actions per transition → (T-1, action_dim)
+        action_dim = action_raw.shape[-1]
+        action_arr = action_raw.reshape(T - 1, stride, action_dim).sum(axis=1)
 
         frames  = torch.stack([
             _preprocess_obs(obs_arr[k], self.obs_height, self.obs_width)
             for k in range(T)
-        ])                                                    # (T, C, H, W)
-        actions = torch.from_numpy(action_arr)                # (T, action_dim)
-        poses   = torch.from_numpy(pose_arr) if pose_arr is not None \
-                  else torch.zeros(T, max(self._pose_dim, 1)) # (T, pose_dim) or zeros
+        ])                                                          # (T, C, H, W)
+        actions = torch.from_numpy(action_arr)                      # (T-1, action_dim)
+        poses   = torch.from_numpy(pose_arr[:-1]) if pose_arr is not None \
+                  else torch.zeros(T - 1, max(self._pose_dim, 1))  # (T-1, pose_dim)
 
         return frames, actions, poses
 

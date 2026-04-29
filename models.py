@@ -184,44 +184,6 @@ class JsccDecoder(nn.Module):
 
 
 # ========================================================================== #
-#  TOKEN ENCODER / DECODER  (LeWorldModel-style compact latent)              #
-# ========================================================================== #
-
-class TokenEncoder(nn.Module):
-    """
-    Per-patch deterministic projection from frozen ViT space to compact space.
-
-    Keeping the full (B, N, D_compact) spatial structure preserves fine-grained
-    patch detail (important for small objects like the cube).
-    No reparameterisation needed — SIGReg regularises the batch distribution.
-
-    (B, N, D_vit) → c : (B, N, D_compact)
-    """
-
-    def __init__(self, D_vit: int, D_compact: int):
-        super().__init__()
-        self.fc = nn.Linear(D_vit, D_compact)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.fc(tokens)
-
-
-class TokenDecoder(nn.Module):
-    """
-    Per-patch projection from compact latent back to ViT token space.
-
-    (B, N, D_compact) → (B, N, D_vit)
-    """
-
-    def __init__(self, D_compact: int, D_vit: int):
-        super().__init__()
-        self.fc = nn.Linear(D_compact, D_vit)
-
-    def forward(self, c: torch.Tensor) -> torch.Tensor:
-        return self.fc(c)
-
-
-# ========================================================================== #
 #  PREDICTOR HELPERS (V-JEPA 2 style)                                        #
 # ========================================================================== #
 
@@ -705,19 +667,17 @@ class SemComSystem(nn.Module):
     ViT Encoder, OpenVLA Projector, and LLM are NOT stored here.
 
     Training stages:
-      Stage 1: token_encoder, predictor (in D_compact space), token_decoder
-               LeWorldModel-style: L_pred + L_kl + L_recon
-      Stage 2: jscc_encoder, side_info_encoder, jscc_decoder, channel
-               (token_encoder, predictor, token_decoder frozen)
+      Stage 2: predictor  (ViT frozen)
+      Stage 3: jscc_encoder, side_info_encoder, jscc_decoder, channel
+               (predictor frozen)
     """
 
     def __init__(self, config: dict):
         super().__init__()
         D_vit       = config["D_vit"]
         D_jscc      = config["D_jscc"]
-        D_compact   = config.get("D_compact", 256)          # compact latent dim
-        d_pred      = config["d_pred"]                      # predictor hidden dim
-        jscc_d_pred = config.get("jscc_d_pred", 384)
+        d_pred      = config["d_pred"]                       # predictor hidden dim (1024)
+        jscc_d_pred = config.get("jscc_d_pred", 384)        # JSCC MLP working dim
         action_dim  = config["action_dim"]
         pose_dim    = config.get("pose_dim",       0)
         grid_size   = config.get("grid_size",     14)
@@ -727,67 +687,15 @@ class SemComSystem(nn.Module):
         mlp_ratio   = config.get("pred_mlp_ratio", 4.0)
         drop_path   = config.get("pred_drop_path", 0.0)
 
-        # Stage 1 modules — compact latent world model
-        self.token_encoder = TokenEncoder(D_vit, D_compact)
-        self.token_decoder = TokenDecoder(D_compact, D_vit)
-        # Predictor now runs in D_compact space (input_proj: D_compact→d_pred,
-        # output_proj: d_pred→D_compact)
-        self.predictor     = Predictor(D_compact, action_dim, d_pred,
-                                       n_layers=n_layers, n_heads=n_heads,
-                                       grid_size=grid_size, grid_depth=grid_depth,
-                                       mlp_ratio=mlp_ratio, drop_path_rate=drop_path,
-                                       pose_dim=pose_dim)
-
-        # Stage 2 modules — JSCC channel coding
         self.jscc_encoder      = JsccEncoder(D_vit, D_jscc, jscc_d_pred)
         self.side_info_encoder = SideInfoEncoder(D_vit, D_jscc, jscc_d_pred)
         self.jscc_decoder      = JsccDecoder(D_jscc, D_vit, jscc_d_pred)
+        self.predictor         = Predictor(D_vit, action_dim, d_pred,
+                                           n_layers=n_layers, n_heads=n_heads,
+                                           grid_size=grid_size, grid_depth=grid_depth,
+                                           mlp_ratio=mlp_ratio, drop_path_rate=drop_path,
+                                           pose_dim=pose_dim)
         self.channel           = RayleighChannel(config["snr_db"])
-
-    @staticmethod
-    def sigreg(Z: torch.Tensor, M: int = 64) -> torch.Tensor:
-        """
-        Sketched Isotropic Gaussian Regularization (LeJEPA, arXiv:2511.08544).
-
-        Projects the batch of embeddings Z onto M random unit directions, then
-        applies the Epps-Pulley normality test statistic along each 1-D projection.
-        By the Cramér-Wold theorem, matching all 1-D marginals ≡ matching the
-        full joint distribution.
-
-        T(z) = √(2π)/n² · ΣΣ exp(-(zⱼ-zₖ)²/2)
-               - 2√π/n · Σ exp(-zⱼ²/4)
-               + √(2π/3)
-
-        T = 0 iff z ~ N(0,1) (limiting result via char. function integration).
-
-        Parameters
-        ----------
-        Z : (n, d)  batch of embeddings — typically mean-pooled compact tokens
-        M : int     number of random sketch directions
-        """
-        import math
-        n, d = Z.shape
-
-        # M random unit vectors on S^{d-1}
-        u = F.normalize(torch.randn(d, M, device=Z.device, dtype=Z.dtype), dim=0)
-
-        # Project and standardise each direction to zero mean / unit std
-        H = Z @ u                                          # (n, M)
-        H = H - H.mean(dim=0, keepdim=True)
-        H = H / (H.std(dim=0, keepdim=True) + 1e-8)
-
-        # Epps-Pulley statistic (vectorised over M)
-        sqrt_2pi   = math.sqrt(2.0 * math.pi)
-        sqrt_pi    = math.sqrt(math.pi)
-        sqrt_2pi_3 = math.sqrt(2.0 * math.pi / 3.0)
-
-        # Pairwise squared distances: (n, n, M)
-        D_sq      = (H.unsqueeze(1) - H.unsqueeze(0)).pow(2)
-        pair_term = (sqrt_2pi / n ** 2) * torch.exp(-D_sq / 2).sum(dim=[0, 1])
-        indiv_term = (2.0 * sqrt_pi / n) * torch.exp(-H.pow(2) / 4).sum(dim=0)
-
-        T = pair_term - indiv_term + sqrt_2pi_3            # (M,)
-        return T.mean()
 
     @staticmethod
     def rate_loss(
