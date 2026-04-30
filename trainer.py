@@ -220,8 +220,11 @@ class BaseTrainer:
     def save_checkpoint(self, filename: str, extra: dict | None = None):
         if not self.is_main:
             return
-        path    = os.path.join(self.out_dir, filename)
-        payload = {"system_state": self._unwrap(self.system).state_dict()}
+        path = os.path.join(self.out_dir, filename)
+        # Strip DDP '.module.' so checkpoints load cleanly without DDP
+        raw_state = self._unwrap(self.system).state_dict()
+        clean_state = {k.replace(".module.", "."): v for k, v in raw_state.items()}
+        payload = {"system_state": clean_state}
         if extra:
             payload.update(extra)
         torch.save(payload, path)
@@ -454,6 +457,17 @@ class Stage1Trainer(BaseTrainer):
             t      = torch.tensor(v / max(n, 1), device=self.device)
             avg[k] = reduce_mean(t).item()
         return avg
+
+    def validate(self):
+        if self.is_main:
+            print(f"\n[Stage1] Running validation only  T={self.clip_length} frames")
+        vl = self._run_epoch(self.val_loader, train=False, epoch=0)
+        if self.is_main:
+            print(
+                f"[Stage1] val_tf={vl['tf']:.4f} (plain={vl['tf_plain']:.4f})"
+                f"  val_ro={vl['rollout']:.4f} (plain={vl['rollout_plain']:.4f})"
+                f"  val_cos={vl['cosine']:.3f}"
+            )
 
     def train(self):
         best   = self.best

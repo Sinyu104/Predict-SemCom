@@ -61,6 +61,8 @@ def parse_args():
 
     p.add_argument("--verbose", action="store_true",
                    help="Print latent/pred diff stats and save w_tf heatmaps every 100 steps")
+    p.add_argument("--val_only", action="store_true",
+                   help="Run one validation epoch and exit (use --resume to specify checkpoint)")
 
     return p.parse_args()
 
@@ -203,8 +205,20 @@ def main():
         )
         run_inference(CONFIG, data_path, ckpt, device, agent)
 
+    elif args.val_only:
+        agent     = build_agent(args, CONFIG, rank)
+        ckpt_path = args.resume or os.path.join(out, "stage1_best.pt")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: '{ckpt_path}'. Use --resume to specify one.")
+        if is_main:
+            print(f"\n[main] ===== STAGE 1 VALIDATION  ckpt={ckpt_path} =====")
+        Stage1Trainer(
+            CONFIG, data_path, device, agent, rank, world_size,
+            resume_ckpt=ckpt_path,
+        ).validate()
+
     else:
-        print("[main] Specify --train or --inference.")
+        print("[main] Specify --train, --inference, or --val_only.")
 
     cleanup_distributed()
 

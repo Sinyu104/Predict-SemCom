@@ -69,9 +69,9 @@ CONFIG = {
     "lambda_rate": 0.01, # λ weighting L_rate = KL(q||p) in Stage 3
 
     # ── Loss weights ─────────────────────────────────────────────────── #
-    "lambda_tf":   0.1,   # weight for teacher-forcing loss L_tf
-    "lambda_roll": 1.0,   # weight for 3-step rollout loss L_roll
-    "gamma_delta": 50.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
+    "lambda_tf":   0.5,   # weight for teacher-forcing loss L_tf
+    "lambda_roll": 0.5,   # weight for 3-step rollout loss L_roll
+    "gamma_delta": 20.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 1e-4,

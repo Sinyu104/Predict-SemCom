@@ -120,6 +120,19 @@ class OpenVLAAgent(nn.Module):
         for p in self._vla.parameters():
             p.requires_grad_(False)
         self._vla.eval()
+
+        # Inject dataset_statistics.json if present alongside the checkpoint.
+        # Fine-tuned checkpoints save stats here but don't embed them in norm_stats.
+        import json, pathlib
+        stats_path = pathlib.Path(self._model_name) / "dataset_statistics.json"
+        if stats_path.exists():
+            with open(stats_path) as f:
+                extra = json.load(f)
+            if not hasattr(self._vla, "norm_stats") or self._vla.norm_stats is None:
+                self._vla.norm_stats = {}
+            self._vla.norm_stats.update(extra)
+            print(f"[OpenVLAAgent] Loaded norm_stats keys: {list(extra.keys())}")
+
         self._loaded = True
         print("[OpenVLAAgent] Loaded and frozen.")
 
@@ -302,13 +315,16 @@ class OpenVLAAgent(nn.Module):
         )
         vit_tokens_dev = vit_tokens.to(self._vla_device, dtype=torch.float16)
 
+        current_slice = [None]
+
         def _inject(module, inp, output):
-            return vit_tokens_dev
+            return current_slice[0]
 
         handle = self._vla.vision_backbone.register_forward_hook(_inject)
         try:
             actions = []
             for i in range(B):
+                current_slice[0] = vit_tokens_dev[i:i+1]
                 single_input = {
                     "input_ids":      input_ids[i:i+1],
                     "attention_mask": attention_mask[i:i+1],
