@@ -231,11 +231,32 @@ class BaseTrainer:
         print(f"  [ckpt] Saved → {path}")
 
     def load_checkpoint(self, path: str) -> dict:
-        ckpt = torch.load(path, map_location="cpu")
-        self._unwrap(self.system).load_state_dict(
-            ckpt["system_state"], strict=False
-        )
+        ckpt  = torch.load(path, map_location="cpu")
+        model = self._unwrap(self.system)
+        model_keys = set(model.state_dict().keys())
+        state = ckpt["system_state"]
+
+        # save_checkpoint strips ".module." from DDP-wrapped submodule keys.
+        # If a submodule has since been DDP-wrapped, its keys now contain
+        # ".module." and won't match the saved keys directly.  Remap by
+        # inserting ".module." after the first path component when needed.
+        remapped = {}
+        for k, v in state.items():
+            if k in model_keys:
+                remapped[k] = v
+            else:
+                parts = k.split('.', 1)
+                if len(parts) == 2:
+                    candidate = f"{parts[0]}.module.{parts[1]}"
+                    remapped[candidate if candidate in model_keys else k] = v
+                else:
+                    remapped[k] = v
+
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
         if self.is_main:
+            if missing:
+                print(f"  [ckpt] WARNING: {len(missing)} missing keys — "
+                      f"e.g. {missing[:3]}")
             print(f"  [ckpt] Loaded ← {path}")
         return ckpt
 
@@ -248,7 +269,8 @@ class BaseTrainer:
         if "scheduler_state" in ckpt and hasattr(self, "scheduler"):
             self.scheduler.load_state_dict(ckpt["scheduler_state"])
         if self.is_main:
-            print(f"  [ckpt] Resuming from epoch {start_epoch}  best={best:.6f}")
+            print(f"  [ckpt] Checkpoint at epoch {start_epoch - 1}  "
+                  f"→ resuming at epoch {start_epoch}  best={best:.6f}")
         del ckpt
         torch.cuda.empty_cache()
         return start_epoch, best
