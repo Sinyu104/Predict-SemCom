@@ -238,11 +238,12 @@ def evaluate(args):
                   else CONFIG.get("clip_stride", 1)
 
     full_ds = ClipDataset(
-        hdf5_path   = data_path,
-        obs_height  = CONFIG["obs_height"],
-        obs_width   = CONFIG["obs_width"],
-        clip_length = clip_len,
-        stride      = clip_stride,
+        hdf5_path    = data_path,
+        obs_height   = CONFIG["obs_height"],
+        obs_width    = CONFIG["obs_width"],
+        obs_channels = CONFIG["obs_channels"],
+        clip_length  = clip_len,
+        stride       = clip_stride,
     )
     n_val   = max(1, int(0.2 * len(full_ds)))
     n_train = len(full_ds) - n_val
@@ -261,6 +262,9 @@ def evaluate(args):
     # ── Accumulators keyed by horizon ────────────────────────────────────── #
     # Each key h ∈ {1, …, max_horizon} maps to a list of scalar values.
     acc = {h: defaultdict(list) for h in range(1, max_horizon + 1)}
+    # Per-position clip accumulator: key t ∈ {0, …, max_horizon-1}
+    # t=0 is cold-start (only z_0 as context); t>0 has t prior frames.
+    acc_clip = {t: defaultdict(list) for t in range(max_horizon)}
     n_clips = 0
 
     n_batches = len(loader) if args.max_clips <= 0 else \
@@ -285,6 +289,16 @@ def evaluate(args):
         # Horizon 1 — teacher-forced full-clip forward_clip (matches trainer val_cos)
         z_preds_h1 = predict_h1_full_clip(predictor, tokens_stacked, actions, gamma)
 
+        # Per-position clip metrics: break out each step t→t+1 separately.
+        # z_preds_h1[t] predicts z_{t+1} with context z_0...z_t via block-causal
+        # attention, so t=0 is cold-start and t>0 has growing temporal history.
+        for t in range(T - 1):
+            lm = latent_metrics(z_preds_h1[t], tokens[t + 1])
+            acc_clip[t]["l1"].append(lm["l1"])
+            acc_clip[t]["mse"].append(lm["mse"])
+            acc_clip[t]["l2"].append(lm["l2"])
+            acc_clip[t]["cos"].append(lm["cos"])
+
         # Pre-compute VLA actions for every real token once (cache across horizons).
         if not latent_only:
             a_tok = [agent.predict_action_from_tokens(tokens[t], instruction)
@@ -295,7 +309,9 @@ def evaluate(args):
             for t in range(T - h):
                 z_start = tokens[t]          # (B, N, D_vit)
                 z_real  = tokens[t + h]      # (B, N, D_vit)  ground-truth target
-                a_gt    = actions[:, t]      # (B, action_dim) action at step t
+                # action at the destination frame; None when t+h is the last frame
+                # (actions has T-1 entries so index T-1 is out of bounds)
+                a_gt = actions[:, t + h] if (t + h) < actions.shape[1] else None
 
                 # Predict: h=1 uses teacher-forced full-clip; h>1 uses AR rollout
                 if h == 1:
@@ -338,10 +354,11 @@ def evaluate(args):
                     acc[h]["act_pred_vs_real"].append(action_mse(a_pred_tok, a_real_tok))
                     acc[h]["act_rep_vs_real"].append(action_mse(a_repeat,    a_real_tok))
 
-                    # vs ground-truth dataset action
-                    acc[h]["act_pred_vs_gt"].append(action_mse(a_pred_tok, a_gt))
-                    acc[h]["act_real_vs_gt"].append(action_mse(a_real_tok, a_gt))
-                    acc[h]["act_rep_vs_gt"].append(action_mse(a_repeat,    a_gt))
+                    # vs ground-truth dataset action (skipped at last frame boundary)
+                    if a_gt is not None:
+                        acc[h]["act_pred_vs_gt"].append(action_mse(a_pred_tok, a_gt))
+                        acc[h]["act_real_vs_gt"].append(action_mse(a_real_tok, a_gt))
+                        acc[h]["act_rep_vs_gt"].append(action_mse(a_repeat,    a_gt))
 
         n_clips += B
         pbar.update(1)
@@ -405,6 +422,24 @@ def evaluate(args):
             tag_gt = f"{(1-ratio_gt)*100:.1f}% better" if ratio_gt < 1 else f"{(ratio_gt-1)*100:.1f}% WORSE"
             print(f"  → Predictor is {tag_gt} than repeat (vs GT)")
 
+    # ── Per-position clip prediction summary ─────────────────────────────── #
+    print()
+    print("=" * W)
+    print("  Per-position clip prediction (1-step teacher-forced, full prior context)")
+    print("  Each row t→t+1 predicts z_{t+1} using real z_0...z_t via block-causal attn.")
+    print("  Shows whether temporal context improves 1-step prediction quality.")
+    print(f"  {'Pos':>4}  {'Context':>18}  {'MSE':>10}  {'L2(RMSE)':>10}  {'Cosine':>8}  {'L1':>10}")
+    print(f"  {'-'*4}  {'-'*18}  {'-'*10}  {'-'*10}  {'-'*8}  {'-'*10}")
+    for t in range(max_horizon):
+        a    = acc_clip[t]
+        ctx  = "cold start" if t == 0 else f"{t} prior frame{'s' if t > 1 else ''}"
+        n    = len(a["mse"])
+        print(f"  {t}→{t+1}  {ctx:>18}  "
+              f"{mean(a['mse']):>10.6f}  "
+              f"{mean(a['l2']):>10.6f}  "
+              f"{mean(a['cos']):>8.6f}  "
+              f"{mean(a['l1']):>10.6f}  "
+              f"({n} samples)")
     print()
     print("=" * W)
 
