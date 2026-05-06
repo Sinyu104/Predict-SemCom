@@ -1,12 +1,14 @@
 """
 main.py  —  Entry point for the Predictive Semantic Communication System.
 
-IMPORTANT: For multi-GPU training use torchrun, NOT python:
+Stage 1 (single-process, VLA spans all GPUs via device_map="auto"):
+    python main.py --train --stage 1 --stored_data data/stage12_clean.hdf5
 
-    torchrun --nproc_per_node=4 main.py --train --stage 1 \\
+Stage 2 (multi-GPU DDP, use torchrun):
+    torchrun --nproc_per_node=4 main.py --train --stage 2 \\
         --stored_data data/stage12_clean.hdf5
 
-Single-GPU / CPU testing (uses OpenVLAStub):
+CPU testing (uses OpenVLAStub, no model download):
     python main.py --train --stage 1 --use_stub \\
         --stored_data data/test.hdf5 --epoch 2 --batch_size 2
 
@@ -63,6 +65,8 @@ def parse_args():
                    help="Print latent/pred diff stats and save w_tf heatmaps every 100 steps")
     p.add_argument("--val_only", action="store_true",
                    help="Run one validation epoch and exit (use --resume to specify checkpoint)")
+    p.add_argument("--skip_phase1", action="store_true",
+                   help="Skip Phase 1 and go straight to Phase 2 (loads stage1p1_final.pt)")
 
     return p.parse_args()
 
@@ -167,7 +171,7 @@ def main():
             Stage1Trainer(
                 CONFIG, data_path, device, agent, rank, world_size,
                 resume_ckpt=args.resume,
-            ).train()
+            ).train(skip_phase1=args.skip_phase1)
 
         elif args.stage == 2:
             ckpt = os.path.join(out, "stage1_best.pt")

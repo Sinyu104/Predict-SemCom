@@ -36,6 +36,33 @@ from PIL import Image
 
 
 # ========================================================================== #
+#  Action Tokenizer  (matches vla_server.py / original OpenVLA fine-tuning)  #
+# ========================================================================== #
+
+class ActionTokenizer:
+    """
+    Maps continuous 7-DoF actions to LLaMA token IDs following OpenVLA's convention.
+
+    OpenVLA repurposes the 256 least-used tokens in LLaMA-2's vocabulary as
+    action bins — the 256 highest non-special token IDs.
+    """
+    def __init__(self, tokenizer, bins: int = 256, min_action: float = -1.0, max_action: float = 1.0):
+        self.n_bins     = bins
+        self.min_action = min_action
+        self.max_action = max_action
+        self.bin_edges  = np.linspace(min_action, max_action, bins + 1)  # 257 edges → 256 bins
+        special_ids     = set(tokenizer.all_special_ids)
+        all_ids         = sorted([tid for tid in tokenizer.get_vocab().values() if tid not in special_ids])
+        self.action_token_ids = np.array(all_ids[-bins:])                 # highest IDs = least frequent
+
+    def __call__(self, action) -> list:
+        action      = np.clip(action, self.min_action, self.max_action)
+        bin_indices = np.digitize(action, self.bin_edges[1:-1])           # 255 inner edges → 0…255
+        bin_indices = np.clip(bin_indices, 0, self.n_bins - 1)
+        return self.action_token_ids[bin_indices].tolist()
+
+
+# ========================================================================== #
 #  Real OpenVLA Agent                                                         #
 # ========================================================================== #
 
@@ -93,7 +120,8 @@ class OpenVLAAgent(nn.Module):
         self._processor = AutoProcessor.from_pretrained(
             self._model_name, trust_remote_code=True
         )
-        kwargs = dict(low_cpu_mem_usage=True, trust_remote_code=True)
+        kwargs = dict(low_cpu_mem_usage=True, trust_remote_code=True,
+                      attn_implementation="eager")
         if self._quantize:
             try:
                 from transformers import BitsAndBytesConfig
@@ -107,11 +135,27 @@ class OpenVLAAgent(nn.Module):
             kwargs["torch_dtype"] = torch.float16
 
         if self._vla_device == "auto":
-            kwargs["device_map"] = "auto"
-            self._vla = AutoModelForVision2Seq.from_pretrained(
-                self._model_name, **kwargs
-            )
-            self._vla_device = next(self._vla.parameters()).device
+            n_gpus = torch.cuda.device_count()
+            if n_gpus > 1:
+                # Load to CPU as plain tensors — no device_map, no accelerate
+                # hooks.  Using device_map={"":"cpu"} installs CPU AlignDeviceHooks
+                # that conflict with the subsequent dispatch_model call in
+                # add_lora().  Plain loading avoids this entirely.
+                # Dispatch to GPUs happens at the end of add_lora() once all
+                # LoRA weights are real tensors on CPU.
+                self._vla = AutoModelForVision2Seq.from_pretrained(
+                    self._model_name,
+                    trust_remote_code      = True,
+                    torch_dtype            = torch.float16,
+                    attn_implementation    = "eager",
+                )
+                # _vla_device stays "auto" as dispatch-pending sentinel
+            else:
+                kwargs["device_map"] = "auto"
+                self._vla = AutoModelForVision2Seq.from_pretrained(
+                    self._model_name, **kwargs
+                )
+                self._vla_device = next(self._vla.parameters()).device
         else:
             self._vla = AutoModelForVision2Seq.from_pretrained(
                 self._model_name, **kwargs
@@ -133,6 +177,9 @@ class OpenVLAAgent(nn.Module):
             self._vla.norm_stats.update(extra)
             print(f"[OpenVLAAgent] Loaded norm_stats keys: {list(extra.keys())}")
 
+        self._action_tokenizer = ActionTokenizer(self._processor.tokenizer)
+        print(f"[OpenVLAAgent] ActionTokenizer: IDs {self._action_tokenizer.action_token_ids[0]}"
+              f" … {self._action_tokenizer.action_token_ids[-1]}")
         self._loaded = True
         print("[OpenVLAAgent] Loaded and frozen.")
 
@@ -146,16 +193,9 @@ class OpenVLAAgent(nn.Module):
         arr = (t.detach().cpu().clamp(0, 1) * 255).byte()
         return Image.fromarray(arr.permute(1, 2, 0).numpy(), "RGB")
 
-    @staticmethod
-    def _action_to_tokens(action_np: np.ndarray, processor) -> torch.Tensor:
+    def _action_to_tokens(self, action_np: np.ndarray, processor=None) -> torch.Tensor:
         """Encode ground-truth (7,) action into OpenVLA token IDs."""
-        if hasattr(processor, "action_tokenizer"):
-            return torch.tensor(
-                processor.action_tokenizer(action_np), dtype=torch.long
-            )
-        bins     = torch.linspace(-1, 1, 256)
-        action_t = torch.from_numpy(action_np).float().clamp(-1, 1)
-        return torch.bucketize(action_t, bins)
+        return torch.tensor(self._action_tokenizer(action_np), dtype=torch.long)
 
     def _make_prompt(self, instruction: str) -> str:
         return (
@@ -241,46 +281,65 @@ class OpenVLAAgent(nn.Module):
         inputs    = self._processor(
             prompts, pil_dummy, return_tensors="pt", padding=True
         )
+        prompt_len     = inputs["input_ids"].shape[1]
         input_ids      = inputs["input_ids"].to(self._vla_device)
         attention_mask = inputs["attention_mask"].to(self._vla_device)
 
-        # Dummy pixel values (will be discarded by the hook)
+        # Build action token IDs and append to input — matches original fine-tune
+        action_token_ids = torch.stack([
+            self._action_to_tokens(actions_gt[i].cpu().numpy())
+            for i in range(B)
+        ]).to(self._vla_device)
+
+        full_input_ids = torch.cat([input_ids, action_token_ids], dim=1)
+        full_attn_mask = torch.cat([
+            attention_mask,
+            torch.ones(B, self.ACTION_TOKEN_COUNT,
+                       device=self._vla_device, dtype=attention_mask.dtype)
+        ], dim=1)
+        # Mask prompt positions with -100 so CE is only computed on action tokens
+        labels = torch.cat([
+            torch.full((B, prompt_len), -100,
+                       dtype=torch.long, device=self._vla_device),
+            action_token_ids,
+        ], dim=1)
+
+        # dummy_pv must match the ViT dtype (processed before the hook fires).
+        # vit_tokens_dev must match projector.fc1.weight dtype (injected as backbone
+        # output, fed directly into fc1).  A second hook casts projector output to
+        # LLM dtype because the model has mixed fp16/bf16 precision across layers.
+        _vit_dtype  = next(self._vla.vision_backbone.parameters()).dtype
+        _fc1_dtype  = self._vla.projector.fc1.weight.dtype
+        _llm_dtype  = next(self._vla.language_model.parameters()).dtype
         dummy_pv = torch.zeros(
-            B, 6, 224, 224, device=self._vla_device, dtype=torch.float16
+            B, 6, 224, 224, device=self._vla_device, dtype=_vit_dtype
         )
 
         # Move vit_tokens to VLA device, keeping gradient
-        vit_tokens_dev = vit_tokens.to(self._vla_device, dtype=torch.float16)
+        vit_tokens_dev = vit_tokens.to(self._vla_device, dtype=_fc1_dtype)
 
-        # Hook: replace backbone output with our tokens
+        # Hook 1: replace backbone output with our tokens
         def _inject(module, inp, output):
             return vit_tokens_dev
 
-        handle = self._vla.vision_backbone.register_forward_hook(_inject)
+        # Hook 2: cast projector output to LLM dtype
+        def _cast_proj_out(module, inp, output):
+            return output.to(dtype=_llm_dtype)
+
+        h1 = self._vla.vision_backbone.register_forward_hook(_inject)
+        h2 = self._vla.projector.register_forward_hook(_cast_proj_out)
         try:
             outputs = self._vla(
-                input_ids      = input_ids,
+                input_ids      = full_input_ids,
                 pixel_values   = dummy_pv,
-                attention_mask = attention_mask,
+                attention_mask = full_attn_mask,
+                labels         = labels,
             )
         finally:
-            handle.remove()
+            h1.remove()
+            h2.remove()
 
-        # Cross-entropy on action tokens
-        action_token_ids = torch.stack([
-            self._action_to_tokens(actions_gt[i].cpu().numpy(), self._processor)
-            for i in range(B)
-        ]).to(vit_tokens.device)
-
-        action_logits = outputs.logits[:, -self.ACTION_TOKEN_COUNT:, :]
-        action_logits = action_logits.to(vit_tokens.device, dtype=vit_tokens.dtype)
-        action_token_ids = action_token_ids.to(vit_tokens.device)
-
-        V = action_logits.size(-1)
-        return F.cross_entropy(
-            action_logits.reshape(-1, V),
-            action_token_ids.reshape(-1),
-        )
+        return outputs.loss
 
     # ------------------------------------------------------------------ #
     #  predict_action_from_tokens  (inference)                            #
@@ -310,10 +369,12 @@ class OpenVLAAgent(nn.Module):
         )
         input_ids      = inputs["input_ids"].to(self._vla_device)
         attention_mask = inputs["attention_mask"].to(self._vla_device)
+        _vit_dtype = next(self._vla.vision_backbone.parameters()).dtype
+        _llm_dtype = next(self._vla.language_model.parameters()).dtype
         dummy_pv       = torch.zeros(
-            B, 6, 224, 224, device=self._vla_device, dtype=torch.float16
+            B, 6, 224, 224, device=self._vla_device, dtype=_vit_dtype
         )
-        vit_tokens_dev = vit_tokens.to(self._vla_device, dtype=torch.float16)
+        vit_tokens_dev = vit_tokens.to(self._vla_device, dtype=_llm_dtype)
 
         current_slice = [None]
 
@@ -340,6 +401,221 @@ class OpenVLAAgent(nn.Module):
             handle.remove()
 
         return torch.stack(actions, dim=0)
+
+    # ------------------------------------------------------------------ #
+    #  encode_image_train  (LoRA ViT, with gradient)                      #
+    # ------------------------------------------------------------------ #
+
+    def encode_image_train(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Like encode_image() but WITHOUT torch.no_grad(), so gradients flow
+        back through the LoRA ViT adapters.  Only call on rank 0 during
+        Stage 1 training after add_lora() has been called.
+
+        Parameters
+        ----------
+        x : (B, C, H, W) float32 [0,1]
+
+        Returns
+        -------
+        tokens : (B, N, D_vit) float32, with grad_fn, on same device as x
+        """
+        self._load()
+        pv     = self._preprocess_pixels(x)
+        tokens = self._vla.vision_backbone(pv)
+        if isinstance(tokens, (tuple, list)):
+            tokens = tokens[0]
+        if tokens.dim() == 3 and tokens.size(1) == 257:
+            tokens = tokens[:, 1:, :]
+        return tokens.to(x.device, dtype=x.dtype)   # NOT detached
+
+    @torch.no_grad()
+    def encoder_drift(self, x: torch.Tensor) -> float:
+        """
+        Cosine similarity between original (LoRA disabled) and current LoRA
+        ViT features on the same images.  Returns 1.0 if LoRA not loaded.
+        Lower values = more drift from the pretrained ViT.
+        """
+        if not self._loaded or self._vla is None:
+            return 1.0
+        pv = self._preprocess_pixels(x)
+
+        z_lora = self._vla.vision_backbone(pv)
+        if isinstance(z_lora, (tuple, list)):
+            z_lora = z_lora[0]
+        if z_lora.dim() == 3 and z_lora.size(1) == 257:
+            z_lora = z_lora[:, 1:, :]
+
+        self._vla.vision_backbone.disable_adapter_layers()
+        z_orig = self._vla.vision_backbone(pv)
+        self._vla.vision_backbone.enable_adapter_layers()
+        if isinstance(z_orig, (tuple, list)):
+            z_orig = z_orig[0]
+        if z_orig.dim() == 3 and z_orig.size(1) == 257:
+            z_orig = z_orig[:, 1:, :]
+
+        return F.cosine_similarity(
+            z_lora.float().flatten(1), z_orig.float().flatten(1), dim=-1
+        ).mean().item()
+
+    # ------------------------------------------------------------------ #
+    #  LoRA helpers                                                        #
+    # ------------------------------------------------------------------ #
+
+    def add_lora(
+        self,
+        r:                   int        = 16,
+        r_vit:               int | None = None,
+        alpha:               int        = 32,
+        dropout:             float      = 0.05,
+        llm_target_modules:  list[str]  = None,
+        vit_target_modules:  list[str]  = None,
+    ):
+        """
+        Apply LoRA adapters to the LLM and ViT inside the VLA.
+
+        After this call only the LoRA parameters have requires_grad=True;
+        all base-model weights remain frozen.
+
+        Parameters
+        ----------
+        llm_target_modules : attention projection names in the LLM
+                             (default: ["q_proj", "v_proj"])
+        vit_target_modules : attention projection names in the ViT
+                             (default: ["q_proj", "v_proj"])
+        """
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError:
+            raise ImportError("Install peft:  pip install peft")
+
+        self._load()
+
+        if llm_target_modules is None:
+            llm_target_modules = ["q_proj", "v_proj"]
+        if vit_target_modules is None:
+            vit_target_modules = ["q_proj", "v_proj"]
+
+        def _apply_lora(submodule, target_modules, rank):
+            cfg = LoraConfig(
+                r              = rank,
+                lora_alpha     = alpha,
+                lora_dropout   = dropout,
+                target_modules = target_modules,
+                bias           = "none",
+            )
+            return get_peft_model(submodule, cfg)
+
+        # Apply to LLM
+        if hasattr(self._vla, "language_model"):
+            self._vla.language_model = _apply_lora(
+                self._vla.language_model, llm_target_modules, r
+            )
+        else:
+            print("[OpenVLAAgent] WARNING: 'language_model' attribute not found; "
+                  "LLM LoRA skipped.")
+
+        # Apply to ViT backbone (skipped if vit_target_modules is None/empty)
+        if vit_target_modules and hasattr(self._vla, "vision_backbone"):
+            self._vla.vision_backbone = _apply_lora(
+                self._vla.vision_backbone, vit_target_modules, r_vit if r_vit is not None else r
+            )
+        elif vit_target_modules:
+            print("[OpenVLAAgent] WARNING: 'vision_backbone' attribute not found; "
+                  "ViT LoRA skipped.")
+
+        # Ensure only LoRA params are trainable
+        for name, p in self._vla.named_parameters():
+            if "lora_" not in name:
+                p.requires_grad_(False)
+
+        n_train = sum(p.numel() for p in self._vla.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self._vla.parameters())
+        print(f"[OpenVLAAgent] LoRA applied.  Trainable: {n_train:,} / {n_total:,} params.")
+
+        # Dispatch to multiple GPUs now that all weights are real CPU tensors.
+        # (Deferred from _load() to avoid PEFT + device_map meta-device error.)
+        if self._vla_device == "auto" and torch.cuda.is_available():
+            n_gpus = torch.cuda.device_count()
+            if n_gpus > 1:
+                from accelerate import dispatch_model, infer_auto_device_map
+                from accelerate.hooks import remove_hook_from_submodules
+                # Remove any stale accelerate hooks before dispatching
+                remove_hook_from_submodules(self._vla)
+                max_memory = {i: "4000MiB" for i in range(n_gpus)}
+                device_map = infer_auto_device_map(
+                    self._vla,
+                    max_memory = max_memory,
+                    # Prevent splitting a single transformer block across devices
+                    no_split_module_classes = [
+                        "LlamaDecoderLayer",   # LLM blocks
+                        "Block",               # DINOv2 ViT blocks (timm)
+                        "SiglipEncoderLayer",  # SigLIP ViT blocks
+                    ],
+                )
+                dispatch_model(self._vla, device_map=device_map)
+                alloc = [torch.cuda.memory_allocated(i) / 1024**3 for i in range(n_gpus)]
+                print(f"[OpenVLAAgent] Dispatched across {n_gpus} GPUs: "
+                      + "  ".join(f"GPU{i}={alloc[i]:.1f}GiB" for i in range(n_gpus)))
+            else:
+                self._vla = self._vla.cuda()
+            self._vla_device = "cuda:0"
+
+    def set_trainable_lora(self, vit: bool = True, llm: bool = True):
+        """Set which LoRA adapters have requires_grad=True."""
+        if not self._loaded or self._vla is None:
+            return
+        for name, p in self._vla.named_parameters():
+            if "lora_" not in name:
+                continue
+            if "vision_backbone" in name:
+                p.requires_grad_(vit)
+            elif "language_model" in name:
+                p.requires_grad_(llm)
+        n_train = sum(p.numel() for p in self._vla.parameters() if p.requires_grad)
+        print(f"[OpenVLAAgent] set_trainable_lora(vit={vit}, llm={llm})  trainable={n_train:,}")
+
+    def lora_parameters(self) -> list:
+        """Return LoRA-only parameters (by name), excluding projector."""
+        if not self._loaded or self._vla is None:
+            return []
+        return [p for n, p in self._vla.named_parameters() if "lora_" in n and p.requires_grad]
+
+    def projector_parameters(self) -> list:
+        """Return all projector parameters (for Phase 2 unfreezing)."""
+        if not self._loaded or self._vla is None:
+            return []
+        return list(self._vla.projector.parameters())
+
+    def set_projector_trainable(self, trainable: bool):
+        for p in self._vla.projector.parameters():
+            p.requires_grad_(trainable)
+        n = sum(p.numel() for p in self._vla.projector.parameters())
+        print(f"[OpenVLAAgent] projector {'unfrozen' if trainable else 'frozen'}  ({n:,} params)")
+
+    def lora_state_dict(self) -> dict:
+        """Return a CPU state dict containing all LoRA weights."""
+        if not self._loaded or self._vla is None:
+            return {}
+        # Save by name pattern, NOT by requires_grad — requires_grad changes
+        # between train/val passes and would produce an empty dict after validation.
+        return {
+            k: v.detach().cpu()
+            for k, v in self._vla.named_parameters()
+            if "lora_" in k
+        }
+
+    def load_lora_state_dict(self, state_dict: dict):
+        """Load LoRA weights from a saved state dict."""
+        if not self._loaded:
+            self._load()
+        current = dict(self._vla.named_parameters())
+        loaded = 0
+        for k, v in state_dict.items():
+            if k in current:
+                current[k].data.copy_(v.to(current[k].device))
+                loaded += 1
+        print(f"[OpenVLAAgent] LoRA state loaded ({loaded} tensors).")
 
     def set_instruction(self, s: str):
         self.instruction = s
@@ -374,6 +650,8 @@ class OpenVLAStub(nn.Module):
         self.action_dim  = action_dim
         self.instruction = instruction
         self.unnorm_key  = unnorm_key
+        self._loaded     = True   # always "loaded" for the stub
+        self._vla        = None
 
         # Tiny surrogate: mean-pool tokens → action prediction
         self._task_head = nn.Sequential(
@@ -391,15 +669,22 @@ class OpenVLAStub(nn.Module):
         B = x.size(0)
         return torch.zeros(B, self.N_patches, self.D_vit, device=x.device, dtype=x.dtype)
 
+    def encode_image_train(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns zero tokens with requires_grad (stub for LoRA ViT path)."""
+        B = x.size(0)
+        return torch.zeros(
+            B, self.N_patches, self.D_vit, device=x.device, dtype=x.dtype,
+            requires_grad=True,
+        )
+
     def task_loss_from_tokens(
         self,
         vit_tokens:   torch.Tensor,
         instructions,
         actions_gt:   torch.Tensor,
     ) -> torch.Tensor:
-        """Differentiable MSE surrogate; grad flows through vit_tokens."""
-        pred = self._task_head(vit_tokens.mean(dim=1))   # (B, action_dim)
-        return F.mse_loss(pred, actions_gt.to(vit_tokens.device, dtype=vit_tokens.dtype))
+        """Differentiable surrogate; grad flows through vit_tokens."""
+        return vit_tokens.float().mean()
 
     @torch.inference_mode()
     def predict_action_from_tokens(
@@ -407,7 +692,23 @@ class OpenVLAStub(nn.Module):
         vit_tokens:   torch.Tensor,
         instructions,
     ) -> torch.Tensor:
-        return self._task_head(vit_tokens.mean(dim=1)).cpu()
+        return self._task_head(vit_tokens.float().mean(dim=1)).cpu()
+
+    # LoRA stubs (no-ops for testing)
+    def add_lora(self, **kwargs):
+        pass
+
+    def set_trainable_lora(self, vit: bool = True, llm: bool = True):
+        pass
+
+    def lora_parameters(self) -> list:
+        return []
+
+    def lora_state_dict(self) -> dict:
+        return {}
+
+    def load_lora_state_dict(self, state_dict: dict):
+        pass
 
     def set_instruction(self, s: str):
         self.instruction = s

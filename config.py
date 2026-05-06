@@ -69,14 +69,39 @@ CONFIG = {
     "lambda_rate": 0.01, # λ weighting L_rate = KL(q||p) in Stage 3
 
     # ── Loss weights ─────────────────────────────────────────────────── #
-    "lambda_tf":   0.5,   # weight for teacher-forcing loss L_tf
-    "lambda_roll": 0.5,   # weight for 3-step rollout loss L_roll
-    "gamma_delta": 20.0,  # target scaling: model predicts γ·(z_{t+1} - z_t)
+    # Stage 1: L = L_CE(z_t,a_t) + L_CE(z_{t+1},a_{t+1}) + lambda_pred*L_pred
+    "lambda_pred": 1.0,   # weight for world-model prediction loss
+    "ce_freq":     10,    # compute CE loss every N batches; 1 = every batch
+    "gamma_delta": 20.0,   # target scaling: model predicts γ·(z_{t+1} - z_t)
+    # Legacy (kept for Stage 2 / checkpoint compat)
+    "lambda_tf":   0.5,
+    "lambda_roll": 0.5,
+
+    # ── Stage 1 LoRA fine-tuning ──────────────────────────────────────── #
+    "lora_r":                  32,   # LLM LoRA rank (matches original fine-tune)
+    "lora_r_vit":               2,   # ViT LoRA rank (smaller = less latent shift)
+    "lora_alpha":              32,
+    "lora_dropout":          0.05,
+    "lora_llm_target_modules": ["q_proj", "v_proj"],
+    "lora_vit_target_modules": ["qkv", "proj"],   # DINOv2/SigLIP use attn.qkv / attn.proj
+    # LoRA ViT gradient training requires ~3-4 GB extra activation memory per batch.
+    # T4 (16 GB) has no headroom after loading the 7B model — set False.
+    # Set True on A100/H100 with enough VRAM.
+    "lora_train_vit": True,
+    "vit_update_freq":  400,  # update ViT LoRA every N steps; predictor updates every step
+    "vit_update_start": 100,  # don't update ViT LoRA until this step
+    "lora_lr":               2e-5,
+
+    # ── Phase 1 early stopping ───────────────────────────────────────── #
+    "early_stop_pred":     0.98,  # stop when rolling cos > this threshold
+    "early_stop_patience": 100,   # rolling window size (steps)
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 1e-4,
-    "batch_size":    8,      # per-GPU batch size
-    "epochs":       50,
+    "batch_size":    4,      # per-GPU batch size (reduced for ViT LoRA grad memory)
+    "phase1_epochs": 1,      # ViT LoRA + Predictor, L_pred only
+    "phase2_epochs": 2,      # LLM LoRA only, L_CE only
+    "epochs":       10,      # kept for compat; ignored when phase1/2_epochs are set
 
     # ── Multi-GPU (DDP) ──────────────────────────────────────────────── #
     "num_gpus":        4,
