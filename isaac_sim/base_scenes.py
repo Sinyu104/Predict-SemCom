@@ -48,10 +48,10 @@ TRAY_COLORS = {
 # Front = smaller X (closer to robot base), Back = larger X.
 # Left  = larger  Y, Right = smaller Y (from robot's forward-facing perspective).
 CORNER_POSITIONS = {
-    "front_left":  np.array([0.30,  0.35, 0.004]),
-    "front_right": np.array([0.30, -0.35, 0.004]),
-    "back_left":   np.array([0.70,  0.35, 0.004]),
-    "back_right":  np.array([0.70, -0.35, 0.004]),
+    "front_left":  np.array([0.70,  0.35, 0.004]),
+    "front_right": np.array([0.70, -0.35, 0.004]),
+    "back_left":   np.array([0.30,  0.35, 0.004]),
+    "back_right":  np.array([0.30, -0.35, 0.004]),
 }
 
 
@@ -139,7 +139,7 @@ class _FrankaBase(BaseScene):
         """Call after world.reset() to bring up controller + annotator."""
         print("[Isaac Sim] Warming up RTX Renderer and compiling shaders...")
         for _ in range(100):
-            self.world.app.update()
+            rep.orchestrator.step(rt_subframes=1, pause_timeline=True)
 
         self._rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
         self._render_product = rep.create.render_product(
@@ -352,6 +352,7 @@ class PickAndPlaceScene(_FrankaBase):
             assert corner in CORNER_POSITIONS, f"Unknown corner: {corner!r}"
 
         self.goal_type = goal_type
+        self.corner    = corner
         self.goal_pos  = (
             CORNER_POSITIONS[corner].copy()
             if goal_type == "corner"
@@ -392,7 +393,7 @@ class PickAndPlaceScene(_FrankaBase):
                     color=TRAY_COLORS["green"],
                 )
             )
-        else:  # corner — small flat yellow marker
+        else:  # corner — small yellow marker at corner + border extending inward
             self.world.scene.add(
                 FixedCuboid(
                     prim_path="/World/Goal", name="goal",
@@ -401,6 +402,31 @@ class PickAndPlaceScene(_FrankaBase):
                     color=np.array([1.0, 1.0, 0.0]),
                 )
             )
+            # Border spans the full workspace defined by the four corner positions.
+            _corners = np.array(list(CORNER_POSITIONS.values()))
+            _min_x, _max_x = _corners[:, 0].min(), _corners[:, 0].max()
+            _min_y, _max_y = _corners[:, 1].min(), _corners[:, 1].max()
+            _cx   = (_min_x + _max_x) / 2
+            _cy   = (_min_y + _max_y) / 2
+            _cz   = self.goal_pos[2]
+            _sx   = _max_x - _min_x   # width in X
+            _sy   = _max_y - _min_y   # width in Y
+            _w    = 0.015              # strip width (m)
+            _h    = 0.003              # strip height (m)
+            for _name, _pos, _sc in [
+                ("goal_zone_px", [_max_x - _w/2, _cy,          _cz], [_w,        _sy, _h]),
+                ("goal_zone_nx", [_min_x + _w/2, _cy,          _cz], [_w,        _sy, _h]),
+                ("goal_zone_py", [_cx,            _max_y - _w/2, _cz], [_sx - 2*_w, _w, _h]),
+                ("goal_zone_ny", [_cx,            _min_y + _w/2, _cz], [_sx - 2*_w, _w, _h]),
+            ]:
+                self.world.scene.add(
+                    FixedCuboid(
+                        prim_path=f"/World/{_name}", name=_name,
+                        position=np.array(_pos),
+                        scale=np.array(_sc),
+                        color=np.array([1.0, 1.0, 0.0]),
+                    )
+                )
 
         self._add_camera()
 
@@ -417,6 +443,8 @@ class PickAndPlaceScene(_FrankaBase):
                 cube.set_world_pose(
                     position=np.array([x, y, self.CUBE_GROUND_Z])
                 )
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
 
         for _ in range(10):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
@@ -520,6 +548,8 @@ class StackScene(_FrankaBase):
                 cube.set_world_pose(
                     position=np.array([x, y, self.CUBE_GROUND_Z])
                 )
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
 
         for _ in range(10):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
@@ -557,7 +587,7 @@ class SortScene(_FrankaBase):
     """
 
     RED_TRAY_POS  = np.array([0.50, -0.35, 0.004])
-    BLUE_TRAY_POS = np.array([0.25, -0.35, 0.004])
+    BLUE_TRAY_POS = np.array([0.35, -0.35, 0.004])
 
     def __init__(self):
         self._init_world()
@@ -616,6 +646,8 @@ class SortScene(_FrankaBase):
             positions = self._sample_non_overlapping(len(self.cubes))
             for cube, (x, y) in zip(self.cubes.values(), positions):
                 cube.set_world_pose(position=np.array([x, y, self.CUBE_GROUND_Z]))
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
 
         for _ in range(10):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)

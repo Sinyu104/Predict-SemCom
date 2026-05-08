@@ -279,6 +279,8 @@ def parse_collector_args(
     p.add_argument("--pose_delta_max",      type=float, default=0.15)
     p.add_argument("--scripted", action="store_true",
                    help="Use the scene's scripted_action() instead of the VLA server")
+    p.add_argument("--headless", action="store_true",
+                   help="Run without the Isaac Sim GUI window")
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
@@ -368,17 +370,18 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
                 print(f"  ep {ep+1:4d}  SUCCESS at step {step+1}")
                 break
 
+        if not success:
+            print(f"  ep {ep+1:4d}  FAILED — discarded")
         if success:
             n_success += 1
-
-        writer.write(obs_buf, act_buf, metadata={
-            "disturbed":       int(args.interference_action or args.interference_pose),
-            "n_action_events": injector.action_events,
-            "n_pose_events":   injector.pose_events,
-            "success":         int(success),
-            "steps":           len(obs_buf),
-            "instruction":     args.instruction,
-        })
+            writer.write(obs_buf, act_buf, metadata={
+                "disturbed":       int(args.interference_action or args.interference_pose),
+                "n_action_events": injector.action_events,
+                "n_pose_events":   injector.pose_events,
+                "success":         int(success),
+                "steps":           len(obs_buf),
+                "instruction":     args.instruction,
+            })
 
         elapsed = time.time() - t0
         eta     = elapsed / (ep + 1) * (args.num_episodes - ep - 1)
