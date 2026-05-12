@@ -57,6 +57,6 @@ if __name__ == "__main__":
     # Override default episode length — two sequential pick-and-place ops needed.
     if args.episode_length == 120:
         args.episode_length = 240
-    scene = SortTwoCubesScene()
+    scene = SortTwoCubesScene(camera_ids=args.camera)
     collect(scene, args)
     simulation_app.close()

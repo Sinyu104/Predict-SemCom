@@ -31,8 +31,8 @@ class PickLeftmostCubeScene(PickAndPlaceScene):
     and stores it as self._target_cube for the episode.
     """
 
-    def __init__(self):
-        super().__init__(goal_type="tray")
+    def __init__(self, **kwargs):
+        super().__init__(goal_type="tray", **kwargs)
         # _target_cube will be set in reset()
 
     def reset(self, randomise: bool = True):
@@ -59,6 +59,6 @@ if __name__ == "__main__":
         default_output      = "data/pick_leftmost_cube/demos.hdf5",
         default_instruction = "pick up the leftmost cube and place it on the tray",
     )
-    scene = PickLeftmostCubeScene()
+    scene = PickLeftmostCubeScene(camera_ids=args.camera)
     collect(scene, args)
     simulation_app.close()

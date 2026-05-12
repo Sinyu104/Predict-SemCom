@@ -20,8 +20,8 @@ import numpy as np
 
 
 class PickPurpleCubeToTrayScene(PickAndPlaceScene):
-    def __init__(self):
-        super().__init__(goal_type="tray")
+    def __init__(self, **kwargs):
+        super().__init__(goal_type="tray", **kwargs)
         self._target_cube = self.cubes["purple"]
 
     def scripted_action(self) -> np.ndarray:
@@ -33,6 +33,6 @@ if __name__ == "__main__":
         default_output      = "data/pick_purple_cube_to_tray/demos.hdf5",
         default_instruction = "pick up the purple cube and place it on the tray",
     )
-    scene = PickPurpleCubeToTrayScene()
+    scene = PickPurpleCubeToTrayScene(camera_ids=args.camera)
     collect(scene, args)
     simulation_app.close()

@@ -20,8 +20,8 @@ import numpy as np
 
 
 class PickRedCubeToBackLeftCornerScene(PickAndPlaceScene):
-    def __init__(self):
-        super().__init__(goal_type="corner", corner="back_left")
+    def __init__(self, **kwargs):
+        super().__init__(goal_type="corner", corner="back_left", **kwargs)
         self._target_cube = self.cubes["red"]
 
     def scripted_action(self) -> np.ndarray:
@@ -33,6 +33,6 @@ if __name__ == "__main__":
         default_output      = "data/pick_red_cube_to_back_left_corner/demos.hdf5",
         default_instruction = "pick up the red cube and place it in the back left corner",
     )
-    scene = PickRedCubeToBackLeftCornerScene()
+    scene = PickRedCubeToBackLeftCornerScene(camera_ids=args.camera)
     collect(scene, args)
     simulation_app.close()

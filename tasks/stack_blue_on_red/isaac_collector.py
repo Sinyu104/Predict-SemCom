@@ -24,8 +24,8 @@ import numpy as np
 
 
 class StackBlueOnRedScene(StackScene):
-    def __init__(self):
-        super().__init__(target_color="blue", base_color="red")
+    def __init__(self, **kwargs):
+        super().__init__(target_color="blue", base_color="red", **kwargs)
 
     def scripted_action(self) -> np.ndarray:
         return self._rmpflow_pick_place_action(
@@ -38,6 +38,6 @@ if __name__ == "__main__":
         default_output      = "data/stack_blue_on_red/demos.hdf5",
         default_instruction = "stack the blue cube on top of the red cube",
     )
-    scene = StackBlueOnRedScene()
+    scene = StackBlueOnRedScene(camera_ids=args.camera)
     collect(scene, args)
     simulation_app.close()
