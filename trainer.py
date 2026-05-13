@@ -1,20 +1,23 @@
 """
-trainer.py  —  Training pipeline for the Predictive Semantic Communication System.
+trainer.py  —  Training pipeline for the VAE-latent Wyner-Ziv SemCom System.
 
-Stage 1 — single-process, device_map="auto"
-    VLA (7B) is loaded with device_map="auto", spreading layers across all 4 GPUs
-    (~3.5 GB each).  Predictor lives on cuda:0.  No torchrun needed.
-    Launch: python main.py --train --stage 1 --stored_data <path>
+Stage 1 — Ctrl-World (SVD-based, first diffusion)
+    Goal:   Fine-tune Action_encoder2 of CtrlWorldWrapper to predict the next
+            VAE latent from history + action using DDPM x₀-prediction.
+    Loss:   L_world = E[|| ẑ_0(x_{t'}, t', c) − z_t ||²]
+    Launch: torchrun --nproc_per_node=4 main.py --train --stage 1 \\
+                --svd_path stabilityai/stable-video-diffusion-img2vid \\
+                --stored_data data/train.hdf5
 
-Stage 2 — multi-GPU DDP (torchrun)
-    Launch: torchrun --nproc_per_node=4 main.py --train --stage 2 ...
-
-Stage overview
---------------
-Stage 1  Predictor + LoRA VLA          Phase1: L = λ_pred·L_pred + λ_sig·SIGReg(Z)
-                                       Phase2: L = L_CE
-Stage 2  JsccEncoder + JsccDecoder +   L = L_distortion + λ·L_rate
-         SideInfoEncoder
+Stage 2 — JSCC + Refinement Diffusion (second diffusion)
+    Goal:   Train JsccEncoder, SideInfoEncoder, and RefinementDiffusion jointly,
+            with frozen Ctrl-World providing ẑ_t as Wyner-Ziv side information.
+    Loss:   L = L_distortion + β·L_rate
+            L_distortion = RefinementDiffusion DDPM x₀-prediction loss (MSE)
+            L_rate       = KL( q(s_t|z_t) || p(s_t|ẑ_t) )
+    Launch: torchrun --nproc_per_node=4 main.py --train --stage 2 \\
+                --svd_path stabilityai/stable-video-diffusion-img2vid \\
+                --stored_data data/train.hdf5
 """
 
 import os
@@ -31,44 +34,7 @@ from tqdm import tqdm
 import datetime
 
 from models import SemComSystem
-from dataset import GNMTrajectoryDataset, ClipDataset
-
-
-# ========================================================================== #
-#  SIGReg — Sketched Isotropic Gaussian Regularizer (LeWorldModel)           #
-# ========================================================================== #
-
-def sigreg(Z: torch.Tensor, M: int = 1024, a: float = 1.0) -> torch.Tensor:
-    """
-    Measures deviation of Z's distribution from an isotropic Gaussian via M
-    random 1-D projections, each tested with a differentiable Epps-Pulley
-    (MMD²) statistic against N(0,1).
-
-    Z : (N, D)  —  batch of embeddings for one timestep
-    M : number of random projections (paper default 1024)
-    a : Gaussian kernel bandwidth (a=1 works well)
-    """
-    N, D = Z.shape
-    a2 = a * a
-
-    # Normalise Z per-feature so projections live on the N(0,1) scale.
-    # Doing this on Z (not on H after projecting) keeps the MMD sensitive to
-    # variance collapse: if all embeddings become identical, H stays near-zero
-    # and the test statistic grows, providing a corrective gradient.
-    Z = Z - Z.mean(0, keepdim=True)
-    Z = Z / (Z.std(0, keepdim=True) + 1e-6)
-
-    u = F.normalize(torch.randn(D, M, device=Z.device, dtype=Z.dtype), dim=0)  # (D, M)
-    H = Z @ u                                                                    # (N, M) — no further normalisation
-
-    # MMD²(empirical, N(0,1)) with Gaussian kernel k(x,y)=exp(-(x-y)²/(2a²))
-    sq_dist = (H.unsqueeze(1) - H.unsqueeze(0)).pow(2)           # (N, N, M)
-    A = torch.exp(-sq_dist / (2 * a2)).mean(dim=(0, 1))           # (M,)  empirical vs empirical
-    B = (a / (1 + a2) ** 0.5) * torch.exp(                        # (M,)  empirical vs Gaussian
-            -H.pow(2) / (2 * (1 + a2))).mean(0)
-    C = a / (2 + a2) ** 0.5                                        # scalar Gaussian vs Gaussian
-
-    return (A - 2 * B + C).mean()
+from dataset import ClipDataset, GNMTrajectoryDataset
 
 
 # ========================================================================== #
@@ -102,6 +68,19 @@ def reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+# ========================================================================== #
+#  DataLoader builders                                                        #
+# ========================================================================== #
+
+def _has_latents(loader: DataLoader) -> bool:
+    """Return True if the underlying dataset has pre-computed VAE latents."""
+    from torch.utils.data import Subset
+    ds = loader.dataset
+    if isinstance(ds, Subset):
+        ds = ds.dataset
+    return getattr(ds, "has_latents", False)
+
+
 def build_ddp_loaders(
     config: dict, hdf5_path: str, rank: int, world_size: int,
     clip_length: int = 1,
@@ -125,13 +104,6 @@ def build_ddp_loaders(
             obs_channels = config["obs_channels"],
         )
 
-    if full_ds._action_dim is not None:
-        expected = config.get("action_dim", 7)
-        if full_ds._action_dim != expected:
-            raise ValueError(
-                f"action_dim mismatch: HDF5={full_ds._action_dim} config={expected}"
-            )
-
     n_total = len(full_ds)
     n_val   = max(1, int(0.2 * n_total))
     n_train = n_total - n_val
@@ -145,7 +117,6 @@ def build_ddp_loaders(
         val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
     )
     nw = config.get("num_workers", 0)
-
     train_loader = DataLoader(
         train_ds, batch_size=config["batch_size"], sampler=train_sampler,
         num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
@@ -155,15 +126,12 @@ def build_ddp_loaders(
         num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
     )
     if rank == 0:
-        print(
-            f"[dataset] total={n_total}  train={n_train}  val={n_val}  "
-            f"per-GPU train batches ≈ {len(train_loader)}"
-        )
+        print(f"[dataset] total={n_total}  train={n_train}  val={n_val}  "
+              f"per-GPU train batches ≈ {len(train_loader)}")
     return train_loader, val_loader
 
 
 def build_single_loaders(config: dict, hdf5_path: str, clip_length: int = 1):
-    """Non-distributed dataloaders for single-process Stage 1 training."""
     from torch.utils.data import random_split
 
     if clip_length > 1:
@@ -183,13 +151,6 @@ def build_single_loaders(config: dict, hdf5_path: str, clip_length: int = 1):
             obs_channels = config["obs_channels"],
         )
 
-    if full_ds._action_dim is not None:
-        expected = config.get("action_dim", 7)
-        if full_ds._action_dim != expected:
-            raise ValueError(
-                f"action_dim mismatch: HDF5={full_ds._action_dim} config={expected}"
-            )
-
     n_total = len(full_ds)
     n_val   = max(1, int(0.2 * n_total))
     n_train = n_total - n_val
@@ -205,10 +166,8 @@ def build_single_loaders(config: dict, hdf5_path: str, clip_length: int = 1):
         val_ds, batch_size=config["batch_size"], shuffle=False,
         num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
     )
-    print(
-        f"[dataset] total={n_total}  train={n_train}  val={n_val}  "
-        f"train batches={len(train_loader)}"
-    )
+    print(f"[dataset] total={n_total}  train={n_train}  val={n_val}  "
+          f"train batches={len(train_loader)}")
     return train_loader, val_loader
 
 
@@ -222,13 +181,13 @@ class BaseTrainer:
         config:     dict,
         data_path:  str,
         device:     torch.device,
-        agent,
+        vae,
         rank:       int,
         world_size: int,
     ):
         self.config     = config
         self.device     = device
-        self.agent      = agent
+        self.vae        = vae
         self.rank       = rank
         self.world_size = world_size
         self.is_main    = (rank == 0)
@@ -244,15 +203,18 @@ class BaseTrainer:
         )
         self.writer = None
         if self.is_main:
-            self.writer = SummaryWriter(log_dir=os.path.join(self.out_dir, "tb_logs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
-
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.writer = SummaryWriter(
+                log_dir=os.path.join(self.out_dir, "tb_logs", ts)
+            )
         self.mse = nn.MSELoss()
 
     def _build_loaders(self, config, data_path, rank, world_size):
         return build_ddp_loaders(config, data_path, rank, world_size)
 
     def _wrap_ddp(self, module: nn.Module) -> nn.Module:
-        if self.world_size > 1:
+        params = list(module.parameters())
+        if self.world_size > 1 and params:
             return DDP(
                 module,
                 device_ids             = [self.device.index],
@@ -264,83 +226,60 @@ class BaseTrainer:
     def _unwrap(self, module) -> nn.Module:
         return module.module if isinstance(module, DDP) else module
 
-    def _encode_all_ranks(self, obs: torch.Tensor) -> torch.Tensor:
+    @torch.no_grad()
+    def _encode_vae(self, frames: torch.Tensor) -> torch.Tensor:
         """
-        Encode images to ViT tokens across DDP ranks, then layer-normalise.
-
-        Only rank 0 has the real VLA.  All ranks gather their obs to rank 0,
-        rank 0 encodes the full batch, then tokens are broadcast back.
-        Returns detached, layer-normalised tokens on self.device.
-
-        LayerNorm is applied per patch token across D_vit dimensions so that
-        raw DINOv2 and SigLIP features (which have very different scales and
-        spiky distributions) are brought to zero mean / unit variance before
-        the predictor or JSCC modules see them.
+        frames : (B, C, H, W) or (B, T, C, H, W)
+        Returns VAE latents of same leading shape with (C_vae, H_vae, W_vae) appended.
+        Always detached — VAE is frozen throughout training.
         """
-        if not dist.is_initialized() or self.world_size == 1:
-            tokens = self.agent.encode_image(obs).to(self.device)
+        if self.vae is None:
+            C_vae = self.config.get("C_vae", 4)
+            H_vae = self.config.get("H_vae", 28)
+            W_vae = self.config.get("W_vae", 28)
+            shape  = frames.shape[:-3] + (C_vae, H_vae, W_vae)
+            return torch.zeros(*shape, device=self.device, dtype=torch.float32)
+
+        if frames.dim() == 5:
+            B, T, C, H, W = frames.shape
+            flat    = frames.reshape(B * T, C, H, W).to(self.device)
+            latents = self.vae.encode(flat)
+            return latents.reshape(B, T, *latents.shape[1:]).detach()
         else:
-            B = obs.size(0)
-            all_obs_buf = [torch.empty_like(obs) for _ in range(self.world_size)]
-            dist.all_gather(all_obs_buf, obs.contiguous())
-
-            N = self.config["N_patches"]
-            D = self.config["D_vit"]
-            all_tokens = torch.zeros(
-                self.world_size * B, N, D, device=self.device, dtype=obs.dtype
-            )
-            if self.rank == 0:
-                all_obs    = torch.cat(all_obs_buf, dim=0).to(self.device)
-                all_tokens = self.agent.encode_image(all_obs).to(self.device)
-
-            dist.broadcast(all_tokens, src=0)
-            tokens = all_tokens[self.rank * B : (self.rank + 1) * B]
-
-        # Normalise each patch token across D_vit so the predictor sees a
-        # consistent scale regardless of DINOv2 / SigLIP magnitude differences.
-        tokens = F.layer_norm(tokens, [tokens.shape[-1]])
-        return tokens.detach()
+            return self.vae.encode(frames.to(self.device)).detach()
 
     def save_checkpoint(self, filename: str, extra: dict | None = None):
         if not self.is_main:
             return
-        path = os.path.join(self.out_dir, filename)
-        # Strip DDP '.module.' so checkpoints load cleanly without DDP
+        path      = os.path.join(self.out_dir, filename)
         raw_state = self._unwrap(self.system).state_dict()
-        clean_state = {k.replace(".module.", "."): v for k, v in raw_state.items()}
-        payload = {"system_state": clean_state}
+        clean     = {k.replace(".module.", "."): v for k, v in raw_state.items()}
+        payload   = {"system_state": clean}
         if extra:
             payload.update(extra)
         torch.save(payload, path)
         print(f"  [ckpt] Saved → {path}")
 
     def load_checkpoint(self, path: str) -> dict:
-        ckpt  = torch.load(path, map_location="cpu")
-        model = self._unwrap(self.system)
+        ckpt       = torch.load(path, map_location="cpu")
+        model      = self._unwrap(self.system)
         model_keys = set(model.state_dict().keys())
-        state = ckpt["system_state"]
-
-        # save_checkpoint strips ".module." from DDP-wrapped submodule keys.
-        # If a submodule has since been DDP-wrapped, its keys now contain
-        # ".module." and won't match the saved keys directly.  Remap by
-        # inserting ".module." after the first path component when needed.
-        remapped = {}
+        state      = ckpt.get("system_state", {})
+        remapped   = {}
         for k, v in state.items():
             if k in model_keys:
                 remapped[k] = v
             else:
-                parts = k.split('.', 1)
+                parts = k.split(".", 1)
                 if len(parts) == 2:
-                    candidate = f"{parts[0]}.module.{parts[1]}"
-                    remapped[candidate if candidate in model_keys else k] = v
+                    cand = f"{parts[0]}.module.{parts[1]}"
+                    remapped[cand if cand in model_keys else k] = v
                 else:
                     remapped[k] = v
-
         missing, unexpected = model.load_state_dict(remapped, strict=False)
         if self.is_main:
             if missing:
-                print(f"  [ckpt] WARNING: {len(missing)} missing keys — "
-                      f"e.g. {missing[:3]}")
+                print(f"  [ckpt] WARNING: {len(missing)} missing keys — e.g. {missing[:3]}")
             print(f"  [ckpt] Loaded ← {path}")
         return ckpt
 
@@ -353,8 +292,7 @@ class BaseTrainer:
         if "scheduler_state" in ckpt and hasattr(self, "scheduler"):
             self.scheduler.load_state_dict(ckpt["scheduler_state"])
         if self.is_main:
-            print(f"  [ckpt] Checkpoint at epoch {start_epoch - 1}  "
-                  f"→ resuming at epoch {start_epoch}  best={best:.6f}")
+            print(f"  [ckpt] Resuming at epoch {start_epoch}  best={best:.6f}")
         del ckpt
         torch.cuda.empty_cache()
         return start_epoch, best
@@ -366,20 +304,17 @@ class BaseTrainer:
 
 
 # ========================================================================== #
-#  Stage 2  —  Predictor (action-conditioned V-JEPA 2)                       #
+#  Stage 1  —  Ctrl-World (SVD-based first diffusion)                        #
 # ========================================================================== #
 
 class Stage1Trainer(BaseTrainer):
     """
-    Two-phase training (single-process, device_map="auto" across all GPUs).
+    Fine-tune Ctrl-World's Action_encoder2 to predict the next VAE latent
+    from history + action using DDPM x₀-prediction loss.
 
-    Phase 1 — reshape latent space to be temporally predictable:
-      Trainable : ViT LoRA + Predictor
-      Loss      : L_pred (weighted MSE on γ-scaled token deltas)
-
-    Phase 2 — adapt action head to the new latent space:
-      Trainable : LLM LoRA only  (ViT + Predictor frozen)
-      Loss      : L_CE (cross-entropy on action tokens)
+    ctrl_world must be either CtrlWorldWrapper (full SVD model) or StubCtrlWorld
+    (lightweight stand-in for testing).  The SemComSystem created by BaseTrainer
+    is not used in Stage 1.
     """
 
     def __init__(
@@ -387,378 +322,277 @@ class Stage1Trainer(BaseTrainer):
         config:      dict,
         data_path:   str,
         device:      torch.device,
-        agent,
+        vae,
         rank:        int,
         world_size:  int,
+        ctrl_world,                  # CtrlWorldWrapper or StubCtrlWorld (required)
         resume_ckpt: str | None = None,
     ):
-        self.clip_length = config.get("clip_length", 16)
-        super().__init__(config, data_path, device, agent, rank=0, world_size=1)
+        self.clip_length = config.get("num_history", 6) + config.get("num_pred", 1)
+        self.ctrl_world  = ctrl_world
+        super().__init__(config, data_path, device, vae, rank, world_size)
 
-        # Apply LoRA to both ViT and LLM upfront (one GPU dispatch).
-        self.agent.add_lora(
-            r                  = config.get("lora_r",     32),
-            r_vit              = config.get("lora_r_vit", None),
-            alpha              = config.get("lora_alpha", 32),
-            dropout            = config.get("lora_dropout", 0.05),
-            llm_target_modules = config.get("lora_llm_target_modules", ["q_proj", "v_proj"]),
-            vit_target_modules = config.get("lora_vit_target_modules", ["qkv", "proj"]),
-        )
+        self.ctrl_world = self.ctrl_world.to(device)
+        # Wrap only the trainable action_encoder with DDP — not the entire 1.5B frozen UNet.
+        # DDP gradient hooks attach to the module's parameters directly, so calling
+        # ctrl_world.forward_ddpm() will still trigger all-reduce on action_encoder grads.
+        if self.world_size > 1 and hasattr(self.ctrl_world, "action_encoder"):
+            self.ctrl_world.action_encoder = DDP(
+                self.ctrl_world.action_encoder,
+                device_ids             = [self.device.index],
+                output_device          = self.device.index,
+                find_unused_parameters = False,
+            )
+        trainable_params = list(self.ctrl_world.trainable_parameters())
 
-        # Start in Phase 1: ViT LoRA + Predictor trainable, LLM LoRA frozen.
-        self.agent.set_trainable_lora(vit=True, llm=False)
-        self._build_phase1_optimizer()
+        if self.is_main:
+            n = sum(p.numel() for p in trainable_params)
+            print(f"[Stage1] Ctrl-World: {n/1e6:.2f}M trainable params (Action_encoder2)")
 
+        if trainable_params:
+            self.optimizer = optim.AdamW(
+                trainable_params,
+                lr           = config["learning_rate"],
+                weight_decay = 0.05,
+            )
+            epochs = config.get("epochs", 30)
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=epochs, eta_min=1e-5
+            )
+        else:
+            # StubCtrlWorld has no params — create a no-op optimizer
+            self.optimizer = None
+            self.scheduler = None
+
+        self.scaler      = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
         self.start_epoch = 1
-        self.best_p1     = math.inf
-        self.best_p2     = math.inf
+        self.best        = math.inf
         if resume_ckpt:
-            self.start_epoch, self.best_p1 = self._load_resume(resume_ckpt)
-
-    def _build_phase1_optimizer(self):
-        pred_params = list(self.system.predictor.parameters())
-        vit_lora    = self.agent.lora_parameters()   # only ViT LoRA active now
-        param_groups = [{"params": pred_params,
-                         "lr": self.config["learning_rate"], "weight_decay": 0.05}]
-        if vit_lora:
-            param_groups.append({
-                "params":       vit_lora,
-                "lr":           self.config.get("lora_lr", self.config["learning_rate"]),
-                "weight_decay": 0.0,
-            })
-        p1_epochs       = self.config.get("phase1_epochs", 5)
-        self.optimizer  = optim.AdamW(param_groups)
-        self.scheduler  = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=p1_epochs, eta_min=1e-5
-        )
-
-    def _build_phase2_optimizer(self):
-        self.agent.set_projector_trainable(True)
-        lora_lr   = self.config.get("lora_lr", self.config["learning_rate"])
-        p2_epochs = self.config.get("phase2_epochs", 5)
-        self.optimizer = optim.AdamW([
-            {"params": self.agent.lora_parameters(),      "lr": lora_lr,        "weight_decay": 0.0},
-            {"params": self.agent.projector_parameters(), "lr": lora_lr * 0.1,  "weight_decay": 1e-4},
-        ])
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=p2_epochs, eta_min=1e-5
-        )
+            self.start_epoch, self.best = self._load_resume(resume_ckpt)
 
     def _build_loaders(self, config, data_path, rank, world_size):
-        return build_single_loaders(config, data_path, self.clip_length)
+        return build_ddp_loaders(config, data_path, rank, world_size,
+                                 clip_length=self.clip_length)
 
-    def _encode_clip(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        frames : (B, T, C, H, W)
-        Returns tokens : (B, T, N, D_vit) — detached, layer-normalised.
-        """
-        B, T, C, H, W = frames.shape
-        flat   = frames.reshape(B * T, C, H, W)
-        tokens = self.agent.encode_image(flat).to(self.device)   # (B*T, N, D_vit)
-        tokens = F.layer_norm(tokens, [tokens.shape[-1]])
-        return tokens.reshape(B, T, tokens.size(1), tokens.size(2)).detach()
-
-    def _encode_clip_rank0_grad(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Encode rank 0's local frames WITH gradients so LoRA ViT can be trained.
-        Only call on rank 0 during training.
-
-        frames : (B, T, C, H, W)
-        Returns tokens : (B, T, N, D_vit) with grad_fn pointing to LoRA ViT.
-        """
-        B, T, C, H, W = frames.shape
-        flat   = frames.reshape(B * T, C, H, W)
-        tokens = self.agent.encode_image_train(flat)         # (B*T, N, D_vit) with grad
-        tokens = F.layer_norm(tokens, [tokens.shape[-1]])
-        return tokens.reshape(B, T, tokens.size(1), tokens.size(2))
-
-    def _run_epoch(self, loader, train: bool, epoch: int, mode: str = "pred") -> dict:
-        """
-        mode='pred' : Phase 1 — encode with ViT grad, loss = L_pred only.
-        mode='ce'   : Phase 2 — encode frozen ViT, loss = L_CE only.
-        """
-        pred = self.system.predictor
-        pred.train(train and mode == "pred")
-
-        if getattr(self.agent, "_loaded", False) and self.agent._vla is not None:
-            self.agent._vla.train(train)
-            # Refreeze base weights; also enforce phase-specific LoRA trainability.
-            for name, p in self.agent._vla.named_parameters():
-                if "lora_" not in name:
-                    p.requires_grad_(False)
-                elif "vision_backbone" in name:
-                    p.requires_grad_(train and mode == "pred")
-                elif "language_model" in name:
-                    p.requires_grad_(train and mode == "ce")
-
-        totals = {"pred": 0.0, "ce": 0.0, "sig": 0.0, "cosine": 0.0, "total": 0.0}
-        n, step = 0, 0
-        phase_tag = ("train" if train else "val") + f"/{mode}"
-        pbar = tqdm(loader, desc=f"  {phase_tag} ep {epoch}",
-                    leave=False, dynamic_ncols=True)
-
-        gamma = self.config.get("gamma_delta", 10.0)
-        # Early stopping for phase 1 training: stop once pred is consistently low
-        es_threshold = self.config.get("early_stop_pred", 0.01)
-        es_patience  = self.config.get("early_stop_patience", 200)
-        pred_history: list[float] = []
-
-        # Encoder drift tracking: fixed reference batch stored on first step
-        drift_freq   = self.config.get("drift_log_freq", 100)
-        ref_frames   = None
-        drift        = 1.0
-
-        for frames, actions, poses in pbar:
-            frames  = frames.to(self.device)
-            actions = actions.to(self.device)
-            B, T = frames.shape[0], frames.shape[1]
-
-            # ── Phase 1: ViT grad + L_pred ─────────────────────────── #
-            if mode == "pred":
-                # Store reference batch and compute encoder drift periodically
-                if train:
-                    if ref_frames is None:
-                        ref_frames = frames[:1, 0].detach().cpu()  # (1, C, H, W)
-                    if step % drift_freq == 0 and hasattr(self.agent, "encoder_drift"):
-                        drift = self.agent.encoder_drift(
-                            ref_frames.to(self.device)
-                        )
-
-                if train:
-                    tokens_grad = self._encode_clip_rank0_grad(frames)
-                    tokens      = tokens_grad.detach()
-                else:
-                    tokens      = self._encode_clip(frames)
-                    tokens_grad = tokens
-
-                # Predictor runs on detached context: its Jacobian is noisy early
-                # in training and would corrupt the ViT if allowed through.
-                # The ViT instead receives gradient through the *targets*:
-                #   dL/d(delta_z) pushes delta_z toward what the predictor predicts,
-                #   naturally keeping consecutive frames close (temporal smoothness).
-                preds_tf = pred.forward_clip(tokens, actions)          # context detached
-                targets  = gamma * (tokens_grad[:, 1:] - tokens_grad[:, :-1])  # NOT detached
-                w_tf     = targets.pow(2).sum(dim=-1, keepdim=True).detach()
-                w_tf     = w_tf / (w_tf.mean() + 1e-8)
-                L_pred   = (w_tf * (preds_tf - targets).pow(2)).mean()
-                L_ce     = torch.tensor(0.0, device=self.device)
-
-                # SIGReg: pool patch tokens → (B, T, D), apply per timestep
-                emb  = tokens_grad.mean(2)          # (B, T, D)
-                T_   = emb.shape[1]
-                L_sig = sum(
-                    sigreg(emb[:, t, :],
-                           M=self.config.get("sigreg_M", 1024),
-                           a=self.config.get("sigreg_a", 1.0))
-                    for t in range(T_)
-                ) / T_
-
-                loss = (self.config.get("lambda_pred", 1.0) * L_pred
-                        + self.config.get("lambda_sig",  0.1) * L_sig)
-
-            # ── Phase 2: frozen ViT + L_CE ─────────────────────────── #
-            else:
-                tokens = self._encode_clip(frames)
-                N, D   = tokens.shape[2], tokens.shape[3]
-
-                with torch.no_grad():
-                    preds_tf = pred.forward_clip(tokens, actions)
-                    targets  = gamma * (tokens[:, 1:] - tokens[:, :-1])
-                    w_tf     = targets.pow(2).sum(dim=-1, keepdim=True)
-                    w_tf     = w_tf / (w_tf.mean() + 1e-8)
-                    L_pred   = (w_tf * (preds_tf - targets).pow(2)).mean()
-
-                tok_flat  = tokens[:, :-1].reshape(B * (T - 1), N, D)
-                stride    = self.config.get("clip_stride", 1)
-                act_flat  = actions.reshape(B * (T - 1), actions.shape[2]) / stride
-                L_ce      = self.agent.task_loss_from_tokens(
-                    tok_flat, self.agent.instruction, act_flat
-                )
-                loss  = L_ce
-                L_sig = torch.tensor(0.0, device=self.device)
-
-            if train:
-                self.optimizer.zero_grad()
-                loss.backward()
-                if mode == "pred":
-                    nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
-                    # ViT LoRA updates less frequently so predictor learns first
-                    vit_freq = self.config.get("vit_update_freq", 1)
-                    vit_lora_params = [
-                        p for p in self.agent.lora_parameters()
-                        if p.requires_grad
-                    ] if hasattr(self.agent, "_vla") and self.agent._vla is not None else []
-                    vit_start = self.config.get("vit_update_start", 0)
-                    if step < vit_start or (vit_freq > 1 and step % vit_freq != 0):
-                        for p in vit_lora_params:
-                            if p.grad is not None:
-                                p.grad.zero_()
-                    elif vit_lora_params:
-                        nn.utils.clip_grad_norm_(vit_lora_params, 1.0)
-                self.optimizer.step()
-
-            with torch.no_grad():
-                preds_abs = tokens[:, :-1] + preds_tf.detach() / gamma
-                cos_sim   = F.cosine_similarity(
-                    preds_abs.float(), tokens[:, 1:].float(), dim=-1
-                ).mean().item()
-
-            totals["pred"]   += L_pred.item()
-            totals["ce"]     += L_ce.item()
-            totals["sig"]    += L_sig.item()
-            totals["cosine"] += cos_sim
-            totals["total"]  += loss.item()
-            n    += 1
-            step += 1
-            postfix = dict(
-                pred=f"{L_pred.item():.4f}",
-                sig=f"{L_sig.item():.4f}",
-                ce=f"{L_ce.item():.4f}",
-                cos=f"{cos_sim:.3f}",
-            )
-            if mode == "pred" and train:
-                postfix["drift"] = f"{drift:.4f}"
-            pbar.set_postfix(postfix)
-
-            # Per-step TensorBoard logging
-            if train and self.is_main and step % self.config.get("log_interval", 10) == 0:
-                tag = "Stage1/P1" if mode == "pred" else "Stage1/P2"
-                metrics = {"loss": loss.item(), "pred": L_pred.item(),
-                           "ce": L_ce.item(), "sig": L_sig.item(), "cosine": cos_sim}
-                if mode == "pred":
-                    metrics["drift"] = drift
-                self._log(tag, metrics, step)
-
-            # Early stop: phase 1 train only — break once cos is stably high
-            if train and mode == "pred":
-                pred_history.append(cos_sim)
-                if len(pred_history) > es_patience:
-                    pred_history.pop(0)
-                if (len(pred_history) == es_patience
-                        and sum(pred_history) / es_patience > es_threshold):
-                    if self.is_main:
-                        print(
-                            f"\n[Stage1/P1] Early stop at step {step}: "
-                            f"rolling cos={sum(pred_history)/es_patience:.4f} "
-                            f"> threshold {es_threshold}"
-                        )
-                    break
-
-        return {k: v / max(n, 1) for k, v in totals.items()}
+    # ------------------------------------------------------------------ #
+    #  Checkpoint — saves Action_encoder2 only (UNet stays frozen)        #
+    # ------------------------------------------------------------------ #
 
     def save_checkpoint(self, filename: str, extra: dict | None = None):
-        super().save_checkpoint(filename, extra)
-        if getattr(self.agent, "_loaded", False) and self.agent._vla is not None:
-            lora_path = os.path.join(
-                self.out_dir, filename.replace(".pt", "_lora.pt")
-            )
-            torch.save(self.agent.lora_state_dict(), lora_path)
-            print(f"  [ckpt] LoRA saved → {lora_path}")
+        if not self.is_main:
+            return
+        path    = os.path.join(self.out_dir, filename)
+        ae_state = {}
+        if hasattr(self.ctrl_world, "action_encoder"):
+            ae = self.ctrl_world.action_encoder
+            ae_state = (ae.module if isinstance(ae, DDP) else ae).state_dict()
+        payload = {"action_encoder_state": ae_state}
+        if getattr(self.ctrl_world, "finetune_cross_attn", False):
+            payload["unet_cross_attn_state"] = self.ctrl_world.unet_cross_attn_state_dict()
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
+        print(f"  [ckpt] Saved → {path}")
 
     def _load_resume(self, path: str) -> tuple[int, float]:
-        start_epoch, best = super()._load_resume(path)
+        ckpt = torch.load(path, map_location="cpu")
+        if "action_encoder_state" in ckpt and hasattr(self.ctrl_world, "action_encoder"):
+            ae = self.ctrl_world.action_encoder
+            (ae.module if isinstance(ae, DDP) else ae).load_state_dict(
+                ckpt["action_encoder_state"], strict=False
+            )
+            if self.is_main:
+                print(f"  [ckpt] Loaded Action_encoder ← {path}")
+        if "unet_cross_attn_state" in ckpt and hasattr(self.ctrl_world, "load_unet_cross_attn_state_dict"):
+            self.ctrl_world.load_unet_cross_attn_state_dict(ckpt["unet_cross_attn_state"])
+            if self.is_main:
+                print(f"  [ckpt] Loaded UNet cross-attn ← {path}")
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best        = ckpt.get("best",  math.inf)
+        if "optimizer_state" in ckpt and self.optimizer is not None:
+            self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scheduler_state" in ckpt and self.scheduler is not None:
+            self.scheduler.load_state_dict(ckpt["scheduler_state"])
         if self.is_main:
-            lora_path = path.replace(".pt", "_lora.pt")
-            if os.path.exists(lora_path):
-                self.agent.load_lora_state_dict(
-                    torch.load(lora_path, map_location="cpu")
-                )
+            print(f"  [ckpt] Resuming from epoch {start_epoch}  best={best:.6f}")
+        del ckpt
+        torch.cuda.empty_cache()
         return start_epoch, best
 
-    def validate(self):
-        if self.is_main:
-            print(f"\n[Stage1] Running validation only  T={self.clip_length} frames")
-        vl = self._run_epoch(self.val_loader, train=False, epoch=0, mode="pred")
-        if self.is_main:
-            print(
-                f"[Stage1] val_pred={vl['pred']:.4f}  "
-                f"val_sig={vl['sig']:.4f}  "
-                f"val_ce={vl['ce']:.4f}  "
-                f"val_cos={vl['cosine']:.3f}"
-            )
+    # ------------------------------------------------------------------ #
+    #  Visualisation — decode predicted vs GT next frame with SD-VAE      #
+    # ------------------------------------------------------------------ #
 
-    def train(self, skip_phase1: bool = False):
-        p1 = self.config.get("phase1_epochs", 5)
-        p2 = self.config.get("phase2_epochs", 5)
-        r  = self.config.get("lora_r", 16)
-        print(f"\n[Stage1] T={self.clip_length} frames  "
-              f"Phase1={p1}ep (ViT+Pred, L_pred)  "
-              f"Phase2={p2}ep (LLM, L_CE)  LoRA r={r}")
+    @torch.no_grad()
+    def _visualize_predictions(self, epoch: int, n_samples: int = 4):
+        if not self.is_main:
+            return
+        if not hasattr(self.ctrl_world, "predict_next_latent"):
+            return   # StubCtrlWorld doesn't implement full inference
 
-        # ── Phase 1 ──────────────────────────────────────────────────── #
-        if skip_phase1:
-            p1_ckpt = os.path.join(self.out_dir, "stage1p1_final.pt")
-            if not os.path.exists(p1_ckpt):
-                raise FileNotFoundError(
-                    f"--skip_phase1 requires '{p1_ckpt}'. Run Phase 1 first."
-                )
-            self._load_resume(p1_ckpt)
-            print(f"\n[Stage1/P1] Skipped — loaded checkpoint from {p1_ckpt}")
-        else:
-            print(f"\n[Stage1/P1] Reshaping latent space  ({p1} epochs)")
-            best_p1 = self.best_p1
-            for ep in range(1, p1 + 1):
-                tr = self._run_epoch(self.train_loader, True,  ep, mode="pred")
-                self.scheduler.step()
-                if self.is_main:
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    self._log("Stage1/P1", {"train_" + k: v for k, v in tr.items()}, ep)
-                    print(
-                        f"[Stage1/P1] ep {ep:2d}/{p1}  "
-                        f"train_pred={tr['pred']:.4f}  train_sig={tr['sig']:.4f}  "
-                        f"train_cos={tr['cosine']:.3f}  lr={lr:.2e}"
+        import torchvision
+        from PIL import Image as PILImage
+
+        model = self.ctrl_world
+        model.eval()
+
+        frames_b, actions_b, latents_b = [], [], []
+        collected = 0
+        for frames, actions, _poses, latents in self.val_loader:
+            frames_b.append(frames);  actions_b.append(actions);  latents_b.append(latents)
+            collected += frames.shape[0]
+            if collected >= n_samples:
+                break
+        frames  = torch.cat(frames_b,  0)[:n_samples]
+        actions = torch.cat(actions_b, 0)[:n_samples]
+        latents = torch.cat(latents_b, 0)[:n_samples]
+
+        T_h = model.num_history
+        z_history = latents[:, :T_h].to(self.device)
+        T_p   = self.config.get("num_pred", 1)
+        z_gt  = latents[:, T_h + T_p - 1].cpu().float()   # ground truth for last predicted frame
+
+        a_pad  = torch.zeros(n_samples, 1, actions.shape[-1], device=self.device)
+        a_full = torch.cat([actions.to(self.device), a_pad], dim=1)
+
+        n_steps = self.config.get("ctrl_world_n_steps", 10)
+        z_pred  = model.predict_next_latent(z_history, a_full, n_steps=n_steps)
+        z_pred = z_pred[:, -1].cpu().float()
+        z_last = latents[:, T_h - 1].cpu().float()
+
+        from vae_wrapper import VAEWrapper
+        vae_name = self.config.get("vae_model_name", "stabilityai/sd-vae-ft-mse")
+        vae_cpu  = VAEWrapper(vae_name)
+
+        imgs_hist = vae_cpu.decode(z_last)
+        imgs_gt   = vae_cpu.decode(z_gt)
+        imgs_pred = vae_cpu.decode(z_pred)
+        del vae_cpu
+
+        tiles = []
+        for i in range(n_samples):
+            tiles += [imgs_hist[i], imgs_gt[i], imgs_pred[i]]
+
+        grid = torchvision.utils.make_grid(
+            torch.stack(tiles), nrow=3, padding=4, pad_value=0.5
+        )
+        viz_dir  = os.path.join(self.out_dir, "viz")
+        os.makedirs(viz_dir, exist_ok=True)
+        out_path = os.path.join(viz_dir, f"ep{epoch:03d}.png")
+        arr = (grid.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype("uint8")
+        PILImage.fromarray(arr).save(out_path)
+        print(f"  [viz] ep{epoch:03d} → {out_path}  (cols: last_hist | gt_next | pred_next)")
+
+    def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
+        self.ctrl_world.train(train)
+        if train and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
+
+        use_precomp_lats = _has_latents(loader)
+        if self.is_main and epoch == (self.start_epoch if train else 0):
+            src = "pre-computed HDF5 latents" if use_precomp_lats else "online VAE encode"
+            print(f"  [Stage1] latent source: {src}")
+
+        totals = {"pred": 0.0}
+        n      = 0
+        phase  = "train" if train else "val"
+        pbar   = tqdm(loader, desc=f"  {phase} ep {epoch}",
+                      disable=not self.is_main, leave=False, dynamic_ncols=True)
+
+        with torch.set_grad_enabled(train):
+            for frames, actions, _poses, latents_precomp in pbar:
+                frames  = frames.to(self.device)
+                actions = actions.to(self.device)
+
+                if use_precomp_lats:
+                    z_clip = latents_precomp.to(self.device)
+                else:
+                    z_clip = self._encode_vae(frames)           # (B, T, 4, Hv, Wv)
+
+                B, T = z_clip.shape[:2]
+                a_pad  = torch.zeros(B, 1, actions.shape[-1], device=self.device)
+                a_full = torch.cat([actions, a_pad], dim=1)     # (B, T, action_dim)
+
+                L_pred = self.ctrl_world.forward_ddpm(z_clip, a_full)
+
+                if train and self.optimizer is not None:
+                    if not torch.isfinite(L_pred):
+                        pbar.set_postfix(pred="NaN-skip")
+                        continue
+                    self.optimizer.zero_grad()
+                    self.scaler.scale(L_pred).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    # Cross-attn params live in the UNet (not DDP-wrapped), so we
+                    # manually all_reduce their gradients across GPUs.
+                    if self.world_size > 1 and getattr(self.ctrl_world, "finetune_cross_attn", False):
+                        for p in self.ctrl_world.cross_attn_parameters():
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                                p.grad.div_(self.world_size)
+                    nn.utils.clip_grad_norm_(
+                        list(self.ctrl_world.trainable_parameters()), 1.0
                     )
-            self.save_checkpoint("stage1p1_final.pt", {"epoch": p1})
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
 
-        # ── Transition ───────────────────────────────────────────────── #
-        print(f"\n[Stage1] Transitioning to Phase 2 — freezing ViT LoRA + Predictor")
-        self.agent.set_trainable_lora(vit=False, llm=True)
-        for p in self.system.predictor.parameters():
-            p.requires_grad_(False)
-        self.agent._vla.train()   # enable train mode so LoRA dropout + projector grads work
-        self._build_phase2_optimizer()
+                totals["pred"] += L_pred.item()
+                n += 1
+                pbar.set_postfix(pred=f"{L_pred.item():.5f}")
 
-        # ── Phase 2 ──────────────────────────────────────────────────── #
-        print(f"\n[Stage1/P2] Adapting LLM action head  ({p2} epochs)")
-        best_p2 = self.best_p2
-        for ep in range(1, p2 + 1):
-            tr = self._run_epoch(self.train_loader, True,  ep, mode="ce")
-            vl = self._run_epoch(self.val_loader,   False, ep, mode="ce")
-            self.scheduler.step()
+        avg = {}
+        for k, v in totals.items():
+            t      = torch.tensor(v / max(n, 1), device=self.device)
+            avg[k] = reduce_mean(t).item()
+        return avg
+
+    def validate(self):
+        vl = self._run_epoch(self.val_loader, train=False, epoch=0)
+        if self.is_main:
+            print(f"[Stage1] val_pred={vl['pred']:.5f}")
+
+    def train(self):
+        epochs = self.config.get("epochs", 30)
+        if self.is_main:
+            print(f"\n[Stage1] Ctrl-World  {epochs} epochs  clip_length={self.clip_length}")
+        best = self.best
+        for ep in range(self.start_epoch, epochs + 1):
+            tr = self._run_epoch(self.train_loader, True,  ep)
+            vl = self._run_epoch(self.val_loader,   False, ep)
+            if self.scheduler is not None:
+                self.scheduler.step()
             if self.is_main:
-                lr = self.optimizer.param_groups[0]["lr"]
-                self._log("Stage1/P2", {"train_" + k: v for k, v in tr.items()}, ep)
-                self._log("Stage1/P2", {"val_"   + k: v for k, v in vl.items()}, ep)
-                print(
-                    f"[Stage1/P2] ep {ep:2d}/{p2}  "
-                    f"val_ce={vl['ce']:.4f}  val_cos={vl['cosine']:.3f}  lr={lr:.2e}"
-                )
-                if vl["ce"] < best_p2:
-                    best_p2 = vl["ce"]
+                lr = self.optimizer.param_groups[0]["lr"] if self.optimizer else 0.0
+                self._log("Stage1", {"train_pred": tr["pred"], "val_pred": vl["pred"]}, ep)
+                print(f"[Stage1] ep {ep:3d}/{epochs}  "
+                      f"train_pred={tr['pred']:.5f}  val_pred={vl['pred']:.5f}  lr={lr:.2e}")
+                if vl["pred"] < best:
+                    best = vl["pred"]
                     self.save_checkpoint("stage1_best.pt", {
-                        "epoch": p1 + ep, "best": best_p2,
-                        "optimizer_state": self.optimizer.state_dict(),
-                        "scheduler_state": self.scheduler.state_dict(),
+                        "epoch": ep, "best": best,
+                        **({"optimizer_state": self.optimizer.state_dict()} if self.optimizer else {}),
+                        **({"scheduler_state": self.scheduler.state_dict()} if self.scheduler else {}),
                         **vl,
                     })
-        self.save_checkpoint("stage1_final.pt", {"epoch": p1 + p2})
+            self._visualize_predictions(ep)
+        self.save_checkpoint("stage1_final.pt", {"epoch": epochs, "best": best})
         if self.is_main and self.writer:
             self.writer.close()
         if self.is_main:
-            print(f"[Stage1] Done. Best val_total={best:.4f}")
+            print(f"[Stage1] Done. Best val_pred={best:.5f}")
 
 
 # ========================================================================== #
-#  Stage 3  —  JSCC (Wyner-Ziv)                                              #
+#  Stage 2  —  JSCC + Refinement Diffusion (Wyner-Ziv)                       #
 # ========================================================================== #
 
 class Stage2Trainer(BaseTrainer):
     """
-    Train JsccEncoder, JsccDecoder, and SideInfoEncoder.
+    Train JsccEncoder, SideInfoEncoder, and RefinementDiffusion jointly.
 
-    Predictor is frozen and provides side information ẑ_t^{pred}.
+    Ctrl-World is loaded from the Stage-1 checkpoint and kept frozen.
+    It provides ẑ_t = predict_next_latent(z_history, a_t) as Wyner-Ziv side information.
 
-    Loss: L = MSE(token_hat, tokens_t) + λ · KL(q(ŝ_t|tokens_t) || p(ŝ_t|ẑ_t^{pred}))
+    Loss:  L = MSE(z̃_t, z_t) + β · KL( q(s_t|z_t) || p(s_t|ẑ_t) )
     """
 
     def __init__(
@@ -767,46 +601,105 @@ class Stage2Trainer(BaseTrainer):
         data_path:   str,
         stage1_ckpt: str,
         device:      torch.device,
-        agent,
+        vae,
         rank:        int,
         world_size:  int,
+        ctrl_world   = None,         # CtrlWorldWrapper or StubCtrlWorld
         resume_ckpt: str | None = None,
     ):
-        super().__init__(config, data_path, device, agent, rank, world_size)
-        self.load_checkpoint(stage1_ckpt)
+        # clip_length = num_history + 1 (history frames + target frame)
+        self.clip_length   = config.get("num_history", 6) + 1
+        self.ctrl_world    = ctrl_world
+        super().__init__(config, data_path, device, vae, rank, world_size)
 
-        for p in self.system.predictor.parameters():
-            p.requires_grad_(False)
-        if self.is_main:
-            print("[Stage3] Predictor frozen.")
+        # ── Load Stage-1 action encoder into ctrl_world ───────────────────
+        if self.ctrl_world is not None:
+            self.ctrl_world = self.ctrl_world.to(device)
+            if stage1_ckpt and os.path.exists(stage1_ckpt):
+                ckpt = torch.load(stage1_ckpt, map_location="cpu")
+                if "action_encoder_state" in ckpt and hasattr(self.ctrl_world, "action_encoder"):
+                    self.ctrl_world.action_encoder.load_state_dict(
+                        ckpt["action_encoder_state"], strict=False
+                    )
+                    if self.is_main:
+                        print(f"[Stage2] Loaded Action_encoder from {stage1_ckpt}")
+                del ckpt
+            self.ctrl_world.requires_grad_(False)
+            if self.is_main:
+                print("[Stage2] Ctrl-World frozen.")
+        elif self.is_main:
+            print("[Stage2] No Ctrl-World provided — using previous frame as ẑ_t (fallback).")
 
-        self.system.jscc_encoder      = self._wrap_ddp(self.system.jscc_encoder)
-        self.system.jscc_decoder      = self._wrap_ddp(self.system.jscc_decoder)
-        self.system.side_info_encoder = self._wrap_ddp(self.system.side_info_encoder)
+        # ── Wrap Stage-2 trainable modules with DDP ──────────────────────
+        self.system.jscc_encoder         = self._wrap_ddp(self.system.jscc_encoder)
+        self.system.side_info_encoder    = self._wrap_ddp(self.system.side_info_encoder)
+        self.system.refinement_diffusion = self._wrap_ddp(self.system.refinement_diffusion)
 
         params = (
-            list(self._unwrap(self.system.jscc_encoder).parameters())      +
-            list(self._unwrap(self.system.jscc_decoder).parameters())      +
-            list(self._unwrap(self.system.side_info_encoder).parameters())
+            list(self._unwrap(self.system.jscc_encoder).parameters())           +
+            list(self._unwrap(self.system.side_info_encoder).parameters())      +
+            list(self._unwrap(self.system.refinement_diffusion).parameters())
         )
-        self.optimizer = optim.Adam(params, lr=config["learning_rate"])
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        self.optimizer   = optim.AdamW(params, lr=config["learning_rate"], weight_decay=1e-4)
+        self.scheduler   = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config["epochs"], eta_min=1e-6
         )
-        self.lambda_rate = config.get("lambda_rate", 0.01)
+        self.beta_rate   = config.get("beta_rate", config.get("lambda_rate", 0.01))
         self.snr_db      = config["snr_db"]
-
+        self.noise_level = config.get("noise_level_second", 250)
         self.start_epoch = 1
         self.best        = math.inf
+
         if resume_ckpt:
             self.start_epoch, self.best = self._load_resume(resume_ckpt)
 
+    def _build_loaders(self, config, data_path, rank, world_size):
+        return build_ddp_loaders(config, data_path, rank, world_size,
+                                 clip_length=self.clip_length)
+
+    def _get_z_hat(
+        self,
+        z_clip:     torch.Tensor,    # (B, T, 4, Hv, Wv)  — clip latents
+        actions:    torch.Tensor,    # (B, T-1, action_dim)
+    ) -> torch.Tensor:
+        """
+        Compute ẑ_t (Wyner-Ziv side information) using frozen Ctrl-World.
+
+        z_clip[:, :-1] = z_history  (num_history frames)
+        z_clip[:, -1]  = z_t        (target frame)
+
+        Returns ẑ_t : (B, 4, Hv, Wv)
+        """
+        B         = z_clip.shape[0]
+        num_hist  = self.clip_length - 1
+        z_history = z_clip[:, :num_hist]                  # (B, T-1, 4, Hv, Wv)
+        action_dim = actions.shape[-1]
+
+        if self.ctrl_world is not None:
+            # Pad actions to (B, num_hist+1, action_dim) for predict_next_latent
+            a_pad   = torch.zeros(B, 1, action_dim, device=self.device)
+            a_full  = torch.cat([actions, a_pad], dim=1)  # (B, num_hist+1, D)
+            n_steps = self.config.get("ctrl_world_n_steps", 10)
+            with torch.no_grad():
+                z_hat = self.ctrl_world.predict_next_latent(z_history, a_full, n_steps=n_steps)
+            return z_hat[:, 0]                             # (B, 4, Hv, Wv)
+        else:
+            # Fallback: use last history frame as a trivial side-info estimate
+            return z_clip[:, -2].detach()
+
     def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
-        self._unwrap(self.system.jscc_encoder).train(train)
-        self._unwrap(self.system.jscc_decoder).train(train)
-        self._unwrap(self.system.side_info_encoder).train(train)
+        jscc  = self._unwrap(self.system.jscc_encoder)
+        side  = self._unwrap(self.system.side_info_encoder)
+        refine = self._unwrap(self.system.refinement_diffusion)
+        jscc.train(train);  side.train(train);  refine.train(train)
+
         if train and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
+
+        use_precomp_lats = _has_latents(loader)
+        if self.is_main and epoch == (self.start_epoch if train else 0):
+            src = "pre-computed HDF5 latents" if use_precomp_lats else "online VAE encode"
+            print(f"  [Stage2] latent source: {src}")
 
         totals = {"distortion": 0.0, "rate": 0.0, "total": 0.0}
         n      = 0
@@ -815,44 +708,39 @@ class Stage2Trainer(BaseTrainer):
                       disable=not self.is_main, leave=False, dynamic_ncols=True)
 
         with torch.set_grad_enabled(train):
-            for obs_t, act_t, obs_tp1 in pbar:
-                obs_t   = obs_t.to(self.device)
-                act_t   = act_t.to(self.device)
-                obs_tp1 = obs_tp1.to(self.device)
+            for frames, actions, _poses, latents_precomp in pbar:
+                frames  = frames.to(self.device)
+                actions = actions.to(self.device)
 
-                tok_prev = self._encode_all_ranks(obs_t)    # (B, N, D_vit)
-                tok_curr = self._encode_all_ranks(obs_tp1)  # (B, N, D_vit)
+                if use_precomp_lats:
+                    z_clip = latents_precomp.to(self.device)   # (B, T, 4, Hv, Wv)
+                else:
+                    z_clip = self._encode_vae(frames)
 
-                # Frozen predictor provides side information
-                with torch.no_grad():
-                    z_pred_si = self.system.predictor(tok_prev, act_t)  # (B, N, D_vit)
+                z_t   = z_clip[:, -1]                          # (B, 4, Hv, Wv) — target
+                z_hat = self._get_z_hat(z_clip, actions)       # (B, 4, Hv, Wv) — side info ẑ_t
 
-                # JSCC encoding (trainable)
-                mu_enc, log_var_enc, s_t = self.system.jscc_encoder(
-                    tok_curr, sample=train
-                )
-                s_hat = self.system.channel(s_t)
+                # JSCC Encoder: z_t → q(s_t | z_t)
+                mu_enc, log_var_enc, s_t = jscc(z_t, sample=train)
+                s_tilde = self.system.channel(s_t)             # (B, D_jscc) — received signal
 
-                # Conditional prior (trainable, loss only)
-                mu_prior, log_var_prior = self.system.side_info_encoder(z_pred_si)
+                # Side Info Encoder: ẑ_t → p(s_t | ẑ_t)   [rate loss only]
+                mu_prior, log_var_prior = side(z_hat)
 
-                # JSCC decoding (trainable)
-                token_hat = self.system.jscc_decoder(s_hat, z_pred_si)
+                # Refinement Diffusion: DDPM x₀-prediction loss
+                L_distortion = refine.forward_ddpm(z_t, z_hat, s_tilde, self.noise_level)
 
-                # Losses
-                L_distortion = self.mse(token_hat, tok_curr.detach())
-                L_rate       = SemComSystem.rate_loss(
+                # Rate: KL( q(s_t|z_t) || p(s_t|ẑ_t) )
+                L_rate = SemComSystem.rate_loss(
                     mu_enc, log_var_enc, mu_prior, log_var_prior, self.snr_db
                 )
-                loss = L_distortion + self.lambda_rate * L_rate
+                loss = L_distortion + self.beta_rate * L_rate
 
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(
-                        list(self._unwrap(self.system.jscc_encoder).parameters())      +
-                        list(self._unwrap(self.system.jscc_decoder).parameters())      +
-                        list(self._unwrap(self.system.side_info_encoder).parameters()),
+                        list(jscc.parameters()) + list(side.parameters()) + list(refine.parameters()),
                         max_norm=5.0,
                     )
                     self.optimizer.step()
@@ -876,10 +764,8 @@ class Stage2Trainer(BaseTrainer):
         best   = self.best
         epochs = self.config["epochs"]
         if self.is_main:
-            print(
-                f"\n[Stage2] JSCC (Wyner-Ziv) training for {epochs} epochs "
-                f"on {self.world_size} GPU(s) …  λ={self.lambda_rate}"
-            )
+            print(f"\n[Stage2] JSCC + Refinement Diffusion  {epochs} epochs  "
+                  f"β={self.beta_rate}  SNR={self.snr_db}dB  t''={self.noise_level}")
 
         for ep in range(self.start_epoch, epochs + 1):
             tr = self._run_epoch(self.train_loader, True,  ep)
@@ -889,12 +775,10 @@ class Stage2Trainer(BaseTrainer):
             if self.is_main:
                 self._log("Stage2", {"train_" + k: v for k, v in tr.items()}, ep)
                 self._log("Stage2", {"val_"   + k: v for k, v in vl.items()}, ep)
-                print(
-                    f"[Stage2] ep {ep:3d}/{epochs}  "
-                    f"val_dist={vl['distortion']:.5f}  "
-                    f"val_rate={vl['rate']:.5f}  "
-                    f"val_total={vl['total']:.5f}"
-                )
+                print(f"[Stage2] ep {ep:3d}/{epochs}  "
+                      f"val_dist={vl['distortion']:.5f}  "
+                      f"val_rate={vl['rate']:.5f}  "
+                      f"val_total={vl['total']:.5f}")
                 if vl["total"] < best:
                     best = vl["total"]
                     self.save_checkpoint("stage2_best.pt", {
@@ -913,3 +797,7 @@ class Stage2Trainer(BaseTrainer):
             self.writer.close()
         if self.is_main:
             print(f"[Stage2] Done. Best val={best:.5f}")
+
+
+# re-export for backward compat
+from models import SemComSystem

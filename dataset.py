@@ -4,28 +4,38 @@ dataset.py  —  HDF5 trajectory dataset for the Predictive SemCom system.
 HDF5 layouts supported (auto-detected)
 ---------------------------------------
 Layout A — flat arrays (all episodes concatenated):
-    /observations   (N, H, W, C)    uint8 or float32 RGB images
-    /actions        (N, action_dim)  float32
-    /poses          (N, pose_dim)    float32  [optional]
+    /observations   (N, H, W, C)          uint8 or float32 RGB images
+    /actions        (N, action_dim)        float32
+    /poses          (N, pose_dim)          float32  [optional]
+    /latents        (N, 4, H_lat, W_lat)   float32  [optional, pre-computed VAE latents]
 
 Layout B — episodic groups (produced by isaac_collector.py):
     /episode_0/observations  (T, H, W, C)
     /episode_0/actions       (T, action_dim)
-    /episode_0/poses         (T, pose_dim)   [optional]
+    /episode_0/poses         (T, pose_dim)          [optional]
+    /episode_0/latents       (T, 4, H_lat, W_lat)   [optional, pre-computed VAE latents]
     /episode_1/...
 
 Two dataset classes
 --------------------
 GNMTrajectoryDataset  — single-step pairs (obs_t, action_t, obs_tp1).
+                        Also returns pre-computed latents if available.
                         Used by Stage 2 (JSCC) trainer.
 
-ClipDataset           — T-frame clips for multi-frame predictor training
-                        (V-JEPA 2-AC, paper §3.1).
-                        Returns (frames, actions, poses) where:
-                          frames  : (T, C, H, W)  float32 [0,1]
-                          actions : (T, action_dim) float32 — a_k at step k;
-                                    a_T = 0 (dummy, padded internally)
-                          poses   : (T, pose_dim) float32, or zeros if absent
+ClipDataset           — T-frame clips for multi-frame predictor training.
+                        Returns (frames, actions, poses, latents) where:
+                          frames  : (T, C, H, W)        float32 [0,1]
+                          actions : (T-1, action_dim)    float32
+                          poses   : (T-1, pose_dim)      float32, or zeros if absent
+                          latents : (T, 4, H_lat, W_lat) float32
+                                    — real VAE latents if /latents present in HDF5,
+                                      zeros otherwise (trainer falls back to VAE encoding)
+
+Pre-computed latents
+---------------------
+Run precompute_latents.py once to add /latents to the HDF5.  Both dataset classes
+detect the key automatically and set has_latents=True.  Stage 1/2 trainers use
+this flag to skip the (expensive) online VAE encode step.
 
 Notes
 -----
@@ -64,12 +74,18 @@ def _preprocess_obs(
 
 class GNMTrajectoryDataset(Dataset):
     """
-    Parameters
-    ----------
-    hdf5_path    : str   Path to the .hdf5 file.
-    obs_height   : int   Target image height after optional resize.
-    obs_width    : int   Target image width after optional resize.
-    obs_channels : int   Expected colour channels (default 3 = RGB).
+    Single-step pairs (obs_t, action_t, obs_tp1) for Stage 2 (JSCC) training.
+
+    If the HDF5 file contains pre-computed /latents (added by precompute_latents.py),
+    the dataset sets has_latents=True and returns latent tensors alongside images.
+
+    Returns
+    -------
+    obs_t    : (C, H, W)             float32
+    action_t : (action_dim,)         float32
+    obs_tp1  : (C, H, W)             float32
+    lat_t    : (4, H_lat, W_lat)     float32  — real latent or zeros
+    lat_tp1  : (4, H_lat, W_lat)     float32  — real latent or zeros
     """
 
     def __init__(
@@ -85,13 +101,11 @@ class GNMTrajectoryDataset(Dataset):
         self.obs_width    = obs_width
         self.obs_channels = obs_channels
 
-        self._index: list = []          # list of (layout_key, step_index)
-        self._action_dim  = None        # detected from file
+        self._index:      list = []
+        self._action_dim: int | None = None
+        self.has_latents: bool = False
+        self._latent_shape: tuple = (4, obs_height // 8, obs_width // 8)
         self._load_index()
-
-    # ------------------------------------------------------------------ #
-    #  Index construction                                                  #
-    # ------------------------------------------------------------------ #
 
     def _load_index(self):
         if not os.path.exists(self.hdf5_path):
@@ -102,15 +116,14 @@ class GNMTrajectoryDataset(Dataset):
 
         with h5py.File(self.hdf5_path, "r") as f:
             if "observations" in f:
-                # Layout A: flat arrays
                 n = len(f["observations"])
                 self._index = [("flat", i) for i in range(n - 1)]
-                if "actions" in f:
-                    shape = f["actions"].shape
-                    if len(shape) > 1:
-                        self._action_dim = shape[1]
+                if "actions" in f and f["actions"].ndim > 1:
+                    self._action_dim = f["actions"].shape[1]
+                if "latents" in f:
+                    self.has_latents = True
+                    self._latent_shape = f["latents"].shape[1:]   # (C, H, W)
             else:
-                # Layout B: episodic groups
                 for ep_key in sorted(f.keys()):
                     grp = f[ep_key]
                     if "observations" not in grp or "actions" not in grp:
@@ -118,39 +131,25 @@ class GNMTrajectoryDataset(Dataset):
                     n = len(grp["observations"])
                     for i in range(n - 1):
                         self._index.append((ep_key, i))
-                    if self._action_dim is None:
-                        shape = grp["actions"].shape
-                        if len(shape) > 1:
-                            self._action_dim = shape[1]
+                    if self._action_dim is None and grp["actions"].ndim > 1:
+                        self._action_dim = grp["actions"].shape[1]
+                    if not self.has_latents and "latents" in grp:
+                        self.has_latents = True
+                        self._latent_shape = grp["latents"].shape[1:]
 
-        if len(self._index) == 0:
+        if not self._index:
             raise ValueError(
                 f"No valid triplets found in '{self.hdf5_path}'. "
                 "Check the HDF5 layout (see dataset.py docstring)."
             )
 
-    # ------------------------------------------------------------------ #
-    #  Image preprocessing                                                 #
-    # ------------------------------------------------------------------ #
-
     def _preprocess_obs(self, obs_np: np.ndarray) -> torch.Tensor:
         return _preprocess_obs(obs_np, self.obs_height, self.obs_width)
-
-    # ------------------------------------------------------------------ #
-    #  Dataset interface                                                   #
-    # ------------------------------------------------------------------ #
 
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int):
-        """
-        Returns
-        -------
-        obs_t    : (C, H, W)     float32
-        action_t : (action_dim,) float32
-        obs_tp1  : (C, H, W)     float32
-        """
         layout_key, i = self._index[idx]
 
         with h5py.File(self.hdf5_path, "r") as f:
@@ -158,16 +157,27 @@ class GNMTrajectoryDataset(Dataset):
                 obs_t    = np.array(f["observations"][i])
                 obs_tp1  = np.array(f["observations"][i + 1])
                 action_t = np.array(f["actions"][i], dtype=np.float32)
+                if self.has_latents:
+                    lat_t   = np.array(f["latents"][i],     dtype=np.float32)
+                    lat_tp1 = np.array(f["latents"][i + 1], dtype=np.float32)
             else:
                 grp      = f[layout_key]
                 obs_t    = np.array(grp["observations"][i])
                 obs_tp1  = np.array(grp["observations"][i + 1])
                 action_t = np.array(grp["actions"][i], dtype=np.float32)
+                if self.has_latents:
+                    lat_t   = np.array(grp["latents"][i],     dtype=np.float32)
+                    lat_tp1 = np.array(grp["latents"][i + 1], dtype=np.float32)
 
         obs_t   = self._preprocess_obs(obs_t)
         obs_tp1 = self._preprocess_obs(obs_tp1)
 
-        return obs_t, torch.from_numpy(action_t), obs_tp1
+        if self.has_latents:
+            return (obs_t, torch.from_numpy(action_t), obs_tp1,
+                    torch.from_numpy(lat_t), torch.from_numpy(lat_tp1))
+        else:
+            zeros = torch.zeros(self._latent_shape)
+            return obs_t, torch.from_numpy(action_t), obs_tp1, zeros, zeros
 
 
 # ========================================================================== #
@@ -176,13 +186,18 @@ class GNMTrajectoryDataset(Dataset):
 
 class ClipDataset(Dataset):
     """
-    Returns T-frame clips sampled from the same episode.
+    T-frame clips for Stage 1 (world model) training.
+
+    If the HDF5 file contains pre-computed /latents (added by precompute_latents.py),
+    the dataset sets has_latents=True and returns them directly — the trainer then
+    skips the online VAE encode step entirely.
 
     Returns
     -------
-    frames  : (T, C, H, W)      float32 [0,1]
-    actions : (T, action_dim)   float32  — a_k at step k (clip has T steps)
-    poses   : (T, pose_dim)     float32  — zeros if /poses absent in HDF5
+    frames  : (T, C, H, W)            float32 [0,1]
+    actions : (T-1, action_dim)        float32
+    poses   : (T-1, pose_dim)          float32  — zeros if /poses absent
+    latents : (T, 4, H_lat, W_lat)     float32  — real latents or zeros
     """
 
     def __init__(
@@ -201,15 +216,16 @@ class ClipDataset(Dataset):
         self.clip_length = clip_length
         self.stride      = stride
 
-        self._index      = []   # (layout_key, start_idx)
-        self._action_dim = None
-        self._pose_dim   = 0
+        self._index:       list        = []
+        self._action_dim:  int | None  = None
+        self._pose_dim:    int         = 0
+        self.has_latents:  bool        = False
+        self._latent_shape: tuple      = (4, obs_height // 8, obs_width // 8)
         self._load_index()
 
     def _load_index(self):
         T      = self.clip_length
         stride = self.stride
-        # Need start + stride*(T-1) < n  →  n - stride*(T-1) valid starts
         window = stride * (T - 1) + 1
         if not os.path.exists(self.hdf5_path):
             raise FileNotFoundError(f"HDF5 not found: '{self.hdf5_path}'")
@@ -222,6 +238,9 @@ class ClipDataset(Dataset):
                     self._action_dim = f["actions"].shape[1]
                 if "poses" in f and f["poses"].ndim > 1:
                     self._pose_dim = f["poses"].shape[1]
+                if "latents" in f:
+                    self.has_latents   = True
+                    self._latent_shape = f["latents"].shape[1:]
             else:
                 for ep_key in sorted(f.keys()):
                     grp = f[ep_key]
@@ -236,6 +255,9 @@ class ClipDataset(Dataset):
                         self._action_dim = grp["actions"].shape[1]
                     if self._pose_dim == 0 and "poses" in grp and grp["poses"].ndim > 1:
                         self._pose_dim = grp["poses"].shape[1]
+                    if not self.has_latents and "latents" in grp:
+                        self.has_latents   = True
+                        self._latent_shape = grp["latents"].shape[1:]
 
         if not self._index:
             raise ValueError(
@@ -248,11 +270,10 @@ class ClipDataset(Dataset):
 
     def __getitem__(self, idx: int):
         layout_key, start = self._index[idx]
-        T      = self.clip_length
-        stride = self.stride
+        T             = self.clip_length
+        stride        = self.stride
         frame_indices = [start + k * stride for k in range(T)]
-        # Actions between t and t+(T-1)*stride: stride*(T-1) raw actions
-        raw_end = start + stride * (T - 1)
+        raw_end       = start + stride * (T - 1)
 
         with h5py.File(self.hdf5_path, "r") as f:
             if layout_key == "flat":
@@ -260,26 +281,31 @@ class ClipDataset(Dataset):
                 action_raw = np.array(f["actions"][start:raw_end], dtype=np.float32)
                 pose_arr   = np.array(f["poses"][frame_indices], dtype=np.float32) \
                              if "poses" in f else None
+                lat_arr    = np.array(f["latents"][frame_indices], dtype=np.float32) \
+                             if self.has_latents else None
             else:
                 grp        = f[layout_key]
                 obs_arr    = np.array(grp["observations"][frame_indices])
                 action_raw = np.array(grp["actions"][start:raw_end], dtype=np.float32)
                 pose_arr   = np.array(grp["poses"][frame_indices], dtype=np.float32) \
                              if "poses" in grp else None
+                lat_arr    = np.array(grp["latents"][frame_indices], dtype=np.float32) \
+                             if self.has_latents else None
 
-        # Sum stride raw actions per transition → (T-1, action_dim)
         action_dim = action_raw.shape[-1]
         action_arr = action_raw.reshape(T - 1, stride, action_dim).sum(axis=1)
 
         frames  = torch.stack([
             _preprocess_obs(obs_arr[k], self.obs_height, self.obs_width)
             for k in range(T)
-        ])                                                          # (T, C, H, W)
-        actions = torch.from_numpy(action_arr)                      # (T-1, action_dim)
+        ])                                                              # (T, C, H, W)
+        actions = torch.from_numpy(action_arr)                          # (T-1, D)
         poses   = torch.from_numpy(pose_arr[:-1]) if pose_arr is not None \
-                  else torch.zeros(T - 1, max(self._pose_dim, 1))  # (T-1, pose_dim)
+                  else torch.zeros(T - 1, max(self._pose_dim, 1))      # (T-1, pose_dim)
+        latents = torch.from_numpy(lat_arr) if lat_arr is not None \
+                  else torch.zeros(T, *self._latent_shape)              # (T, 4, H, W)
 
-        return frames, actions, poses
+        return frames, actions, poses, latents
 
 
 # ========================================================================== #

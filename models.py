@@ -1,47 +1,28 @@
 """
-models.py  —  Neural network modules for the Predictive Semantic Communication System.
+models.py  —  Neural network modules for the VAE-latent Wyner-Ziv SemCom System.
 
-Architecture (action-conditioned V-JEPA 2 + Wyner-Ziv JSCC)
--------------------------------------------------------------
-Device (Robot):
-    x_t → [ViT (agent, frozen)] → tokens_t (B, N, D_vit)
-        → [JsccEncoder] → s_t ~ q(s_t|tokens_t), shape (B, D_jscc)
-        → [RayleighChannel] → ŝ_t (B, D_jscc)
+Transmitter (Robot):
+    z_t  = VAE_encode(x_t)                           ← frozen SD-VAE
+    s_t  ~ q(s_t | z_t) = N(μ_enc, σ²_enc)           ← JsccEncoder
+    s̃_t  = RayleighChannel(s_t)
 
-Edge Server:
-    (tokens_{t-1}, a_{t-1}) → [Predictor] → ẑ_t^{pred} (B, N, D_vit)
-    ẑ_t^{pred} → [SideInfoEncoder] → p(ŝ_t|ẑ_t^{pred})    ← loss only
-    (ŝ_t, ẑ_t^{pred}) → [JsccDecoder] → token_hat (B, N, D_vit)
-        → [OpenVLA Projector (agent, frozen)] → (B, N, D_model)
-        → [LLM (agent, frozen)] → â_t
+Receiver (Edge Server):
+    ẑ_t  = CtrlWorld([z̃_{t-km},...,z̃_{t-1}], a_t)   ← frozen Stage-1 (ctrl_world_wrapper.py)
+    p(s_t | ẑ_t) = N(μ_prior, σ²_prior)               ← SideInfoEncoder  (KL loss only)
+    z̃_t  = RefinementDiffusion(ẑ_t, s̃_t)             ← SDEdit start from ẑ_t; s̃_t cross-attn
+    x̃_t  = VAE_decode(z̃_t)                            ← frozen SD-VAE  (vae_wrapper.py)
+    â_t  = Policy(x̃_t)
 
-Predictor design — narrow transformer (V-JEPA 2 style with 3D RoPE)
-----------------------------------------------------------------------
-Full patch resolution (B, N, D_vit); narrow working dim d_pred ≪ D_vit.
-Transformer blocks use factored 3D RoPE (frame × height × width per head),
-Pre-LN, and stochastic-depth drop-path.
-The action is embedded and prepended as a conditioning token (position 0,0,0).
+Modules in this file
+--------------------
+1. JsccEncoder          z_t          → μ_enc, log_var_enc, s_t   (B, D_jscc)
+2. SideInfoEncoder      ẑ_t          → μ_prior, log_var_prior     (B, D_jscc)
+3. RefinementDiffusion  (ẑ_t, s̃_t)  → z̃_t   — second diffusion, s̃_t via cross-attn
+4. RayleighChannel      s_t          → s̃_t
+5. SemComSystem         container for Stage-2 JSCC modules + static rate_loss()
 
-JsccDecoder design — cross-attention
--------------------------------------
-The predicted tokens ẑ_t^{pred} serve as queries; the received signal
-ŝ_t (projected to d_pred) is the single key/value token.  Each patch
-token independently attends to the channel signal to compute a correction.
-
-Rate Loss (Wyner-Ziv)
----------------------
-KL( q(ŝ_t|tokens_t) || p(ŝ_t|ẑ_t^{pred}) )
-  q = N(μ_enc,   σ²_enc + σ²_n)   σ²_n explicit
-  p = N(μ_prior, σ²_prior)         σ²_n absorbed into learned σ²_prior
-
-Modules
--------
-1. JsccEncoder      (B,N,D_vit) → μ_enc, log_var_enc, s_t  [via mean pool + MLP]
-2. SideInfoEncoder  (B,N,D_vit) → μ_prior, log_var_prior    [loss only, mean pool + MLP]
-3. JsccDecoder      (B,D_jscc) + (B,N,D_vit) → (B,N,D_vit) [cross-attention]
-4. Predictor        (B,N,D_vit) + (B,action_dim) → (B,N,D_vit) [V-JEPA2 narrow transformer, 3D RoPE]
-5. RayleighChannel  (B,D_jscc) → (B,D_jscc)
-6. SemComSystem     container + static rate_loss()
+Ctrl-World (first diffusion) lives in ctrl_world_wrapper.py.
+VAE encoder/decoder live in vae_wrapper.py.
 """
 
 import math
@@ -51,34 +32,57 @@ import torch.nn.functional as F
 
 
 # ========================================================================== #
+#  Helpers                                                                    #
+# ========================================================================== #
+
+def _make_2d_sincos_pos(H: int, W: int, d_model: int, device, dtype) -> torch.Tensor:
+    """2D sinusoidal positional embedding (H*W, d_model)."""
+    assert d_model % 4 == 0
+    d2 = d_model // 2
+    omega = 1.0 / (10000.0 ** (torch.arange(d2 // 2, device=device, dtype=dtype) / (d2 // 2)))
+    y_pos = torch.arange(H, device=device, dtype=dtype)
+    x_pos = torch.arange(W, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(y_pos, x_pos, indexing="ij")
+    yy = yy.reshape(-1)
+    xx = xx.reshape(-1)
+    pe_y = torch.cat([torch.sin(yy[:, None] * omega), torch.cos(yy[:, None] * omega)], dim=-1)
+    pe_x = torch.cat([torch.sin(xx[:, None] * omega), torch.cos(xx[:, None] * omega)], dim=-1)
+    return torch.cat([pe_y, pe_x], dim=-1)                     # (H*W, d_model)
+
+
+# ========================================================================== #
 #  1. JSCC ENCODER                                                            #
 # ========================================================================== #
 
 class JsccEncoder(nn.Module):
     """
-    Probabilistic JSCC encoder: tokens_t → q(s_t|tokens_t) = N(μ_enc, σ²_enc)
+    Probabilistic JSCC encoder: z_t → q(s_t | z_t) = N(μ_enc, σ²_enc)
 
-    Mean-pools over the N patch dimension, then applies a two-layer MLP.
-    No access to ẑ_t^{pred} — Wyner-Ziv constraint.
+    Mean-pools VAE latent over space → MLP → μ and log_var.
+    No access to ẑ_t (Wyner-Ziv transmitter constraint).
     """
 
-    def __init__(self, D_vit: int, D_jscc: int, d_pred: int):
+    def __init__(self, C_vae: int, H_vae: int, W_vae: int, D_jscc: int, d_hidden: int = 512):
         super().__init__()
         self.shared = nn.Sequential(
-            nn.Linear(D_vit, d_pred),
+            nn.Linear(C_vae, d_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_hidden, d_hidden),
             nn.ReLU(inplace=True),
         )
-        self.fc_mu      = nn.Linear(d_pred, D_jscc)
-        self.fc_log_var = nn.Linear(d_pred, D_jscc)
+        self.fc_mu      = nn.Linear(d_hidden, D_jscc)
+        self.fc_log_var = nn.Linear(d_hidden, D_jscc)
+        self.D_jscc = D_jscc
 
     def forward(
-        self, tokens: torch.Tensor, sample: bool = True
+        self, z: torch.Tensor, sample: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        tokens : (B, N, D_vit)
+        z : (B, C_vae, H_vae, W_vae)
         Returns μ_enc, log_var_enc, s_t — all (B, D_jscc)
         """
-        h       = self.shared(tokens.mean(dim=1))       # (B, d_pred)
+        h       = z.mean(dim=(-2, -1))
+        h       = self.shared(h)
         mu      = self.fc_mu(h)
         log_var = self.fc_log_var(h).clamp(-10.0, 2.0)
 
@@ -96,536 +100,272 @@ class JsccEncoder(nn.Module):
 
 class SideInfoEncoder(nn.Module):
     """
-    Conditional prior: ẑ_t^{pred} → p(ŝ_t|ẑ_t^{pred}) = N(μ_prior, σ²_prior)
+    Conditional prior: ẑ_t → p(s_t | ẑ_t) = N(μ_prior, σ²_prior)
 
-    Used ONLY in the rate loss (KL term).  No data flows through this module.
-    Mean-pools predicted tokens before encoding.
+    Used ONLY in the rate loss (KL term). No data flows through this module
+    at inference. Same architecture as JsccEncoder.
     """
 
-    def __init__(self, D_vit: int, D_jscc: int, d_pred: int):
+    def __init__(self, C_vae: int, H_vae: int, W_vae: int, D_jscc: int, d_hidden: int = 512):
         super().__init__()
         self.shared = nn.Sequential(
-            nn.Linear(D_vit, d_pred),
+            nn.Linear(C_vae, d_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_hidden, d_hidden),
             nn.ReLU(inplace=True),
         )
-        self.fc_mu      = nn.Linear(d_pred, D_jscc)
-        self.fc_log_var = nn.Linear(d_pred, D_jscc)
+        self.fc_mu      = nn.Linear(d_hidden, D_jscc)
+        self.fc_log_var = nn.Linear(d_hidden, D_jscc)
 
-    def forward(
-        self, z_pred: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, z_hat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        z_pred : (B, N, D_vit) — predictor output ẑ_t^{pred}
+        z_hat : (B, C_vae, H_vae, W_vae)
         Returns μ_prior, log_var_prior — both (B, D_jscc)
         """
-        h       = self.shared(z_pred.mean(dim=1))       # (B, d_pred)
+        h       = z_hat.mean(dim=(-2, -1))
+        h       = self.shared(h)
         mu      = self.fc_mu(h)
         log_var = self.fc_log_var(h).clamp(-10.0, 2.0)
         return mu, log_var
 
 
 # ========================================================================== #
-#  3. JSCC DECODER  (cross-attention)                                         #
+#  3. REFINEMENT DIFFUSION  (second diffusion — Wyner-Ziv JSCC decoder)      #
 # ========================================================================== #
 
-class JsccDecoder(nn.Module):
-    """
-    Wyner-Ziv decoder: (ŝ_t, ẑ_t^{pred}) → token_hat (B, N, D_vit)
+class _TimestepEmbedding(nn.Module):
+    """Sinusoidal timestep embedding → 2-layer SiLU MLP → d_model."""
 
-    Each predicted patch token (query) attends to the received channel
-    signal (key/value) to compute a per-token correction.  Residual
-    connection adds the correction to the predictor's estimate.
-
-    Architecture:
-        q   = token_proj(ẑ_t^{pred})          (B, N, d_pred)
-        kv  = signal_proj(ŝ_t).unsqueeze(1)   (B, 1, d_pred)
-        q'  = q + CrossAttn(norm(q), kv, kv)
-        q'' = q' + FFN(norm(q'))
-        token_hat = ẑ_t^{pred} + out_proj(q'')
-    """
-
-    def __init__(self, D_jscc: int, D_vit: int, d_pred: int, n_heads: int = 8):
+    def __init__(self, d_model: int):
         super().__init__()
-        self.token_proj  = nn.Linear(D_vit,  d_pred)
-        self.signal_proj = nn.Linear(D_jscc, d_pred)
-        self.norm1       = nn.LayerNorm(d_pred)
-        self.cross_attn  = nn.MultiheadAttention(
-            d_pred, n_heads, dropout=0.0, batch_first=True
+        self.d_model = d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.SiLU(),
+            nn.Linear(d_model * 4, d_model),
         )
-        self.norm2       = nn.LayerNorm(d_pred)
-        self.ffn         = nn.Sequential(
-            nn.Linear(d_pred, d_pred * 4),
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) long → (B, d_model)"""
+        half  = self.d_model // 2
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(half, device=t.device, dtype=torch.float32) / half
+        )
+        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)   # (B, half)
+        emb  = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, d_model)
+        return self.mlp(emb)
+
+
+class _RefineBlock(nn.Module):
+    """Pre-LN self-attention + cross-attention (on s̃_t) + FFN block."""
+
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1      = nn.LayerNorm(d_model)
+        self.self_attn  = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
+        self.norm2      = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
+        self.norm3      = nn.LayerNorm(d_model)
+        self.ffn        = nn.Sequential(
+            nn.Linear(d_model, int(d_model * mlp_ratio)),
             nn.GELU(),
-            nn.Linear(d_pred * 4, d_pred),
+            nn.Linear(int(d_model * mlp_ratio), d_model),
         )
-        self.out_proj    = nn.Linear(d_pred, D_vit)
 
-    def forward(
-        self, s_hat: torch.Tensor, z_pred: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
-        s_hat  : (B, D_jscc)    received channel signal ŝ_t
-        z_pred : (B, N, D_vit)  predictor side information ẑ_t^{pred}
-        → token_hat : (B, N, D_vit)
+        x    : (B, N, d_model)  — patch tokens
+        cond : (B, 1, d_model)  — received signal conditioning token
         """
-        # Project tokens and signal to working dim
-        q  = self.token_proj(z_pred)                           # (B, N, d_pred)
-        kv = self.signal_proj(s_hat).unsqueeze(1)              # (B, 1, d_pred)
+        xn = self.norm1(x)
+        h, _ = self.self_attn(xn, xn, xn)
+        x = x + h
 
-        # Cross-attention: each token attends to the received signal
-        delta, _ = self.cross_attn(self.norm1(q), kv, kv)
-        q = q + delta                                          # residual
+        xn = self.norm2(x)
+        h, _ = self.cross_attn(xn, cond, cond)
+        x = x + h
 
-        # FFN
-        q = q + self.ffn(self.norm2(q))
-
-        # Project correction back to D_vit and add to predictor estimate
-        return z_pred + self.out_proj(q)                       # (B, N, D_vit)
-
-
-# ========================================================================== #
-#  PREDICTOR HELPERS (V-JEPA 2 style)                                        #
-# ========================================================================== #
-
-def _drop_path(
-    x: torch.Tensor, drop_prob: float, training: bool
-) -> torch.Tensor:
-    if drop_prob == 0.0 or not training:
-        return x
-    keep_prob = 1.0 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    mask  = torch.rand(shape, dtype=x.dtype, device=x.device).add_(keep_prob).floor_()
-    return x.div(keep_prob) * mask
-
-
-class _DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _drop_path(x, self.drop_prob, self.training)
-
-
-def _rope_rotate(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-    """Factored RoPE rotation matching V-JEPA 2's rotate_queries_or_keys.
-    x   : (B, n_heads, N, D_chunk)
-    pos : broadcastable to (B, n_heads, N)  — integer position indices
-    """
-    D     = x.shape[-1]
-    omega = 1.0 / (10000.0 ** (torch.arange(D // 2, dtype=x.dtype, device=x.device) / (D / 2.0)))
-    freq  = pos.unsqueeze(-1) * omega              # (..., N, D/2)
-    cos      = freq.cos().repeat(1, 1, 1, 2)           # (..., N, D) — half-split convention
-    sin      = freq.sin().repeat(1, 1, 1, 2)
-    x1, x2  = x.chunk(2, dim=-1)                      # first half, second half
-    rot      = torch.cat((-x2, x1), dim=-1)
-    return x * cos + rot * sin
-
-
-class _PredMLP(nn.Module):
-    def __init__(self, hidden_size: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        inner    = int(hidden_size * mlp_ratio)
-        self.fc1 = nn.Linear(hidden_size, inner)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(inner, hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
-
-
-class _PredAttention(nn.Module):
-    """Self-attention with factored 3D RoPE.
-    Position IDs are computed externally by Predictor and passed in,
-    so this module is agnostic to clip length / sequence layout.
-    Uses F.scaled_dot_product_attention for memory efficiency (Flash Attention
-    when available, otherwise math kernel).
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        n_heads:     int,
-        qkv_bias:    bool  = True,
-        attn_drop:   float = 0.0,
-    ):
-        super().__init__()
-        assert hidden_size % n_heads == 0
-        self.n_heads   = n_heads
-        self.head_dim  = hidden_size // n_heads
-        self.scale     = self.head_dim ** -0.5
-        self.attn_drop = attn_drop
-
-        self.q    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.k    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.v    = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.proj = nn.Linear(hidden_size, hidden_size)
-
-        self.d_dim = 2 * ((self.head_dim // 3) // 2)
-        self.h_dim = 2 * ((self.head_dim // 3) // 2)
-        self.w_dim = 2 * ((self.head_dim // 3) // 2)
-
-    def _apply_rope(self, qk: torch.Tensor, pos_ids: tuple) -> torch.Tensor:
-        f_ids, h_ids, w_ids = pos_ids
-        s1 = self.d_dim
-        s2 = s1 + self.h_dim
-        s3 = s2 + self.w_dim
-        out = [
-            _rope_rotate(qk[..., :s1], f_ids),
-            _rope_rotate(qk[..., s1:s2], h_ids),
-            _rope_rotate(qk[..., s2:s3], w_ids),
-        ]
-        if s3 < self.head_dim:
-            out.append(qk[..., s3:])
-        return torch.cat(out, dim=-1)
-
-    def forward(
-        self,
-        x:         torch.Tensor,
-        pos_ids:   tuple,
-        attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        x         : (B, N, C)
-        pos_ids   : (f_ids, h_ids, w_ids), each (1, 1, N) — from Predictor
-        attn_mask : (1, 1, N, N) bool, True=attend — None for full attention
-        """
-        B, N, C = x.shape
-        def to_heads(lin):
-            return lin(x).view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
-        q, k, v = to_heads(self.q), to_heads(self.k), to_heads(self.v)
-
-        q = self._apply_rope(q, pos_ids)
-        k = self._apply_rope(k, pos_ids)
-
-        dropout_p = self.attn_drop if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask  = attn_mask,
-            dropout_p  = dropout_p,
-            scale      = self.scale,
-        )
-        out = out.transpose(1, 2).reshape(B, N, C)
-        return self.proj(out)
-
-
-class _PredBlock(nn.Module):
-    """V-JEPA 2 transformer block: Pre-LN, 3D-RoPE self-attention, drop-path."""
-
-    def __init__(
-        self,
-        hidden_size:    int,
-        n_heads:        int,
-        mlp_ratio:      float = 4.0,
-        drop_path_rate: float = 0.0,
-        qkv_bias:       bool  = True,
-        attn_drop:      float = 0.0,
-    ):
-        super().__init__()
-        self.norm1     = nn.LayerNorm(hidden_size)
-        self.attn      = _PredAttention(hidden_size, n_heads, qkv_bias, attn_drop)
-        self.drop_path = _DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        self.norm2     = nn.LayerNorm(hidden_size)
-        self.mlp       = _PredMLP(hidden_size, mlp_ratio)
-
-    def forward(
-        self,
-        x:         torch.Tensor,
-        pos_ids:   tuple,
-        attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = x + self.drop_path(self.attn(self.norm1(x), pos_ids, attn_mask))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = x + self.ffn(self.norm3(x))
         return x
 
 
-# ========================================================================== #
-#  4. PREDICTOR  (V-JEPA 2 — narrow transformer with factored 3D RoPE)       #
-# ========================================================================== #
-
-class Predictor(nn.Module):
+class RefinementDiffusion(nn.Module):
     """
-    V-JEPA 2-AC predictor — robotics paper spec (~300M, 24L, 16H, 1024d).
+    Second diffusion process: (ẑ_t, s̃_t) → z̃_t  — true SDEdit formulation.
 
-    Training uses multi-frame clips with block-causal attention (paper §3.1):
-      - forward_clip()   : teacher-forcing over T frames (paper Eq. 2)
-      - rollout_2step()  : 2-step autoregressive prediction (paper Eq. 3)
+    Training: DDPM x₀-prediction on z_t (true data distribution).
+        t'' ~ Uniform[1, noise_level]
+        x_{t''} = sqrt(ᾱ_{t''}) z_t + sqrt(1-ᾱ_{t''}) ε    ← noise TARGET, not ẑ_t
+        z̃_t     = denoiser(x_{t''}, t'', ẑ_t, s̃_t)          ← both ẑ_t and s̃_t condition
+        L        = MSE(z̃_t, z_t)
 
-    Block-causal attention: frame k attends to frames 1..k only.
-    RoPE: full 3D (frame × height × width) for patch tokens;
-          temporal-only (h=w=0) for action/pose tokens — paper §3.1.
+    Inference: SDEdit — partially noise ẑ_t, DDIM denoise conditioned on ẑ_t and s̃_t.
+        x_{t''} = sqrt(ᾱ_{t''}) ẑ_t + sqrt(1-ᾱ_{t''}) ε    ← start from noised ẑ_t
+        DDIM denoise from t'' → 0, conditioned on (ẑ_t, s̃_t)
 
-    Single-frame forward() is kept for Stage 2 (JSCC) where the predictor
-    provides side information one step at a time.
-
-    Architecture per frame block:
-        [a_tok, (pose_tok,) patch_0 .. patch_{N-1}]
-    Position IDs computed in Predictor and passed to each _PredBlock.
+    The model learns p(z_t | ẑ_t, s̃_t). At inference, starting from noised ẑ_t
+    is a good initialisation since ẑ_t ≈ z_t; the model corrects the residual
+    guided by s̃_t. This is the correct SDEdit setup (Song et al. 2021).
     """
 
     def __init__(
         self,
-        D_vit:          int,
-        action_dim:     int,
-        d_pred:         int   = 1024,
-        n_layers:       int   = 24,
-        n_heads:        int   = 16,
-        grid_size:      int   = 16,
-        grid_depth:     int   = 1,
-        mlp_ratio:      float = 4.0,
-        drop_path_rate: float = 0.0,
-        pose_dim:       int   = 0,
+        D_jscc:   int,
+        C_vae:    int   = 4,
+        H_vae:    int   = 28,
+        W_vae:    int   = 28,
+        d_model:  int   = 256,
+        n_heads:  int   = 8,
+        n_layers: int   = 4,
     ):
         super().__init__()
-        self.action_dim = action_dim
-        self.pose_dim   = pose_dim
-        self.grid_size  = grid_size
+        self.C_vae = C_vae
+        self.H_vae = H_vae
+        self.W_vae = W_vae
 
-        self.input_proj   = nn.Linear(D_vit,      d_pred)
-        self.action_embed = nn.Linear(action_dim, d_pred)
-        self.action_scale = nn.Parameter(torch.tensor(3.0))
-        if pose_dim > 0:
-            self.pose_embed = nn.Linear(pose_dim, d_pred)
+        # DDPM noise schedule (scaled-linear, matching SD/SVD)
+        betas            = torch.linspace(0.00085 ** 0.5, 0.012 ** 0.5, 1000) ** 2
+        alphas_cumprod   = (1.0 - betas).cumprod(dim=0)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)  # (1000,)
 
-        dp_rates = [drop_path_rate * i / max(n_layers - 1, 1) for i in range(n_layers)]
-        self.blocks = nn.ModuleList([
-            _PredBlock(d_pred, n_heads, mlp_ratio, dp_rates[i])
-            for i in range(n_layers)
-        ])
-        self.norm        = nn.LayerNorm(d_pred)
-        self.output_proj = nn.Linear(d_pred, D_vit)
+        # Noisy-input patch projection
+        self.patch_proj  = nn.Linear(C_vae, d_model)
+        # ẑ_t patch projection (separate weights — different semantic role)
+        self.zhat_proj   = nn.Linear(C_vae, d_model)
+        # Received signal projection → single conditioning token
+        self.sig_proj    = nn.Linear(D_jscc, d_model)
+        self.t_embed     = _TimestepEmbedding(d_model)
+        self.t_proj      = nn.Linear(d_model, d_model)
 
-    # ------------------------------------------------------------------ #
-    #  Position IDs and causal mask (computed once per forward call)      #
-    # ------------------------------------------------------------------ #
+        # 2D positional embedding shared by noisy patches and ẑ_t patches (lazy init)
+        self.register_buffer("pos_embed", torch.zeros(1, H_vae * W_vae, d_model), persistent=False)
+        self._pos_init   = False
 
-    @torch.no_grad()
-    def _pos_ids(self, n_cond: int, N: int, T: int, device: torch.device):
-        """
-        Returns (f_ids, h_ids, w_ids), each (1, 1, T*n_per_frame).
-        Conditioning tokens (action, pose): temporal position k, h=w=0.
-        Patch tokens: full 3D position (frame k, row, col).
-        """
-        patch_idx = torch.arange(N, device=device)
-        ph = patch_idx // self.grid_size
-        pw = patch_idx % self.grid_size
-        f_list, h_list, w_list = [], [], []
-        for k in range(T):
-            f_list += [torch.full((n_cond,), k, device=device), torch.full((N,), k, device=device)]
-            h_list += [torch.zeros(n_cond, device=device, dtype=ph.dtype), ph]
-            w_list += [torch.zeros(n_cond, device=device, dtype=pw.dtype), pw]
-        f = torch.cat(f_list).view(1, 1, -1)
-        h = torch.cat(h_list).view(1, 1, -1)
-        w = torch.cat(w_list).view(1, 1, -1)
-        return f, h, w
+        # Transformer denoiser
+        self.blocks   = nn.ModuleList([_RefineBlock(d_model, n_heads) for _ in range(n_layers)])
+        self.norm     = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, C_vae)
 
-    @torch.no_grad()
-    def _causal_mask(self, T: int, n_per_frame: int, device: torch.device):
-        """
-        Block-causal bool mask (1, 1, N_total, N_total).
-        True = attend: frame k attends to all tokens in frames 0..k.
-        """
-        N_total  = T * n_per_frame
-        frame_of = torch.arange(N_total, device=device) // n_per_frame
-        mask = frame_of.unsqueeze(1) >= frame_of.unsqueeze(0)   # (N, N)
-        return mask.unsqueeze(0).unsqueeze(0)                    # (1, 1, N, N)
+    def _init_pos(self, device, dtype):
+        if not self._pos_init:
+            pe = _make_2d_sincos_pos(self.H_vae, self.W_vae, self.pos_embed.shape[-1], device, dtype)
+            self.pos_embed = pe.unsqueeze(0)
+            self._pos_init = True
 
-    # ------------------------------------------------------------------ #
-    #  Sequence builder                                                    #
-    # ------------------------------------------------------------------ #
-
-    def _build_seq(
+    def _denoise_x0(
         self,
-        tokens_T:  torch.Tensor,
-        actions_T: torch.Tensor,
-        poses_T:   torch.Tensor | None,
-    ):
-        """
-        tokens_T  : (B, T, N, D_vit)
-        actions_T : (B, T, action_dim)  — a_T is zeros (dummy for last frame)
-        poses_T   : (B, T, pose_dim) optional
-        Returns: x (B, T*n_per_frame, d_pred), n_cond, n_per_frame
-        """
-        B, T, N, _ = tokens_T.shape
-        x_p = self.input_proj(tokens_T.reshape(B * T, N, -1)).reshape(B, T, N, -1)
-        a   = self.action_embed(actions_T)                           # (B, T, d_pred)
-
-        # Broadcast action into every patch token so all 8 layers see the
-        # action signal directly, rather than relying on attention to propagate
-        # it from a single prepended token across 256 patches.
-        x_p = x_p + a.unsqueeze(2) * self.action_scale              # (B, T, N, d_pred)
-
-        if self.pose_dim > 0 and poses_T is not None:
-            p      = self.pose_embed(poses_T)                        # (B, T, d_pred)
-            blocks = torch.cat([a.unsqueeze(2), p.unsqueeze(2), x_p], dim=2)
-            n_cond = 2
-        else:
-            blocks = torch.cat([a.unsqueeze(2), x_p], dim=2)
-            n_cond = 1
-
-        n_per_frame = n_cond + N
-        return blocks.reshape(B, T * n_per_frame, -1), n_cond, n_per_frame
-
-    # ------------------------------------------------------------------ #
-    #  Forward passes                                                      #
-    # ------------------------------------------------------------------ #
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        a:      torch.Tensor,
-        pose:   torch.Tensor | None = None,
+        x_noisy: torch.Tensor,   # (B, C, H, W) — noisy input
+        t:       torch.Tensor,   # (B,) long — timestep indices
+        z_hat:   torch.Tensor,   # (B, C, H, W) — Ctrl-World prediction ẑ_t
+        s_tilde: torch.Tensor,   # (B, D_jscc)  — received channel signal
     ) -> torch.Tensor:
+        """Predict clean x_0 given x_{t''}, t'', ẑ_t, and s̃_t.
+
+        Conditioning sequence fed to cross-attention:
+            [ẑ_t spatial tokens (N) | s̃_t token (1)]  →  (B, N+1, d_model)
+
+        ẑ_t tokens provide spatial prior; s̃_t token carries channel correction.
         """
-        Single-frame prediction — used in Stage 2 (JSCC side information).
-        tokens : (B, N, D_vit)
-        a      : (B, action_dim)
-        → z_pred : (B, N, D_vit)
-        """
-        B, N, _ = tokens.shape
-        x_p  = self.input_proj(tokens)
-        cond = [self.action_embed(a).unsqueeze(1)]
-        if self.pose_dim > 0 and pose is not None:
-            cond.append(self.pose_embed(pose).unsqueeze(1))
-        n_cond = len(cond)
-        x = torch.cat(cond + [x_p], dim=1)                          # (B, n_cond+N, d_pred)
+        B, C, H, W = x_noisy.shape
+        N = H * W
+        self._init_pos(x_noisy.device, x_noisy.dtype)
+        pos = self.pos_embed.to(x_noisy.dtype)                            # (1, N, d)
 
-        pos_ids = self._pos_ids(n_cond, N, T=1, device=x.device)
-        for blk in self.blocks:
-            x = blk(x, pos_ids)                                      # no causal mask: T=1
-        x = self.norm(x)[:, n_cond:]                                 # (B, N, d_pred)
-        return self.output_proj(x)                                    # (B, N, D_vit) — γΔ
+        # Noisy input tokens
+        patches = x_noisy.reshape(B, C, N).transpose(1, 2)               # (B, N, C)
+        x = self.patch_proj(patches) + pos                                # (B, N, d)
 
-    def forward_clip(
-        self,
-        tokens:  torch.Tensor,
-        actions: torch.Tensor,
-        poses:   torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Multi-frame teacher-forcing forward (paper Eq. 2).
+        # Timestep conditioning: broadcast to each token
+        t_emb = self.t_proj(self.t_embed(t)).unsqueeze(1)                 # (B, 1, d)
+        x     = x + t_emb
 
-        tokens  : (B, T, N, D_vit)
-        actions : (B, T-1, action_dim)  — a_1 .. a_{T-1}
-        poses   : (B, T, pose_dim) optional
-
-        Returns ẑ_{2..T} : (B, T-1, N, D_vit)
-        """
-        B, T, N, D_vit = tokens.shape
-
-        a_pad     = tokens.new_zeros(B, 1, self.action_dim)
-        actions_T = torch.cat([actions, a_pad], dim=1)               # (B, T, action_dim)
-
-        x, n_cond, n_per_frame = self._build_seq(tokens, actions_T, poses)
-        pos_ids    = self._pos_ids(n_cond, N, T, x.device)
-        causal_msk = self._causal_mask(T, n_per_frame, x.device)
+        # Conditioning sequence: ẑ_t spatial tokens + s̃_t global token
+        zhat_patches = z_hat.reshape(B, C, N).transpose(1, 2)            # (B, N, C)
+        zhat_tokens  = self.zhat_proj(zhat_patches) + pos                 # (B, N, d)
+        sig_token    = self.sig_proj(s_tilde).unsqueeze(1)                # (B, 1, d)
+        cond         = torch.cat([zhat_tokens, sig_token], dim=1)         # (B, N+1, d)
 
         for blk in self.blocks:
-            x = blk(x, pos_ids, causal_msk)
+            x = blk(x, cond)
+        x = self.norm(x)
 
-        x = self.norm(x).reshape(B, T, n_per_frame, -1)
-        patch_out = x[:, :, n_cond:, :]                              # (B, T, N, d_pred)
-        preds     = self.output_proj(patch_out)                      # (B, T, N, D_vit) — γΔ
-        return preds[:, :-1]                                         # (B, T-1, N, D_vit)
+        pred = self.out_proj(x)                                            # (B, N, C)
+        return pred.transpose(1, 2).reshape(B, C, H, W)                   # (B, C, H, W)
 
-    def rollout_2step(
+    def forward_ddpm(
         self,
-        tokens:  torch.Tensor,
-        actions: torch.Tensor,
-        poses:   torch.Tensor | None = None,
-        gamma:   float = 1.0,
+        z_t:         torch.Tensor,   # (B, C, H, W) — ground truth target
+        z_hat:       torch.Tensor,   # (B, C, H, W) — Ctrl-World side info ẑ_t
+        s_tilde:     torch.Tensor,   # (B, D_jscc)  — received signal s̃_t
+        noise_level: int = 250,
     ) -> torch.Tensor:
         """
-        2-step autoregressive rollout.
-        Model outputs γΔ; divide by gamma to recover Δ and reconstruct absolute tokens.
+        True SDEdit training loss: noise z_t (not ẑ_t), condition on (ẑ_t, s̃_t).
 
-        tokens  : (B, T≥3, N, D_vit)
-        actions : (B, 2, action_dim)
-        Returns ẑ_3 : (B, N, D_vit)  — absolute token
+        x_{t''} = sqrt(ᾱ_{t''}) z_t + sqrt(1-ᾱ_{t''}) ε,   t'' ~ U[1, noise_level]
+        L        = MSE( denoiser(x_{t''}, t'', ẑ_t, s̃_t),  z_t )
         """
-        # Step 1 — predict γΔ_2, reconstruct ẑ_2
-        delta_2 = self.forward_clip(
-            tokens[:, :2],
-            actions[:, :1],
-            poses[:, :2] if poses is not None else None,
-        )[:, 0]                                                      # (B, N, D_vit)
-        z_hat_2 = tokens[:, 0] + delta_2 / gamma
+        B  = z_t.shape[0]
+        t  = torch.randint(1, noise_level + 1, (B,), device=z_t.device)
+        ab = self.alphas_cumprod[t].view(B, 1, 1, 1).float()
+        eps     = torch.randn_like(z_t)
+        x_noisy = ab.sqrt() * z_t + (1.0 - ab).sqrt() * eps              # noise z_t
+        pred_x0 = self._denoise_x0(x_noisy, t, z_hat, s_tilde)
+        return F.mse_loss(pred_x0, z_t.detach())
 
-        # Step 2 — predict γΔ_3, reconstruct ẑ_3
-        dummy = torch.zeros_like(tokens[:, :1])
-        tokens_ar = torch.cat(
-            [tokens[:, :1], z_hat_2.unsqueeze(1), dummy], dim=1
-        )                                                            # (B, 3, N, D_vit)
-        delta_3 = self.forward_clip(
-            tokens_ar,
-            actions[:, :2],
-            poses[:, :3] if poses is not None else None,
-        )[:, 1]                                                      # (B, N, D_vit)
-        return z_hat_2 + delta_3 / gamma                             # (B, N, D_vit) — ẑ_3
-
-    def rollout_3step(
+    @torch.no_grad()
+    def sdedit_refine(
         self,
-        tokens:  torch.Tensor,
-        actions: torch.Tensor,
-        poses:   torch.Tensor | None = None,
-        gamma:   float = 1.0,
+        z_hat:       torch.Tensor,   # (B, C, H, W) — ẑ_t from Ctrl-World
+        s_tilde:     torch.Tensor,   # (B, D_jscc)  — s̃_t received signal
+        noise_level: int = 250,      # SDEdit noise level t'' (must satisfy t'' < t')
+        n_steps:     int = 10,       # DDIM denoising steps
     ) -> torch.Tensor:
         """
-        3-step autoregressive rollout.
+        SDEdit inference: partially noise ẑ_t at level t'', then DDIM denoise.
 
-        tokens  : (B, T≥4, N, D_vit)
-        actions : (B, 3, action_dim)    — a_1, a_2, a_3
-        poses   : (B, 4, pose_dim) optional
-        gamma   : scaling factor used during training (model outputs γΔ)
-
-        Step 1: ẑ_2 = z_1 + pred/γ
-        Step 2: ẑ_3 = ẑ_2 + pred/γ
-        Step 3: predict γΔ_4  (raw model output, same space as L_tf)
-        Returns (ẑ_3, γΔ_4) : absolute token before last step, and raw final prediction
+        The model learned p(z_t | ẑ_t, s̃_t) so ẑ_t conditions every step,
+        while s̃_t steers the output toward the true z_t.
+        At high SNR, s̃_t cleanly corrects toward z_t.
+        At low SNR, output falls back toward ẑ_t (graceful degradation).
         """
-        dummy = torch.zeros_like(tokens[:, :1])
+        B       = z_hat.shape[0]
+        t_start = min(noise_level, len(self.alphas_cumprod) - 1)
 
-        # Step 1 — predict γΔ_2, reconstruct ẑ_2
-        delta_2 = self.forward_clip(
-            tokens[:, :2],
-            actions[:, :1],
-            poses[:, :2] if poses is not None else None,
-        )[:, 0]                                                      # (B, N, D_vit)
-        z_hat_2 = tokens[:, 0] + delta_2 / gamma
+        # SDEdit initialisation: noise ẑ_t (good prior, close to z_t)
+        alpha_s = self.alphas_cumprod[t_start].float()
+        eps     = torch.randn_like(z_hat)
+        x       = alpha_s.sqrt() * z_hat + (1.0 - alpha_s).sqrt() * eps
 
-        # Step 2 — predict γΔ_3, reconstruct ẑ_3
-        tokens_ar2 = torch.cat(
-            [tokens[:, :1], z_hat_2.unsqueeze(1), dummy], dim=1
-        )                                                            # (B, 3, N, D_vit)
-        delta_3 = self.forward_clip(
-            tokens_ar2,
-            actions[:, :2],
-            poses[:, :3] if poses is not None else None,
-        )[:, 1]                                                      # (B, N, D_vit)
-        z_hat_3 = z_hat_2 + delta_3 / gamma
+        # DDIM timestep schedule
+        step_size = max(1, t_start // n_steps)
+        timesteps = list(range(t_start, 0, -step_size))
 
-        # Step 3 — predict γΔ_4, reconstruct ẑ_4
-        tokens_ar3 = torch.cat(
-            [tokens[:, :1], z_hat_2.unsqueeze(1),
-             z_hat_3.unsqueeze(1), dummy], dim=1
-        )                                                            # (B, 4, N, D_vit)
-        delta_4 = self.forward_clip(
-            tokens_ar3,
-            actions[:, :3],
-            poses[:, :4] if poses is not None else None,
-        )[:, 2]                                                      # (B, N, D_vit)
-        return z_hat_3, delta_4                                      # ẑ_3, γΔ_4
+        for i, t_cur in enumerate(timesteps):
+            t_batch = torch.full((B,), t_cur, device=z_hat.device, dtype=torch.long)
+            pred_x0 = self._denoise_x0(x, t_batch, z_hat, s_tilde)      # ẑ_t conditions every step
+
+            t_next     = timesteps[i + 1] if i + 1 < len(timesteps) else 0
+            alpha_cur  = self.alphas_cumprod[t_cur].float()
+            alpha_next = self.alphas_cumprod[t_next].float() if t_next > 0 \
+                         else torch.tensor(1.0, device=x.device)
+
+            # DDIM deterministic update
+            eps_pred = (x - alpha_cur.sqrt() * pred_x0) / (1.0 - alpha_cur).sqrt().clamp(min=1e-8)
+            x        = alpha_next.sqrt() * pred_x0 + (1.0 - alpha_next).sqrt() * eps_pred
+
+        return x   # ≈ pred_x0 at the last step
 
 
 # ========================================================================== #
-#  5. RAYLEIGH CHANNEL                                                        #
+#  4. RAYLEIGH CHANNEL                                                        #
 # ========================================================================== #
 
 class RayleighChannel(nn.Module):
     """
     Flat Rayleigh fading channel: y = h·x + n,  h, n ~ CN(0,1)
 
-    Signal power is estimated per-batch. Coherent equalization divides by |h|².
+    Coherent equalization divides by |h|² after reception.
     """
 
     def __init__(self, snr_db: float = 10.0):
@@ -634,11 +374,10 @@ class RayleighChannel(nn.Module):
 
     @property
     def sigma_n_sq(self) -> float:
-        """Noise variance at unit signal power — used in the KL rate loss."""
         return 1.0 / (10.0 ** (self.snr_db / 10.0))
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        """s: (B, D_jscc) → ŝ: (B, D_jscc)"""
+        """s: (B, D_jscc) → s̃: (B, D_jscc)"""
         B         = s.size(0)
         sig_power = s.pow(2).mean(dim=-1, keepdim=True).clamp(min=1e-8)
         snr_lin   = 10.0 ** (self.snr_db / 10.0)
@@ -657,45 +396,39 @@ class RayleighChannel(nn.Module):
 
 
 # ========================================================================== #
-#  6. FULL SYSTEM (container)                                                 #
+#  5. FULL SYSTEM (Stage-2 JSCC container)                                   #
 # ========================================================================== #
 
 class SemComSystem(nn.Module):
     """
-    Container for all trainable SemCom modules.
+    Container for all Stage-2 trainable JSCC modules.
 
-    ViT Encoder, OpenVLA Projector, and LLM are NOT stored here.
+    Does NOT include Ctrl-World (first diffusion) — that lives in
+    ctrl_world_wrapper.py and is loaded separately by Stage2Trainer.
 
-    Training stages:
-      Stage 2: predictor  (ViT frozen)
-      Stage 3: jscc_encoder, side_info_encoder, jscc_decoder, channel
-               (predictor frozen)
+    Stage 1: only Ctrl-World action encoder is trained (not this system).
+    Stage 2: jscc_encoder, side_info_encoder, refinement_diffusion are trained;
+             channel is used but has no parameters.
     """
 
     def __init__(self, config: dict):
         super().__init__()
-        D_vit       = config["D_vit"]
-        D_jscc      = config["D_jscc"]
-        d_pred      = config["d_pred"]                       # predictor hidden dim (1024)
-        jscc_d_pred = config.get("jscc_d_pred", 384)        # JSCC MLP working dim
-        action_dim  = config["action_dim"]
-        pose_dim    = config.get("pose_dim",       0)
-        grid_size   = config.get("grid_size",     14)
-        grid_depth  = config.get("grid_depth",     1)
-        n_layers    = config.get("pred_n_layers", 24)
-        n_heads     = config.get("pred_n_heads",  16)
-        mlp_ratio   = config.get("pred_mlp_ratio", 4.0)
-        drop_path   = config.get("pred_drop_path", 0.0)
+        C_vae    = config.get("C_vae",    4)
+        H_vae    = config.get("H_vae",   28)
+        W_vae    = config.get("W_vae",   28)
+        D_jscc   = config["D_jscc"]
+        d_hidden = config.get("jscc_d_hidden", 512)
+        snr_db   = config["snr_db"]
+        refine_d = config.get("refine_d_model",  256)
+        refine_h = config.get("refine_n_heads",    8)
+        refine_l = config.get("refine_n_layers",   4)
 
-        self.jscc_encoder      = JsccEncoder(D_vit, D_jscc, jscc_d_pred)
-        self.side_info_encoder = SideInfoEncoder(D_vit, D_jscc, jscc_d_pred)
-        self.jscc_decoder      = JsccDecoder(D_jscc, D_vit, jscc_d_pred)
-        self.predictor         = Predictor(D_vit, action_dim, d_pred,
-                                           n_layers=n_layers, n_heads=n_heads,
-                                           grid_size=grid_size, grid_depth=grid_depth,
-                                           mlp_ratio=mlp_ratio, drop_path_rate=drop_path,
-                                           pose_dim=pose_dim)
-        self.channel           = RayleighChannel(config["snr_db"])
+        self.jscc_encoder         = JsccEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden)
+        self.side_info_encoder    = SideInfoEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden)
+        self.refinement_diffusion = RefinementDiffusion(
+            D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l
+        )
+        self.channel              = RayleighChannel(snr_db)
 
     @staticmethod
     def rate_loss(
@@ -706,10 +439,10 @@ class SemComSystem(nn.Module):
         snr_db:        float,
     ) -> torch.Tensor:
         """
-        KL( q(ŝ_t|tokens_t) || p(ŝ_t|ẑ_t^{pred}) )
+        KL( q(s_t | z_t) || p(s_t | ẑ_t) )
 
-        q: N(μ_enc,   σ²_enc + σ²_n)   σ²_n = 1/snr_lin, explicit
-        p: N(μ_prior, σ²_prior)         σ²_n absorbed into learned σ²_prior
+        q : N(μ_enc,   σ²_enc + σ²_n)   where σ²_n = 1/snr_lin (physical channel noise)
+        p : N(μ_prior, σ²_prior)         σ²_n absorbed into learned σ²_prior
         """
         sigma_n_sq = 1.0 / (10.0 ** (snr_db / 10.0))
         q_var      = log_var_enc.exp() + sigma_n_sq
