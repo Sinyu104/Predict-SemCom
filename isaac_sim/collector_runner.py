@@ -347,6 +347,8 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
         act_buf  = []
         success  = False
 
+        for _ in range(5):                        # flush post-reset render before first obs
+            scene.step()
         obs_t       = scene.get_obs()             # dict {cam_id: (H,W,3)}
         primary_cam = min(obs_t.keys())           # lowest cam id used for VLA
 

@@ -173,6 +173,14 @@ class _FrankaBase(BaseScene):
             annot.attach([rp])
             self._annots[cam_id]          = annot
             self._render_products[cam_id] = rp
+
+        print("[Isaac Sim] Warming up annotators...")
+        for _ in range(100):
+            rep.orchestrator.step(rt_subframes=1, pause_timeline=True)
+        # Force GPU→CPU pipeline initialisation for every annotator.
+        # Without this first read, subsequent get_data() calls may return black frames.
+        for annot in self._annots.values():
+            _ = np.asarray(annot.get_data())
         self._obs_checked = False
 
         self.controller = RMPFlowController(
@@ -194,7 +202,6 @@ class _FrankaBase(BaseScene):
             raw = annot.get_data()
             if not self._obs_checked:
                 self._obs_checked = True
-                print(f"[Camera {cam_id}] annotator raw type: {type(raw)}")
             data = raw.get("data", None) if isinstance(raw, dict) else raw
             if data is None or (hasattr(data, "size") and data.size == 0):
                 result[cam_id] = np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
@@ -477,7 +484,7 @@ class PickAndPlaceScene(_FrankaBase):
                 cube.set_linear_velocity(np.zeros(3))
                 cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(10):
+        for _ in range(50):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
         self.get_obs()  # flush stale frame
 
@@ -584,7 +591,7 @@ class StackScene(_FrankaBase):
                 cube.set_linear_velocity(np.zeros(3))
                 cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(10):
+        for _ in range(50):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
         self.get_obs()
 
@@ -683,7 +690,7 @@ class SortScene(_FrankaBase):
                 cube.set_linear_velocity(np.zeros(3))
                 cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(10):
+        for _ in range(50):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
         self.get_obs()
 
