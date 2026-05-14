@@ -115,35 +115,15 @@ def build_policy(args, config: dict, vae):
         )
 
     backbone = config.get("policy_backbone", "stub")
-    if backbone == "openvla":
-        from openvla_agent import OpenVLAAgent
-        import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "server"))
-        try:
-            from vla_server import _resolve_model_dir
-            ft_dir     = config.get("policy_finetune_dir", "")
-            model_name = _resolve_model_dir(ft_dir) if (ft_dir and os.path.isdir(ft_dir)) \
-                         else config["policy_model_name"]
-        except ImportError:
-            model_name = config["policy_model_name"]
-
-        vla_agent = OpenVLAAgent(
+    if backbone == "lerobot_pi0fast":
+        from policy_agent import LerobotPi0FastAgent
+        return LerobotPi0FastAgent(
+            model_path  = config.get("pi0fast_model_path", "physical-intelligence/pi0-fast"),
             instruction = config.get("policy_instruction", ""),
-            unnorm_key  = config.get("policy_unnorm_key", "bridge_orig"),
-            model_name  = model_name,
-            device      = config.get("policy_device_map", "auto"),
-            quantize    = config.get("policy_quantize", False),
-        )
-        from policy_agent import Pi0FastPolicy
-        return Pi0FastPolicy(
-            chunk_size  = config.get("action_chunk_size", 16),
-            action_dim  = config["action_dim"],
-            d_model     = config.get("policy_d_model",   512),
-            n_layers    = config.get("policy_n_layers",    4),
-            n_heads     = config.get("policy_n_heads",     8),
-            backbone    = "openvla",
-            vla_agent   = vla_agent,
-            instruction = config.get("policy_instruction", ""),
+            cam1_key    = config.get("pi0fast_cam1_key"),
+            cam2_key    = config.get("pi0fast_cam2_key"),
+            state_dim   = config.get("pi0fast_state_dim", 6),
+            chunk_size  = config.get("pi0fast_chunk_size"),
         )
     else:
         from policy_agent import Pi0FastStub

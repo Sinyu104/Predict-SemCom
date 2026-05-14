@@ -41,6 +41,8 @@ the chunk is predicted in a single forward pass, making inference ~10× faster
 than the full π0 diffusion model while retaining action-chunk benefits.
 """
 
+import sys
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -285,3 +287,174 @@ class Pi0FastStub(nn.Module):
     def lora_parameters(self):                 return []
     def lora_state_dict(self):                 return {}
     def load_lora_state_dict(self, sd):        pass
+
+
+# ========================================================================== #
+#  LerobotPi0FastAgent  (real lerobot PI0Fast model)                         #
+# ========================================================================== #
+
+class LerobotPi0FastAgent(nn.Module):
+    """
+    Wrapper around lerobot's PI0FastPolicy for the VAE-latent SemCom pipeline.
+
+    Takes decoded image x̃_t (B, 3, H, W) in [0, 1] and returns an action
+    chunk (B, chunk_size, action_dim).  Handles batch preparation (language
+    tokenisation, image key routing) internally.
+
+    Robot state is not available from the image-only pipeline, so a zero
+    state vector is used — acceptable for evaluation.
+
+    Parameters
+    ----------
+    model_path    : HuggingFace hub ID or local directory of the pi0-fast
+                    checkpoint (must contain config.json + model.safetensors)
+    instruction   : natural-language task description
+    image_key     : camera key expected by the loaded model config; if None,
+                    the first key in config.image_features is used
+    state_dim     : robot state dimension (zeros are passed; must be ≤ max_state_dim)
+    """
+
+    def __init__(
+        self,
+        model_path:  str,
+        instruction: str = "do the task",
+        cam1_key:    str | None = None,
+        cam2_key:    str | None = None,
+        state_dim:   int = 6,
+        chunk_size:  int | None = None,
+    ):
+        super().__init__()
+        self.model_path  = model_path
+        self.instruction = instruction
+        self._cam1_key   = cam1_key
+        self._cam2_key   = cam2_key
+        self.state_dim   = state_dim
+        self._chunk_size = chunk_size   # None = use model default
+        self._policy     = None
+        self._tokenizer  = None
+        self._lang_ids   = None
+        self._lang_mask  = None
+
+    # ------------------------------------------------------------------ #
+    #  Lazy loader                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _load(self):
+        if self._policy is not None:
+            return
+
+        # lerobot.policies.__init__ imports the broken 'groot' module at
+        # module level; mock it out before any lerobot.policies import.
+        from unittest.mock import MagicMock
+        for _m in [
+            "lerobot.policies.groot",
+            "lerobot.policies.groot.modeling_groot",
+            "lerobot.policies.groot.configuration_groot",
+            "lerobot.policies.groot.groot_n1",
+        ]:
+            sys.modules.setdefault(_m, MagicMock())
+
+        from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy
+        from lerobot.configs.policies import PreTrainedConfig
+        from transformers import AutoTokenizer
+
+        print(f"[LerobotPi0FastAgent] Loading {self.model_path} …")
+        if self._chunk_size is not None:
+            cfg = PreTrainedConfig.from_pretrained(self.model_path)
+            cfg.chunk_size     = self._chunk_size
+            cfg.n_action_steps = self._chunk_size
+            print(f"[LerobotPi0FastAgent] chunk_size overridden to {self._chunk_size}")
+            self._policy = PI0FastPolicy.from_pretrained(self.model_path, config=cfg)
+        else:
+            self._policy = PI0FastPolicy.from_pretrained(self.model_path)
+        self._policy.eval()
+
+        tok_name = getattr(self._policy.config, "text_tokenizer_name",
+                           "google/paligemma-3b-pt-224")
+        print(f"[LerobotPi0FastAgent] Loading tokenizer ({tok_name}) …")
+        self._tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        self._cache_lang_tokens()
+
+        # Auto-detect camera keys from model config if not provided
+        cfg_keys = list(getattr(self._policy.config, "image_features", {}).keys())
+        if self._cam1_key is None:
+            self._cam1_key = cfg_keys[0] if cfg_keys else "observation.images.base_0_rgb"
+        if self._cam2_key is None:
+            self._cam2_key = cfg_keys[1] if len(cfg_keys) >= 2 else None
+        print(f"[LerobotPi0FastAgent] cam1_key='{self._cam1_key}'  cam2_key='{self._cam2_key}'")
+
+        print("[LerobotPi0FastAgent] Ready.")
+
+    def _cache_lang_tokens(self):
+        """Pre-tokenise instruction with a zero (midpoint) state vector."""
+        tok_max = getattr(self._policy.config, "tokenizer_max_length", 200)
+
+        # Zeros → bin 128 (midpoint of 256 bins over [-1, 1])
+        state_np   = np.zeros(self.state_dim)
+        disc       = np.digitize(state_np, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+        state_str  = " ".join(map(str, disc))
+        cleaned    = self.instruction.strip().replace("_", " ").replace("\n", " ")
+        prompt     = f"Task: {cleaned}, State: {state_str};\n"
+
+        enc = self._tokenizer(
+            prompt,
+            return_tensors  = "pt",
+            padding         = "max_length",
+            max_length      = tok_max,
+            truncation      = True,
+        )
+        self._lang_ids  = enc["input_ids"]       # (1, tok_max)
+        self._lang_mask = enc["attention_mask"]  # (1, tok_max)
+
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
+
+    def set_instruction(self, s: str):
+        self.instruction = s
+        self._lang_ids   = None
+        self._lang_mask  = None
+        if self._tokenizer is not None:
+            self._cache_lang_tokens()
+
+    @property
+    def chunk_size(self) -> int:
+        self._load()
+        return self._policy.config.chunk_size
+
+    @property
+    def action_dim(self) -> int:
+        self._load()
+        from lerobot.utils.constants import ACTION
+        return self._policy.config.output_features[ACTION].shape[0]
+
+    @torch.inference_mode()
+    def predict_action_chunk(
+        self,
+        x:  torch.Tensor,                    # (B, 3, H, W)  cam1
+        x2: torch.Tensor | None = None,      # (B, 3, H, W)  cam2 (optional)
+    ) -> torch.Tensor:
+        """
+        x  : (B, 3, H, W) decoded image from cam1 in [0, 1]
+        x2 : (B, 3, H, W) decoded image from cam2 in [0, 1], or None
+        Returns (B, chunk_size, action_dim) on CPU
+        """
+        self._load()
+        device = next(self._policy.parameters()).device
+        B = x.size(0)
+
+        batch = {
+            self._cam1_key: x.to(device),
+            "observation.language.tokens":
+                self._lang_ids.expand(B, -1).to(device),
+            "observation.language.attention_mask":
+                self._lang_mask.expand(B, -1).to(device),
+        }
+        if x2 is not None and self._cam2_key is not None:
+            batch[self._cam2_key] = x2.to(device)
+
+        return self._policy.predict_action_chunk(batch).cpu()
+
+    # keep interface consistent with Pi0FastStub / Pi0FastPolicy
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.predict_action_chunk(x)

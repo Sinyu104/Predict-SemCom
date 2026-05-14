@@ -83,16 +83,16 @@ CONFIG = {
     "lambda_rate": 0.01,  # alias for beta_rate (backward compatibility)
 
     # ── Policy ───────────────────────────────────────────────────────── #
-    "policy_backbone":   "stub",     # "openvla" | "stub"
-    "policy_d_model":     512,
-    "policy_n_layers":      4,
-    "policy_n_heads":       8,
-    "policy_model_name":   "openvla/openvla-7b",
-    "policy_unnorm_key":   "franka_isaac",
-    "policy_instruction":  "pick up the red cube and place it on the tray",
-    "policy_finetune_dir": "outputs/openvla_finetuned_v3",
-    "policy_device_map":   "auto",
-    "policy_quantize":     False,
+    # backbone options: "lerobot_pi0fast" | "stub"
+    "policy_backbone":      "lerobot_pi0fast",
+    "policy_instruction":   "pick up the red cube and place it on the tray",
+
+    # lerobot PI0Fast settings
+    "pi0fast_model_path":   "outputs/pi0fast_finetuned",        # set to fine-tuned path after training
+    "pi0fast_cam1_key":     "observation.images.base_0_rgb",    # observations_cam1 (left base)
+    "pi0fast_cam2_key":     "observation.images.right_wrist_0_rgb", # observations_cam2 (right base)
+    "pi0fast_state_dim":    6,       # robot state dim (zeros used; must be ≤ max_state_dim=32)
+    "pi0fast_chunk_size":   30,      # action chunk length
 
     # ── Optimisation ─────────────────────────────────────────────────── #
     "learning_rate": 1e-4,
