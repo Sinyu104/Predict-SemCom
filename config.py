@@ -104,12 +104,32 @@ CONFIG = {
     "ddp_backend":    "nccl",
     "ddp_find_unused": True,
 
-    # ── Misc ──────────────────────────────────────────────────────────── #
+    # ── Network (ZMQ) ───────────────────────────────────────────────── #
+    "server_host":       "192.168.1.100",   # ← CHANGE to your server's IP
+    "zmq_port":          5555,
+    "zmq_timeout_ms":    10_000,            # 10 s timeout per request
+    "obs_jpeg_quality":  85,                # JPEG quality for obs compression
+
+    # ── OpenVLA ─────────────────────────────────────────────────────── #
+    "openvla_model_name":    "openvla/openvla-7b",
+    "openvla_finetune_dir":  "outputs/openvla_finetuned_v3",
+    "openvla_device_map":    "auto",
+    "openvla_quantize":      False,
+
+    # ── Fine-tuning (Stage 0) ────────────────────────────────────────── #
+    "finetune_epochs":       10,
+    "finetune_lr":           2e-5,
+    "finetune_lora_rank":    32,
+    "finetune_batch_size":   4,
+
+    # ── Misc ─────────────────────────────────────────────────────────── #
     "seed":          42,
     "num_workers":    0,      # 0 = safe with h5py; increase if SWMR enabled
     "log_interval":  10,
 
-    # ── Paths ─────────────────────────────────────────────────────────── #
-    "default_data_path": "data/trajectories.hdf5",
+    # ── Paths ────────────────────────────────────────────────────────── #
+    # default_data_path is kept for backward compat with --stored_data flag.
+    # For multi-task training use --tasks in main.py instead.
+    "default_data_path": "data/pick_red_cube_to_tray/demos.hdf5",
     "output_dir":        "./outputs",
 }

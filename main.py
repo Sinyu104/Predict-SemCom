@@ -20,6 +20,7 @@ Inference:
 """
 
 import argparse
+import json
 import os
 import torch
 
@@ -134,6 +135,42 @@ def build_policy(args, config: dict, vae):
         )
 
 
+# ── Task config helpers ───────────────────────────────────────────────────── #
+
+ALL_TASKS = [
+    "pick_red_cube_to_tray",
+    "pick_blue_cube_to_tray",
+    "pick_yellow_cube_to_tray",
+    "pick_orange_cube_to_tray",
+    "pick_purple_cube_to_tray",
+    "pick_red_cube_to_front_left_corner",
+    "pick_red_cube_to_front_right_corner",
+    "pick_red_cube_to_back_left_corner",
+    "pick_red_cube_to_back_right_corner",
+    "pick_leftmost_cube",
+    "stack_red_on_blue",
+    "stack_blue_on_red",
+    "sort_two_cubes",
+]
+
+
+def load_task_config(task_name: str, data_dir: str = "data") -> dict:
+    path = os.path.join(data_dir, task_name, "task.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"task.json not found at '{path}'. "
+            "Collect data for this task first."
+        )
+    with open(path) as f:
+        return json.load(f)
+
+
+def resolve_tasks(tasks_arg: list[str]) -> list[str]:
+    if len(tasks_arg) == 1 and tasks_arg[0] == "all":
+        return ALL_TASKS
+    return tasks_arg
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────── #
 
 def parse_args():
@@ -165,8 +202,20 @@ def parse_args():
                    help="Predicted future frames per step (default: 1).")
 
     p.add_argument("--output_data_dir", type=str, default="./outputs")
-    p.add_argument("--stored_data",     type=str, default=None)
+    p.add_argument("--stored_data",     type=str, default=None,
+                   help="Direct path to a single HDF5 file (backward compat). "
+                        "Use --tasks for multi-task training.")
     p.add_argument("--resume",          type=str, default=None)
+    p.add_argument("--tasks", nargs="+", default=None,
+                   help="Task name(s) to train on, or 'all'. "
+                        "Loads data/<task>/demos.hdf5 and task.json for each.")
+    p.add_argument("--data_dir", type=str, default="data",
+                   help="Root directory containing per-task data folders.")
+
+    # Architecture overrides
+    p.add_argument("--latent_dim", type=int, default=None)
+    p.add_argument("--hidden_dim", type=int, default=None)
+
     return p.parse_args()
 
 
@@ -205,8 +254,27 @@ def main():
         print(f"[main] snr_db={CONFIG['snr_db']}dB  D_jscc={CONFIG['D_jscc']}  "
               f"num_history={num_hist}  t''={CONFIG['noise_level_second']}")
 
-    data_path = args.stored_data or CONFIG.get("default_data_path", "data/trajectories.hdf5")
-    out       = args.output_data_dir
+    # ── Resolve data paths ────────────────────────────────────────────── #
+    if args.tasks:
+        task_names = resolve_tasks(args.tasks)
+        task_cfgs  = [load_task_config(t, args.data_dir) for t in task_names]
+        data_paths = [
+            os.path.join(args.data_dir, t, "demos.hdf5") for t in task_names
+        ]
+        if is_main:
+            print(f"[main] Multi-task training: {task_names}")
+    else:
+        # Backward-compat: single HDF5 via --stored_data
+        single_path = (
+            args.stored_data
+            or CONFIG.get("default_data_path", "data/pick_red_cube_to_tray/demos.hdf5")
+        )
+        data_paths = [single_path]
+        task_cfgs  = [{}]
+
+    # For single-task or backward-compat, use the first (and only) path.
+    data_path = data_paths[0]
+    out = args.output_data_dir
 
     if args.train:
         vae        = build_vae(args, CONFIG)
