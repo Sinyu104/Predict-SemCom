@@ -10,13 +10,14 @@ cube throughout.
 """
 
 import argparse, os, sys
+import h5py
 
 _pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument("--headless", action="store_true", default=True)
-_pre.parse_known_args()
+_pre.add_argument("--headless", action="store_true")
+_pre_args, _ = _pre.parse_known_args()
 
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": False, "renderer": "RayTracedLighting", "anti_aliasing": 0})
+simulation_app = SimulationApp({"headless": _pre_args.headless, "renderer": "RayTracedLighting", "anti_aliasing": 0})
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from isaac_sim.base_scenes import PickAndPlaceScene
@@ -30,8 +31,8 @@ class PickLeftmostCubeScene(PickAndPlaceScene):
     and stores it as self._target_cube for the episode.
     """
 
-    def __init__(self):
-        super().__init__(goal_type="tray")
+    def __init__(self, **kwargs):
+        super().__init__(goal_type="tray", **kwargs)
         # _target_cube will be set in reset()
 
     def reset(self, randomise: bool = True):
@@ -58,6 +59,6 @@ if __name__ == "__main__":
         default_output      = "data/pick_leftmost_cube/demos.hdf5",
         default_instruction = "pick up the leftmost cube and place it on the tray",
     )
-    scene = PickLeftmostCubeScene()
+    scene = PickLeftmostCubeScene(camera_ids=args.camera)
     collect(scene, args)
     simulation_app.close()

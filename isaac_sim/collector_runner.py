@@ -224,9 +224,13 @@ class HDF5Writer:
     def write(self, observations: list, actions: list,
               metadata: dict | None = None):
         grp = self.f.create_group(f"episode_{self.ep}")
-        grp.create_dataset(
-            "observations", data=np.stack(observations), compression="lzf"
-        )
+        # observations is a list of dicts {cam_id: (H,W,3)}
+        for cam_id in observations[0].keys():
+            grp.create_dataset(
+                f"observations_cam{cam_id}",
+                data=np.stack([obs[cam_id] for obs in observations]),
+                compression="lzf",
+            )
         grp.create_dataset(
             "actions", data=np.stack(actions), compression="lzf"
         )
@@ -279,6 +283,11 @@ def parse_collector_args(
     p.add_argument("--pose_delta_max",      type=float, default=0.15)
     p.add_argument("--scripted", action="store_true",
                    help="Use the scene's scripted_action() instead of the VLA server")
+    p.add_argument("--headless", action="store_true",
+                   help="Run without the Isaac Sim GUI window")
+    p.add_argument("--camera", nargs="+", type=int, default=[1],
+                   help="Camera IDs to collect (1=fixed, 2=second fixed, 3=wrist). "
+                        "E.g. --camera 2 3")
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
@@ -338,14 +347,17 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
         act_buf  = []
         success  = False
 
-        obs_t = scene.get_obs()
+        for _ in range(5):                        # flush post-reset render before first obs
+            scene.step()
+        obs_t       = scene.get_obs()             # dict {cam_id: (H,W,3)}
+        primary_cam = min(obs_t.keys())           # lowest cam id used for VLA
 
         for step in range(args.episode_length):
             if args.scripted:
                 action = scene.scripted_action()
             else:
                 t_req  = time.perf_counter()
-                action = client.request_action(obs_t)
+                action = client.request_action(obs_t[primary_cam])
                 total_latency  += (time.perf_counter() - t_req) * 1000
                 total_requests += 1
                 if args.interference_action:
@@ -361,24 +373,25 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
             act_buf.append(action)
 
             scene.step()
-            obs_t = scene.get_obs()
+            obs_t = scene.get_obs()   # dict {cam_id: (H,W,3)}
 
             if scene.is_success():
                 success = True
                 print(f"  ep {ep+1:4d}  SUCCESS at step {step+1}")
                 break
 
+        if not success:
+            print(f"  ep {ep+1:4d}  FAILED — discarded")
         if success:
             n_success += 1
-
-        writer.write(obs_buf, act_buf, metadata={
-            "disturbed":       int(args.interference_action or args.interference_pose),
-            "n_action_events": injector.action_events,
-            "n_pose_events":   injector.pose_events,
-            "success":         int(success),
-            "steps":           len(obs_buf),
-            "instruction":     args.instruction,
-        })
+            writer.write(obs_buf, act_buf, metadata={
+                "disturbed":       int(args.interference_action or args.interference_pose),
+                "n_action_events": injector.action_events,
+                "n_pose_events":   injector.pose_events,
+                "success":         int(success),
+                "steps":           len(obs_buf),
+                "instruction":     args.instruction,
+            })
 
         elapsed = time.time() - t0
         eta     = elapsed / (ep + 1) * (args.num_episodes - ep - 1)

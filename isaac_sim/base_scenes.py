@@ -48,10 +48,10 @@ TRAY_COLORS = {
 # Front = smaller X (closer to robot base), Back = larger X.
 # Left  = larger  Y, Right = smaller Y (from robot's forward-facing perspective).
 CORNER_POSITIONS = {
-    "front_left":  np.array([0.30,  0.35, 0.004]),
-    "front_right": np.array([0.30, -0.35, 0.004]),
-    "back_left":   np.array([0.70,  0.35, 0.004]),
-    "back_right":  np.array([0.70, -0.35, 0.004]),
+    "front_left":  np.array([0.70,  0.35, 0.004]),
+    "front_right": np.array([0.70, -0.35, 0.004]),
+    "back_left":   np.array([0.30,  0.35, 0.004]),
+    "back_right":  np.array([0.30, -0.35, 0.004]),
 }
 
 
@@ -70,7 +70,7 @@ class BaseScene(ABC):
     @abstractmethod
     def reset(self, randomise: bool = True) -> None: ...
     @abstractmethod
-    def get_obs(self) -> np.ndarray: ...
+    def get_obs(self) -> dict: ...
     @abstractmethod
     def apply_action(self, action: np.ndarray) -> None: ...
     @abstractmethod
@@ -94,8 +94,10 @@ class _FrankaBase(BaseScene):
     LIFT_HEIGHT   = 0.22    # metres — carry height during transport phase
     CUBE_GROUND_Z = 0.025   # cube centre Z when resting on flat ground (half of 0.05 m)
 
-    CAM_POS = (2.39661, 0.46729, 1.05345)
-    CAM_ROT = (65.86584, 0.0, 104.8045)
+    CAM_POS  = (2.39661, 0.46729, 1.05345)   # camera 1 — original fixed view
+    CAM_ROT  = (65.86584, 0.0, 104.8045)
+    CAM2_POS = (2.39661, -0.8, 1.05345)      # camera 2 — second fixed view (adjust to taste)
+    CAM2_ROT = (65.19141, 0.0, 68.93048)
 
     CUBE_X_RANGE  = (0.30, 0.70)
     CUBE_Y_RANGE  = (-0.15, 0.30)
@@ -126,26 +128,59 @@ class _FrankaBase(BaseScene):
                    position=np.zeros(3))
         )
 
-    def _add_camera(self):
-        stage = self.world.stage
-        self._cam_path = "/World/ObsCamera"
-        cam_prim = UsdGeom.Camera.Define(stage, self._cam_path)
-        xf = UsdGeom.Xformable(cam_prim)
-        xf.AddTranslateOp().Set(Gf.Vec3d(*self.CAM_POS))
-        xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.CAM_ROT))
-        print(f"[Camera] prim={self._cam_path}  pos={self.CAM_POS}  rot={self.CAM_ROT}")
+    def _cam_path_for(self, cam_id: int) -> str:
+        paths = {
+            1: "/World/ObsCamera1",
+            2: "/World/ObsCamera2",
+            3: "/World/Franka/panda_hand/WristCam",
+        }
+        if cam_id not in paths:
+            raise ValueError(f"Unknown camera id {cam_id}; valid: 1, 2, 3")
+        return paths[cam_id]
 
-    def _finish_init(self):
-        """Call after world.reset() to bring up controller + annotator."""
+    def _add_cameras(self, camera_ids: list):
+        stage = self.world.stage
+        for cam_id in camera_ids:
+            path = self._cam_path_for(cam_id)
+            cam_prim = UsdGeom.Camera.Define(stage, path)
+            xf = UsdGeom.Xformable(cam_prim)
+            if cam_id == 1:
+                xf.AddTranslateOp().Set(Gf.Vec3d(*self.CAM_POS))
+                xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.CAM_ROT))
+            elif cam_id == 2:
+                xf.AddTranslateOp().Set(Gf.Vec3d(*self.CAM2_POS))
+                xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.CAM2_ROT))
+            elif cam_id == 3:
+                # Eye-in-hand: pull 8 cm back from panda_hand origin (away from
+                # fingertips) so the camera sits above the hand, then rotate 180°
+                # around X to flip it to face the workspace below.
+                xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 4.72257))
+                xf.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            print(f"[Camera {cam_id}] prim={path}")
+
+    def _finish_init(self, camera_ids: list):
+        """Call after world.reset() to bring up controllers and per-camera annotators."""
         print("[Isaac Sim] Warming up RTX Renderer and compiling shaders...")
         for _ in range(100):
-            self.world.app.update()
+            rep.orchestrator.step(rt_subframes=1, pause_timeline=True)
 
-        self._rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-        self._render_product = rep.create.render_product(
-            self._cam_path, (OBS_W, OBS_H)
-        )
-        self._rgb_annot.attach([self._render_product])
+        self._camera_ids = list(camera_ids)
+        self._annots = {}
+        self._render_products = {}
+        for cam_id in camera_ids:
+            annot = rep.AnnotatorRegistry.get_annotator("rgb")
+            rp    = rep.create.render_product(self._cam_path_for(cam_id), (OBS_W, OBS_H))
+            annot.attach([rp])
+            self._annots[cam_id]          = annot
+            self._render_products[cam_id] = rp
+
+        print("[Isaac Sim] Warming up annotators...")
+        for _ in range(100):
+            rep.orchestrator.step(rt_subframes=1, pause_timeline=True)
+        # Force GPU→CPU pipeline initialisation for every annotator.
+        # Without this first read, subsequent get_data() calls may return black frames.
+        for annot in self._annots.values():
+            _ = np.asarray(annot.get_data())
         self._obs_checked = False
 
         self.controller = RMPFlowController(
@@ -160,32 +195,33 @@ class _FrankaBase(BaseScene):
 
     # ── Observation ───────────────────────────────────────────────────── #
 
-    def get_obs(self) -> np.ndarray:
-        raw = self._rgb_annot.get_data()
-
-        if not self._obs_checked:
-            self._obs_checked = True
-            print(f"[Camera] annotator raw type: {type(raw)}")
-
-        data = raw.get("data", None) if isinstance(raw, dict) else raw
-
-        if data is None or (hasattr(data, "size") and data.size == 0):
-            return np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
-
-        arr = np.asarray(data)
-        if arr.ndim == 1:
-            if arr.size == OBS_H * OBS_W * 4:
-                arr = arr.reshape(OBS_H, OBS_W, 4)
-            elif arr.size == OBS_H * OBS_W * 3:
-                arr = arr.reshape(OBS_H, OBS_W, 3)
-                return arr if arr.dtype == np.uint8 else _float_to_uint8(arr)
-            else:
-                return np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
-
-        rgb = arr[:, :, :3] if arr.shape[-1] == 4 else arr
-        if rgb.max() == 0:
-            print("[Camera] Warning: black frame.")
-        return rgb if rgb.dtype == np.uint8 else _float_to_uint8(rgb)
+    def get_obs(self) -> dict:
+        """Return {cam_id: (H, W, 3) uint8} for every active camera."""
+        result = {}
+        for cam_id, annot in self._annots.items():
+            raw = annot.get_data()
+            if not self._obs_checked:
+                self._obs_checked = True
+            data = raw.get("data", None) if isinstance(raw, dict) else raw
+            if data is None or (hasattr(data, "size") and data.size == 0):
+                result[cam_id] = np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
+                continue
+            arr = np.asarray(data)
+            if arr.ndim == 1:
+                if arr.size == OBS_H * OBS_W * 4:
+                    arr = arr.reshape(OBS_H, OBS_W, 4)
+                elif arr.size == OBS_H * OBS_W * 3:
+                    arr = arr.reshape(OBS_H, OBS_W, 3)
+                    result[cam_id] = arr if arr.dtype == np.uint8 else _float_to_uint8(arr)
+                    continue
+                else:
+                    result[cam_id] = np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
+                    continue
+            rgb = arr[:, :, :3] if arr.shape[-1] == 4 else arr
+            if rgb.max() == 0:
+                print(f"[Camera {cam_id}] Warning: black frame.")
+            result[cam_id] = rgb if rgb.dtype == np.uint8 else _float_to_uint8(rgb)
+        return result
 
     # ── Action / step ─────────────────────────────────────────────────── #
 
@@ -346,13 +382,16 @@ class PickAndPlaceScene(_FrankaBase):
 
     TRAY_POS = np.array([0.50, -0.35, 0.004])
 
-    def __init__(self, goal_type: str = "tray", corner: str | None = None):
+    def __init__(self, goal_type: str = "tray", corner: str | None = None,
+                 camera_ids: list | tuple = (1,)):
         assert goal_type in ("tray", "corner"), f"Unknown goal_type: {goal_type!r}"
         if goal_type == "corner":
             assert corner in CORNER_POSITIONS, f"Unknown corner: {corner!r}"
 
-        self.goal_type = goal_type
-        self.goal_pos  = (
+        self.goal_type    = goal_type
+        self.corner       = corner
+        self._camera_ids  = list(camera_ids)
+        self.goal_pos     = (
             CORNER_POSITIONS[corner].copy()
             if goal_type == "corner"
             else self.TRAY_POS.copy()
@@ -362,7 +401,7 @@ class PickAndPlaceScene(_FrankaBase):
         self._init_world()
         self._build()
         self.world.reset()
-        self._finish_init()
+        self._finish_init(self._camera_ids)
 
     def _build(self):
         self.world.scene.add_default_ground_plane()
@@ -392,7 +431,7 @@ class PickAndPlaceScene(_FrankaBase):
                     color=TRAY_COLORS["green"],
                 )
             )
-        else:  # corner — small flat yellow marker
+        else:  # corner — small yellow marker at corner + border extending inward
             self.world.scene.add(
                 FixedCuboid(
                     prim_path="/World/Goal", name="goal",
@@ -401,8 +440,33 @@ class PickAndPlaceScene(_FrankaBase):
                     color=np.array([1.0, 1.0, 0.0]),
                 )
             )
+            # Border spans the full workspace defined by the four corner positions.
+            _corners = np.array(list(CORNER_POSITIONS.values()))
+            _min_x, _max_x = _corners[:, 0].min(), _corners[:, 0].max()
+            _min_y, _max_y = _corners[:, 1].min(), _corners[:, 1].max()
+            _cx   = (_min_x + _max_x) / 2
+            _cy   = (_min_y + _max_y) / 2
+            _cz   = self.goal_pos[2]
+            _sx   = _max_x - _min_x   # width in X
+            _sy   = _max_y - _min_y   # width in Y
+            _w    = 0.015              # strip width (m)
+            _h    = 0.003              # strip height (m)
+            for _name, _pos, _sc in [
+                ("goal_zone_px", [_max_x - _w/2, _cy,          _cz], [_w,        _sy, _h]),
+                ("goal_zone_nx", [_min_x + _w/2, _cy,          _cz], [_w,        _sy, _h]),
+                ("goal_zone_py", [_cx,            _max_y - _w/2, _cz], [_sx - 2*_w, _w, _h]),
+                ("goal_zone_ny", [_cx,            _min_y + _w/2, _cz], [_sx - 2*_w, _w, _h]),
+            ]:
+                self.world.scene.add(
+                    FixedCuboid(
+                        prim_path=f"/World/{_name}", name=_name,
+                        position=np.array(_pos),
+                        scale=np.array(_sc),
+                        color=np.array([1.0, 1.0, 0.0]),
+                    )
+                )
 
-        self._add_camera()
+        self._add_cameras(self._camera_ids)
 
     def reset(self, randomise: bool = True):
         self.world.reset()
@@ -417,8 +481,10 @@ class PickAndPlaceScene(_FrankaBase):
                 cube.set_world_pose(
                     position=np.array([x, y, self.CUBE_GROUND_Z])
                 )
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(10):
+        for _ in range(50):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
         self.get_obs()  # flush stale frame
 
@@ -455,18 +521,20 @@ class StackScene(_FrankaBase):
 
     BASE_POS = np.array([0.50, -0.25, 0.025])
 
-    def __init__(self, target_color: str, base_color: str):
+    def __init__(self, target_color: str, base_color: str,
+                 camera_ids: list | tuple = (1,)):
         assert target_color in CUBE_COLORS, f"Unknown colour: {target_color!r}"
         assert base_color   in CUBE_COLORS, f"Unknown colour: {base_color!r}"
         assert target_color != base_color,  "target and base must differ"
 
         self.target_color = target_color
         self.base_color   = base_color
+        self._camera_ids  = list(camera_ids)
 
         self._init_world()
         self._build()
         self.world.reset()
-        self._finish_init()
+        self._finish_init(self._camera_ids)
 
     def _build(self):
         self.world.scene.add_default_ground_plane()
@@ -499,7 +567,7 @@ class StackScene(_FrankaBase):
             )
         )
 
-        self._add_camera()
+        self._add_cameras(self._camera_ids)
 
     @property
     def _stack_goal_pos(self) -> np.ndarray:
@@ -520,8 +588,10 @@ class StackScene(_FrankaBase):
                 cube.set_world_pose(
                     position=np.array([x, y, self.CUBE_GROUND_Z])
                 )
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(10):
+        for _ in range(50):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
         self.get_obs()
 
@@ -557,13 +627,14 @@ class SortScene(_FrankaBase):
     """
 
     RED_TRAY_POS  = np.array([0.50, -0.35, 0.004])
-    BLUE_TRAY_POS = np.array([0.25, -0.35, 0.004])
+    BLUE_TRAY_POS = np.array([0.35, -0.35, 0.004])
 
-    def __init__(self):
+    def __init__(self, camera_ids: list | tuple = (1,)):
+        self._camera_ids = list(camera_ids)
         self._init_world()
         self._build()
         self.world.reset()
-        self._finish_init()
+        self._finish_init(self._camera_ids)
         self._sort_phase = 0
 
     def _build(self):
@@ -602,7 +673,7 @@ class SortScene(_FrankaBase):
             )
         )
 
-        self._add_camera()
+        self._add_cameras(self._camera_ids)
 
     def reset(self, randomise: bool = True):
         self.world.reset()
@@ -616,8 +687,10 @@ class SortScene(_FrankaBase):
             positions = self._sample_non_overlapping(len(self.cubes))
             for cube, (x, y) in zip(self.cubes.values(), positions):
                 cube.set_world_pose(position=np.array([x, y, self.CUBE_GROUND_Z]))
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(10):
+        for _ in range(50):
             rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
         self.get_obs()
 
