@@ -4,6 +4,10 @@ isaac_sim/vla_runner.py  —  Shared VLA inference / evaluation entry point.
 Runs the trained VLA policy on one or more tasks inside Isaac Sim.
 Each task is evaluated sequentially (Isaac Sim can only have one World active).
 
+The server returns a chunk of `chunk_size` actions per request.  The runner
+executes the entire chunk before issuing the next request, which reduces
+communication overhead by a factor of chunk_size.
+
 Usage
 -----
   # Single task
@@ -15,6 +19,9 @@ Usage
 
   # All registered tasks
   <isaac_sim_root>\\python.bat isaac_sim\\vla_runner.py --tasks all
+
+  # Adjust chunk size to match the server (default 10)
+  <isaac_sim_root>\\python.bat isaac_sim\\vla_runner.py --tasks all --chunk_size 10
 """
 
 import argparse
@@ -22,6 +29,8 @@ import json
 import os
 import sys
 import time
+
+import numpy as np
 
 # ── SimulationApp must be created before any Isaac Sim imports ───────────── #
 _pre = argparse.ArgumentParser(add_help=False)
@@ -53,10 +62,13 @@ def parse_args():
                    help="Task name(s) to evaluate, or 'all' for all registered tasks")
     p.add_argument("--num_episodes",   type=int,   default=50)
     p.add_argument("--episode_length", type=int,   default=120)
+    p.add_argument("--chunk_size",     type=int,   default=10,
+                   help="Action chunk size (must match --chunk_size used on the server)")
     p.add_argument("--timeout_s",      type=float, default=10.0)
     p.add_argument("--jpeg_quality",   type=int,   default=85)
     p.add_argument("--data_dir",       type=str,   default="data",
                    help="Root data directory containing task.json files")
+    p.add_argument("--headless",       action="store_true", default=False)
     return p.parse_args()
 
 
@@ -96,29 +108,40 @@ def evaluate_task(task_name: str, args) -> dict:
     total_requests = 0
     t0             = time.time()
 
-    print(f"\n[VLARunner] Task: {task_name}")
+    print(f"\n[VLARunner] Task       : {task_name}")
     print(f"[VLARunner] Instruction: {cfg['instruction']}")
-    print(f"[VLARunner] Episodes: {args.num_episodes}  Length: {episode_length}\n")
+    print(f"[VLARunner] Episodes   : {args.num_episodes}  "
+          f"Length: {episode_length}  chunk_size: {args.chunk_size}\n")
 
     for ep in range(args.num_episodes):
         scene.reset(randomise=True)
         obs_t   = scene.get_obs()
         success = False
+        step    = 0
 
-        for step in range(episode_length):
-            t_req  = time.perf_counter()
-            action = client.request_action(obs_t)
+        while step < episode_length and not success:
+            # Request a full action chunk from the server
+            t_req        = time.perf_counter()
+            action_chunk = client.request_action(obs_t)
             total_latency  += (time.perf_counter() - t_req) * 1000
             total_requests += 1
 
-            scene.apply_action(action)
-            scene.step()
-            obs_t = scene.get_obs()
+            # action_chunk is (chunk_size, 7) for pi0fast, or (7,) for legacy single-action servers
+            if action_chunk.ndim == 1:
+                action_chunk = action_chunk[np.newaxis, :]   # normalise to (1, 7)
 
-            if scene.is_success():
-                success = True
-                print(f"  ep {ep+1:4d}  SUCCESS at step {step+1}")
-                break
+            # Execute each action in the chunk sequentially
+            for k in range(len(action_chunk)):
+                if step >= episode_length:
+                    break
+                scene.apply_action(action_chunk[k])
+                scene.step()
+                step += 1
+                obs_t = scene.get_obs()
+                if scene.is_success():
+                    success = True
+                    print(f"  ep {ep+1:4d}  SUCCESS at step {step}")
+                    break
 
         if success:
             n_success += 1
@@ -132,8 +155,7 @@ def evaluate_task(task_name: str, args) -> dict:
 
     client.close()
     rate = 100.0 * n_success / max(args.num_episodes, 1)
-    print(f"\n[VLARunner] {task_name}: {n_success}/{args.num_episodes} "
-          f"({rate:.1f}%)")
+    print(f"\n[VLARunner] {task_name}: {n_success}/{args.num_episodes} ({rate:.1f}%)")
     return {"task": task_name, "success_rate": rate, "n_success": n_success}
 
 
