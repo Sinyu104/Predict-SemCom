@@ -22,7 +22,6 @@ import random
 import threading
 import time
 
-import h5py
 import numpy as np
 
 from isaac_sim.base_scenes import BaseScene
@@ -216,6 +215,7 @@ class InterferenceInjector:
 
 class HDF5Writer:
     def __init__(self, path: str):
+        import h5py
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         self.f  = h5py.File(path, "w")
         self.ep = 0

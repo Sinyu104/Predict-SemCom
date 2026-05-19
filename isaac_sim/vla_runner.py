@@ -61,7 +61,7 @@ def parse_args():
     p.add_argument("--tasks", nargs="+", default=["pick_red_cube_to_tray"],
                    help="Task name(s) to evaluate, or 'all' for all registered tasks")
     p.add_argument("--num_episodes",   type=int,   default=50)
-    p.add_argument("--episode_length", type=int,   default=120)
+    p.add_argument("--episode_length", type=int,   default=300)
     p.add_argument("--chunk_size",     type=int,   default=10,
                    help="Action chunk size (must match --chunk_size used on the server)")
     p.add_argument("--timeout_s",      type=float, default=10.0)
@@ -120,9 +120,12 @@ def evaluate_task(task_name: str, args) -> dict:
         step    = 0
 
         while step < episode_length and not success:
+            # get_obs() returns {cam_id: array}; use the lowest cam id for VLA
+            obs_img = obs_t[min(obs_t.keys())] if isinstance(obs_t, dict) else obs_t
+
             # Request a full action chunk from the server
             t_req        = time.perf_counter()
-            action_chunk = client.request_action(obs_t)
+            action_chunk = client.request_action(obs_img)
             total_latency  += (time.perf_counter() - t_req) * 1000
             total_requests += 1
 

@@ -8,14 +8,14 @@ targeting the top surface of the red cube as the goal.
 """
 
 import argparse, os, sys
-import h5py
 
-_pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument("--headless", action="store_true")
-_pre_args, _ = _pre.parse_known_args()
-
-from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": _pre_args.headless, "renderer": "RayTracedLighting", "anti_aliasing": 0})
+if __name__ == "__main__":
+    import h5py
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--headless", action="store_true")
+    _pre_args, _ = _pre.parse_known_args()
+    from isaacsim import SimulationApp
+    simulation_app = SimulationApp({"headless": _pre_args.headless, "renderer": "RayTracedLighting", "anti_aliasing": 0})
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from isaac_sim.base_scenes import StackScene
