@@ -463,7 +463,7 @@ def finetune_pi0fast(args):
     # fp32, all go OOM on T4s before FSDP can shard.
     # Fix: temporarily redirect any cuda .to() call to cpu during from_pretrained,
     # then let FSDP move only the local shard (~3.45 GB) to GPU after wrapping.
-    model_path = args.resume_from if args.resume_from else args.model_dir
+    model_path = args.model_dir   # always load base weights; LoRA loaded separately below
     log(f"[finetune] Loading PI0FastPolicy from {model_path} (on CPU) …")
 
     import torch.nn as nn
@@ -515,20 +515,33 @@ def finetune_pi0fast(args):
 
     lora_rank, lora_alpha = args.lora_rank, args.lora_rank * 2
 
-    # lm_head
+    # Q, K, V, O projections + lm_head.
     pali = policy.model.paligemma_with_expert.paligemma
-    pali.lm_head = LoRALinear(pali.lm_head, lora_rank, lora_alpha)
-
-    # Q, K, V projections in every transformer layer
     for layer in pali.model.language_model.layers:
         attn = layer.self_attn
         attn.q_proj = LoRALinear(attn.q_proj, lora_rank, lora_alpha)
         attn.k_proj = LoRALinear(attn.k_proj, lora_rank, lora_alpha)
         attn.v_proj = LoRALinear(attn.v_proj, lora_rank, lora_alpha)
+        attn.o_proj = LoRALinear(attn.o_proj, lora_rank, lora_alpha)
+    pali.lm_head = LoRALinear(pali.lm_head, lora_rank, lora_alpha)
+
+    # ── Load LoRA weights from previous checkpoint (if resuming) ─────── #
+    if args.resume_from:
+        lora_pt = os.path.join(args.resume_from, "lora_weights.pt")
+        if os.path.isfile(lora_pt):
+            resume_sd   = torch.load(lora_pt, map_location="cpu")
+            lora_params = {n: p for n, p in policy.named_parameters() if "lora_" in n}
+            loaded = sum(
+                1 for k, v in resume_sd.items()
+                if k in lora_params and not lora_params[k].data.copy_(v) is None
+            )
+            log(f"[finetune] Resumed {loaded} LoRA tensors from {lora_pt}")
+        else:
+            log(f"[finetune] WARNING: no lora_weights.pt found at {lora_pt}")
 
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in policy.parameters())
-    log(f"[finetune] LoRA rank={args.lora_rank} (lm_head + Q/K/V all layers): "
+    log(f"[finetune] LoRA rank={args.lora_rank} (Q/K/V/O + lm_head): "
         f"{n_train:,} trainable / {n_total:,} total  "
         f"({100*n_train/n_total:.3f}%)  chunk={args.chunk_size}")
 
@@ -600,9 +613,12 @@ def finetune_pi0fast(args):
         state_path = os.path.join(args.resume_from, "training_state.pt")
         if os.path.isfile(state_path):
             state = torch.load(state_path, map_location="cpu")
-            optimizer.load_state_dict(state["optimizer"])
-            scheduler.load_state_dict(state["scheduler"])
-            log(f"[finetune] Restored optimizer + scheduler from {state_path}")
+            try:
+                optimizer.load_state_dict(state["optimizer"])
+                scheduler.load_state_dict(state["scheduler"])
+                log(f"[finetune] Restored optimizer + scheduler from {state_path}")
+            except ValueError:
+                log(f"[finetune] Optimizer state mismatch (LoRA structure changed) — starting fresh optimizer")
 
     # ── Training loop ────────────────────────────────────────────────── #
     os.makedirs(args.finetune_output, exist_ok=True)
@@ -714,7 +730,7 @@ def finetune_pi0fast(args):
                  "epoch":     ep + 1},
                 os.path.join(ckpt_dir, "training_state.pt"),
             )
-            log(f"[finetune] Checkpoint → {ckpt_dir}  ({len(lora_sd)} LoRA tensors)")
+            log(f"[finetune] Checkpoint → {ckpt_dir}  ({len(lora_sd)} LoRA tensors, incl. lm_head)")
             if ep > start_epoch:
                 prev = os.path.join(args.finetune_output, f"checkpoint_epoch{ep}")
                 if os.path.isdir(prev):
