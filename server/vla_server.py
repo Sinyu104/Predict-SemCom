@@ -22,7 +22,7 @@ Server → Client:  /vla/response (std_msgs/String)
 ROS2 environment (set on BOTH machines before launching)
 ---------------------------------------------------------
     export ROS_DOMAIN_ID=66
-    export ROS_DISCOVERY_SERVER=10.32.33.41:11811
+    export ROS_DISCOVERY_SERVER=10.32.33.49:11811
 
 Usage
 -----
