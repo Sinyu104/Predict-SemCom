@@ -60,8 +60,9 @@ CONFIG = {
 
     # ── Ctrl-World (Stage 1 — first diffusion, SVD-based) ────────────── #
     "svd_model_name":          "stabilityai/stable-video-diffusion-img2vid",
+    "obs_key":                  "observations_cam1",  # camera to train on (cam1 = left base)
     "num_history":              6,    # history frames fed to Ctrl-World
-    "num_pred":                 10,   # future frames to predict
+    "num_pred":                 8,    # predict K=8 steps ahead (delay-pipeline horizon; uses K known past actions)
     "noise_level_first":        500,  # max DDPM timestep t' sampled during Ctrl-World training
     "ctrl_world_n_steps":       10,   # DDIM denoising steps at Ctrl-World inference (pure noise → z_hat)
     "finetune_unet_cross_attn": True, # unfreeze UNet attn2 layers to help with gripper/OOD regions
@@ -75,8 +76,8 @@ CONFIG = {
 
     # ── Clip length for Stage 1/2 training ───────────────────────────── #
     # clip_length = num_history + num_pred (auto-overridden in main.py)
-    "clip_length": 16,   # 6 history + 10 pred
-    "clip_stride": 4,    # sample every k-th frame; actions summed over k steps
+    "clip_length": 14,   # 6 history + 8 pred (auto-overridden in main.py)
+    "clip_stride": 1,    # consecutive frames; one action per step (no summing)
 
     # ── Stage 2 loss ─────────────────────────────────────────────────── #
     "beta_rate":  0.01,   # β weighting L_rate = KL(q||p)
