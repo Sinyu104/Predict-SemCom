@@ -73,6 +73,22 @@ def _preprocess_obs(
     return t
 
 
+def _resolve_obs_key(grp, preferred: str | None = None) -> str | None:
+    """
+    Pick the observations dataset key inside an HDF5 group / file.
+
+    Order: explicit `preferred` → "observations" → "observations_cam1" →
+    "observations_cam2".  Returns None if none are present.
+    """
+    candidates = ([preferred] if preferred else []) + [
+        "observations", "observations_cam1", "observations_cam2",
+    ]
+    for k in candidates:
+        if k and k in grp:
+            return k
+    return None
+
+
 def load_task_config(task_dir: str) -> dict:
     """Read task.json from a task data directory."""
     path = os.path.join(task_dir, "task.json")
@@ -218,13 +234,18 @@ class ClipDataset(Dataset):
         obs_channels: int = 3,
         clip_length:  int = 16,
         stride:       int = 1,
+        obs_key:      str | None = None,
+        max_episodes: int | None = None,
     ):
         super().__init__()
-        self.hdf5_path   = hdf5_path
-        self.obs_height  = obs_height
-        self.obs_width   = obs_width
-        self.clip_length = clip_length
-        self.stride      = stride
+        self.hdf5_path    = hdf5_path
+        self.obs_height   = obs_height
+        self.obs_width    = obs_width
+        self.clip_length  = clip_length
+        self.stride       = stride
+        self.obs_key      = obs_key          # preferred camera key (e.g. "observations_cam1")
+        self.max_episodes = max_episodes     # use only the first N episodes per file (None = all)
+        self._obs_key:    str | None = None  # resolved at index time
 
         self._index:       list        = []
         self._action_dim:  int | None  = None
@@ -241,8 +262,10 @@ class ClipDataset(Dataset):
             raise FileNotFoundError(f"HDF5 not found: '{self.hdf5_path}'")
 
         with h5py.File(self.hdf5_path, "r") as f:
-            if "observations" in f:
-                n = len(f["observations"])
+            flat_key = _resolve_obs_key(f, self.obs_key)
+            if flat_key is not None:
+                self._obs_key = flat_key
+                n = len(f[flat_key])
                 self._index = [("flat", i) for i in range(n - window + 1)]
                 if "actions" in f and f["actions"].ndim > 1:
                     self._action_dim = f["actions"].shape[1]
@@ -252,11 +275,22 @@ class ClipDataset(Dataset):
                     self.has_latents   = True
                     self._latent_shape = f["latents"].shape[1:]
             else:
-                for ep_key in sorted(f.keys()):
+                # Numeric sort ("episode_2" < "episode_10") so a "first N" subset
+                # is a contiguous, deterministic slice of the recorded demos.
+                def _ep_num(k):
+                    digits = "".join(ch for ch in k if ch.isdigit())
+                    return int(digits) if digits else 0
+                ep_keys = sorted(f.keys(), key=_ep_num)
+                if self.max_episodes is not None:
+                    ep_keys = ep_keys[: self.max_episodes]
+                for ep_key in ep_keys:
                     grp = f[ep_key]
-                    if "observations" not in grp or "actions" not in grp:
+                    obs_key = _resolve_obs_key(grp, self.obs_key)
+                    if obs_key is None or "actions" not in grp:
                         continue
-                    n = len(grp["observations"])
+                    if self._obs_key is None:
+                        self._obs_key = obs_key
+                    n = len(grp[obs_key])
                     if n < window:
                         continue
                     for i in range(n - window + 1):
@@ -287,7 +321,7 @@ class ClipDataset(Dataset):
 
         with h5py.File(self.hdf5_path, "r") as f:
             if layout_key == "flat":
-                obs_arr    = np.array(f["observations"][frame_indices])
+                obs_arr    = np.array(f[self._obs_key][frame_indices])
                 action_raw = np.array(f["actions"][start:raw_end], dtype=np.float32)
                 pose_arr   = np.array(f["poses"][frame_indices], dtype=np.float32) \
                              if "poses" in f else None
@@ -295,7 +329,7 @@ class ClipDataset(Dataset):
                              if self.has_latents else None
             else:
                 grp        = f[layout_key]
-                obs_arr    = np.array(grp["observations"][frame_indices])
+                obs_arr    = np.array(grp[self._obs_key][frame_indices])
                 action_raw = np.array(grp["actions"][start:raw_end], dtype=np.float32)
                 pose_arr   = np.array(grp["poses"][frame_indices], dtype=np.float32) \
                              if "poses" in grp else None
