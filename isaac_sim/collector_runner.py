@@ -214,12 +214,18 @@ class InterferenceInjector:
 # ============================================================================ #
 
 class HDF5Writer:
-    def __init__(self, path: str):
+    def __init__(self, path: str, append: bool = False):
         import h5py
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-        self.f  = h5py.File(path, "w")
-        self.ep = 0
-        print(f"[HDF5Writer] Writing to: {path}")
+        mode = "a" if (append and os.path.exists(path)) else "w"
+        try:
+            self.f = h5py.File(path, mode)
+        except OSError:
+            print(f"[HDF5Writer] Corrupt file detected, overwriting: {path}")
+            self.f = h5py.File(path, "w")
+            mode = "w"
+        self.ep = len([k for k in self.f.keys() if k.startswith("episode_")])
+        print(f"[HDF5Writer] {'Appending to' if mode=='a' else 'Writing to'}: {path} (starting at ep {self.ep})")
 
     def write(self, observations: list, actions: list,
               metadata: dict | None = None):
