@@ -200,6 +200,9 @@ def parse_args():
                    help="History frames for Ctrl-World (default: config.num_history = 6).")
     p.add_argument("--num_pred",    type=int, default=None,
                    help="Predicted future frames per step (default: 1).")
+    p.add_argument("--max_episodes_per_task", type=int, default=None,
+                   help="Use only the first N episodes from each task's demos.hdf5 "
+                        "(default: all). Subsamples data to shorten epoch wall-time.")
 
     p.add_argument("--output_data_dir", type=str, default="./outputs")
     p.add_argument("--stored_data",     type=str, default=None,
@@ -230,6 +233,8 @@ def main():
     if args.batch_size    is not None: CONFIG["batch_size"]    = args.batch_size
     if args.epoch         is not None: CONFIG["epochs"]        = args.epoch
     if args.learning_rate is not None: CONFIG["learning_rate"] = args.learning_rate
+    if args.max_episodes_per_task is not None:
+        CONFIG["max_episodes_per_task"] = args.max_episodes_per_task
     CONFIG["output_dir"] = args.output_data_dir
 
     # Sync clip_length with num_history / num_pred
@@ -282,10 +287,14 @@ def main():
 
         if args.stage == 1:
             n = ctrl_world.num_trainable_params()
+            # Stage 1 can train on multiple HDF5 files (concatenated clips).
+            stage1_data = data_paths if len(data_paths) > 1 else data_path
             if is_main:
                 print(f"\n[main] ===== STAGE 1: Ctrl-World  trainable={n/1e6:.2f}M =====")
+                if len(data_paths) > 1:
+                    print(f"[main] Stage 1 over {len(data_paths)} files: {data_paths}")
             Stage1Trainer(
-                CONFIG, data_path, device, vae, rank, world_size,
+                CONFIG, stage1_data, device, vae, rank, world_size,
                 ctrl_world   = ctrl_world,
                 resume_ckpt  = args.resume,
             ).train()
