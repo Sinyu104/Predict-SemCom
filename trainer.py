@@ -82,23 +82,34 @@ def _has_latents(loader: DataLoader) -> bool:
 
 
 def build_ddp_loaders(
-    config: dict, hdf5_path: str, rank: int, world_size: int,
+    config: dict, hdf5_path, rank: int, world_size: int,
     clip_length: int = 1,
 ) -> tuple[DataLoader, DataLoader]:
-    from torch.utils.data import random_split
+    from torch.utils.data import random_split, ConcatDataset
+
+    # hdf5_path may be a single path (str) or a list of paths (multi-task).
+    paths = [hdf5_path] if isinstance(hdf5_path, str) else list(hdf5_path)
 
     if clip_length > 1:
-        full_ds = ClipDataset(
-            hdf5_path    = hdf5_path,
-            obs_height   = config["obs_height"],
-            obs_width    = config["obs_width"],
-            obs_channels = config["obs_channels"],
-            clip_length  = clip_length,
-            stride       = config.get("clip_stride", 1),
-        )
+        sub_ds = [
+            ClipDataset(
+                hdf5_path    = p,
+                obs_height   = config["obs_height"],
+                obs_width    = config["obs_width"],
+                obs_channels = config["obs_channels"],
+                clip_length  = clip_length,
+                stride       = config.get("clip_stride", 1),
+                obs_key      = config.get("obs_key"),
+                max_episodes = config.get("max_episodes_per_task"),
+            )
+            for p in paths
+        ]
+        full_ds = sub_ds[0] if len(sub_ds) == 1 else ConcatDataset(sub_ds)
+        # Propagate has_latents so the trainer's online/precomputed switch works.
+        full_ds.has_latents = all(d.has_latents for d in sub_ds)
     else:
         full_ds = GNMTrajectoryDataset(
-            hdf5_path    = hdf5_path,
+            hdf5_path    = paths[0],
             obs_height   = config["obs_height"],
             obs_width    = config["obs_width"],
             obs_channels = config["obs_channels"],
@@ -447,10 +458,14 @@ class Stage1Trainer(BaseTrainer):
         actions = torch.cat(actions_b, 0)[:n_samples]
         latents = torch.cat(latents_b, 0)[:n_samples]
 
+        # When the dataset has no pre-computed latents it returns zeros; encode the
+        # frames with the (frozen) VAE so the viz reflects real observations.
+        if not _has_latents(self.val_loader):
+            latents = self._encode_vae(frames).cpu().float()
+
         T_h = model.num_history
         z_history = latents[:, :T_h].to(self.device)
         T_p   = self.config.get("num_pred", 1)
-        z_gt  = latents[:, T_h + T_p - 1].cpu().float()   # ground truth for last predicted frame
 
         a_pad  = torch.zeros(n_samples, 1, actions.shape[-1], device=self.device)
         a_full = torch.cat([actions.to(self.device), a_pad], dim=1)
@@ -458,14 +473,14 @@ class Stage1Trainer(BaseTrainer):
         n_steps = self.config.get("ctrl_world_n_steps", 10)
         z_pred  = model.predict_next_latent(z_history, a_full, n_steps=n_steps)
         z_pred = z_pred[:, -1].cpu().float()
-        z_last = latents[:, T_h - 1].cpu().float()
 
         from vae_wrapper import VAEWrapper
         vae_name = self.config.get("vae_model_name", "stabilityai/sd-vae-ft-mse")
         vae_cpu  = VAEWrapper(vae_name)
 
-        imgs_hist = vae_cpu.decode(z_last)
-        imgs_gt   = vae_cpu.decode(z_gt)
+        # Cols 1-2 = raw ground-truth observations (no VAE round-trip); col 3 = decoded prediction.
+        imgs_hist = frames[:, T_h - 1].cpu().float()           # last history frame (raw)
+        imgs_gt   = frames[:, T_h + T_p - 1].cpu().float()     # target frame (raw)
         imgs_pred = vae_cpu.decode(z_pred)
         del vae_cpu
 
