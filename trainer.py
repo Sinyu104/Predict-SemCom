@@ -700,6 +700,10 @@ class Stage2Trainer(BaseTrainer):
         # Training must span the full schedule — see forward_ddpm / config for why.
         self.train_noise_max = config.get("noise_level_train", 1000)
         # Deviation-weighted distortion — see _run_epoch for why.
+        # Two-phase schedule. Phase 1 withholds ẑ_t from the refinement so the decoder
+        # must build a channel pathway before it is handed the crutch; see _run_epoch.
+        self.phase1_epochs   = config.get("stage2_phase1_epochs", 0)
+        self._phase          = 1 if self.phase1_epochs > 0 else 2
         self.zhat_dropout    = config.get("zhat_dropout", 0.15)
         self.dev_weighting   = config.get("dev_weighting", True)
         self.dev_weight_pow  = config.get("dev_weight_pow", 1.0)
@@ -789,8 +793,22 @@ class Stage2Trainer(BaseTrainer):
                 z_tgt = z_clip[:, self.num_history:]           # (B, P, 4, Hv, Wv) — targets
                 z_sid = self._get_z_hat(z_clip, actions)       # (B, P, 4, Hv, Wv) — side info
 
+                # Phase 1: withhold ẑ_t from the REFINEMENT entirely — input,
+                # conditioning and residual base. The decoder then cannot emit
+                # anything without decoding s̃_t, so it is forced to build a channel
+                # pathway. Without this it converges to ignoring the channel: it
+                # holds ẑ_t (~95% correct), suppressing a noisy s̃_t is locally
+                # optimal, and that zeroes ∂L/∂s̃ — the only route by which gradient
+                # reaches the encoder (measured: 3.27e-06 collapsed vs 1.72e-03 at
+                # init). β does not fix this; at β=0 the encoder sends 250
+                # bits/frame and they are still ignored.
+                # ẑ_t still reaches the SideInfoEncoder, so the rate stays the
+                # conditional KL and the Wyner-Ziv structure is unchanged.
+                z_ref = torch.zeros_like(z_sid) if self._phase == 1 else z_sid
+
                 z_t   = z_tgt.reshape(-1, *z_tgt.shape[2:])    # (B*P, 4, Hv, Wv)
-                z_hat = z_sid.reshape(-1, *z_sid.shape[2:])    # (B*P, 4, Hv, Wv)
+                z_hat = z_sid.reshape(-1, *z_sid.shape[2:])    # (B*P, 4, Hv, Wv) — real ẑ_t
+                z_in  = z_ref.reshape(-1, *z_ref.shape[2:])    # what the REFINEMENT sees
 
                 # JSCC Encoder: z_t → q(s_t | z_t)
                 mu_enc, log_var_enc, s_t = jscc(z_t, sample=train)
@@ -805,7 +823,7 @@ class Stage2Trainer(BaseTrainer):
                 # the previous run, which is the coordination failure ẑ-dropout targets.
                 if train:
                     s_tilde.retain_grad()
-                d_i = refine.forward_ddpm(z_t, z_hat, s_tilde,
+                d_i = refine.forward_ddpm(z_t, z_in, s_tilde,
                                           self.train_noise_max, per_sample=True,
                                           zhat_dropout=self.zhat_dropout)          # (B,)
                 r_i = SemComSystem.rate_loss(
@@ -880,12 +898,23 @@ class Stage2Trainer(BaseTrainer):
     def train(self):
         best   = self.best
         epochs = self.config["epochs"]
+        p1     = self.phase1_epochs
         if self.is_main:
             print(f"\n[Stage2] JSCC + Refinement Diffusion  {epochs} epochs  "
                   f"β={self.beta_rate}  SNR={self.snr_db}dB  "
                   f"train t''~U[1,{self.train_noise_max}]  infer t''={self.noise_level}")
+            if p1 > 0:
+                print(f"[Stage2] two-phase: epochs 1-{p1} withhold ẑ_t from the "
+                      f"refinement (forces a channel pathway), {p1+1}-{epochs} restore it")
 
         for ep in range(self.start_epoch, epochs + 1):
+            # Phase 1 forces the decoder to decode s̃_t; phase 2 hands ẑ_t back so it
+            # learns WHEN to correct. Phase 2 must see the full distribution — running
+            # it on disturbed frames only gave a working channel but over-corrected
+            # calm frames badly (calmest decile ended up ~2x worse than ẑ_t alone).
+            self._phase = 1 if ep <= p1 else 2
+            if self.is_main and ep == p1 + 1 and p1 > 0:
+                print(f"[Stage2] --- entering phase 2: ẑ_t restored ---")
             tr = self._run_epoch(self.train_loader, True,  ep)
             vl = self._run_epoch(self.val_loader,   False, ep)
             self.scheduler.step()

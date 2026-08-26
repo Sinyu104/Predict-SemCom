@@ -94,6 +94,19 @@ CONFIG = {
     "clip_length": 14,   # 6 history + 8 pred (auto-overridden in main.py)
     "clip_stride": 1,    # consecutive frames; one action per step (no summing)
 
+    # ── Stage 2 two-phase schedule ───────────────────────────────────── #
+    # Epochs 1..N withhold ẑ_t from the refinement entirely (input, conditioning and
+    # residual base), so the decoder cannot emit anything without decoding s̃_t and is
+    # forced to build a channel pathway. Without this it converges to ignoring the
+    # channel — it holds ẑ_t (~95% correct), so suppressing a noisy s̃_t is locally
+    # optimal, and that zeroes ∂L/∂s̃, the only route by which gradient reaches the
+    # encoder. Measured |∂L/∂s̃| 3.27e-06 collapsed vs 1.72e-03 at init; with the
+    # two-phase schedule it held at ~1e-04 and kept rising.
+    # ẑ_t still reaches the SideInfoEncoder throughout, so the rate stays the
+    # conditional KL and the encoder never sees ẑ_t — Wyner-Ziv is unchanged.
+    # 0 disables the schedule (single-phase, the old behaviour).
+    "stage2_phase1_epochs": 3,
+
     # ── Stage 2 loss ─────────────────────────────────────────────────── #
     # ẑ_t-dropout: hide the prediction from the correction path on this fraction of
     # samples, so the decoder cannot converge to ignoring the channel. Default OFF:
