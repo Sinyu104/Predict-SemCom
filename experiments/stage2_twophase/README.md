@@ -105,8 +105,8 @@ done; wait
 python twophase.py --pre pre --out ../../outputs/stage2_twophase \
     --top 1.0 --top2 1.0 --ep1 3 --ep2 5 --drop2 0.30 --bs 16
 
-# 3. evaluation
-python eval_full.py --pre pre --ckpt ../../outputs/stage2_twophase/phase2.pt
+# 3. evaluation — twophase.py already prints the held-out numbers, the full
+#    distribution and the per-decile breakdown when it finishes. These are extra:
 python tiny_tdp.py                                  # A/B/C by deviation group and t''
 python persample.py --cache pre/zcache.pt           # per-sample benefit distribution
 python gradcheck.py --cache pre/zcache.pt           # |dL/ds~| trained vs random init
@@ -132,9 +132,3 @@ step 1 rather than reusing an old one.
   +5.3% overall while doubling the error on the calmest decile.
 - `dist` is only a true reconstruction error in direct mode (t''=0). Otherwise it averages
   over random t'' and is not comparable to the `z_hat` baseline.
-
-## Known rough edge
-
-`eval_full.py`'s `seen?` column reports membership of the top 20%, which was meaningful
-only when training was filtered. With the current recipe every decile is trained on, so
-that column reads 0%/100% misleadingly and should be removed or fixed.

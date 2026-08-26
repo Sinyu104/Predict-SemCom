@@ -114,24 +114,50 @@ for ph,neps,drop in ((1,a.ep1,0.0),(2,a.ep2,a.drop2)):
     torch.save({"system_state":sysm.state_dict(),"phase":ph},
                os.path.join(a.out,f"phase{ph}.pt"))
 
-# final: does the channel matter?
+# ── final evaluation ─────────────────────────────────────────────────────────
+#   A = refine with the real s~_t     B = refine with s~_t ZEROED
+#   C = z_hat alone, no refinement
+# A vs B isolates the channel: same net, same z_hat, same frames, only the
+# transmission differs. A vs C says whether Stage 2 beats the raw prediction.
+#
+# The DECILE breakdown is not optional. An aggregate hides regime-specific
+# failure: an earlier configuration read +5.3% overall while DOUBLING the error
+# on the calmest decile, which is 90% of real frames.
+def evaluate(idx, label):
+    A=[];Bl=[]
+    with torch.no_grad():
+        for i in range(0,len(idx),a.bs):
+            sel=idx[i:i+a.bs]; z=ZT[sel].to(DEV); h=ZH[sel].to(DEV); B=len(z)
+            _,_,s=sysm.jscc_encoder(z,sample=False); st=sysm.channel(s)
+            t0=torch.zeros(B,dtype=torch.long,device=DEV)
+            pa=sysm.refinement_diffusion._denoise_x0(h,t0,h,st)
+            pb=sysm.refinement_diffusion._denoise_x0(h,t0,h,torch.zeros_like(st))
+            A.append(((pa-z)**2).mean(dim=(1,2,3)).cpu())
+            Bl.append(((pb-z)**2).mean(dim=(1,2,3)).cpu())
+    A=torch.cat(A).numpy(); Bl=torch.cat(Bl).numpy(); C=dev[idx].numpy()
+    rel=100*(Bl-A)/np.maximum(Bl,1e-12)
+    print(f"\n{label} (n={len(A)}):")
+    print(f"  A (with s~) = {A.mean():.5f}")
+    print(f"  B (s~ = 0)  = {Bl.mean():.5f}")
+    print(f"  C (z_hat)   = {C.mean():.5f}")
+    print(f"  A vs B = {100*(Bl.mean()-A.mean())/Bl.mean():+.3f}%   <-- channel contribution")
+    print(f"  A vs C = {100*(C.mean()-A.mean())/C.mean():+.2f}%   (system vs raw prediction)")
+    print(f"  per-sample: helped>1% {(rel>1).sum()}/{len(rel)} "
+          f"({100*(rel>1).mean():.1f}%)   best {rel.max():+.2f}%")
+    return A,Bl,C
+
 sysm.eval()
-iva=va2
-A=[];Bl=[]
-with torch.no_grad():
-    for i in range(0,len(iva),a.bs):
-        sel=iva[i:i+a.bs]; z=ZT[sel].to(DEV); h=ZH[sel].to(DEV); B=len(z)
-        _,_,s=sysm.jscc_encoder(z,sample=False); st=sysm.channel(s)
-        t0=torch.zeros(B,dtype=torch.long,device=DEV)
-        pa=sysm.refinement_diffusion._denoise_x0(h,t0,h,st)
-        pb=sysm.refinement_diffusion._denoise_x0(h,t0,h,torch.zeros_like(st))
-        A.append(((pa-z)**2).mean(dim=(1,2,3)).cpu()); Bl.append(((pb-z)**2).mean(dim=(1,2,3)).cpu())
-A=torch.cat(A).numpy(); Bl=torch.cat(Bl).numpy(); C=dev[iva].numpy()
-print(f"\nFINAL on held-out phase-2 distribution (n={len(A)}):")
-print(f"  A (with s~) = {A.mean():.5f}")
-print(f"  B (s~ = 0)  = {Bl.mean():.5f}")
-print(f"  C (z_hat)   = {C.mean():.5f}")
-print(f"  A vs B = {100*(Bl.mean()-A.mean())/Bl.mean():+.3f}%   <-- channel contribution")
-print(f"  A vs C = {100*(C.mean()-A.mean())/C.mean():+.2f}%")
-rel=100*(Bl-A)/np.maximum(Bl,1e-12)
-print(f"  per-sample: best frame {rel.max():+.3f}%   helped>1%: {(rel>1).sum()}/{len(rel)}")
+evaluate(va2, "HELD-OUT")
+
+allidx=torch.arange(len(ZT))
+A,Bl,C = evaluate(allidx, "FULL DISTRIBUTION (deployment number)")
+print("\nBY DEVIATION DECILE (D1 calmest ... D10 most disturbed):")
+print("   dec   n      dev      A(with)   B(s~=0)   C(zhat)    A vs B    A vs C")
+q=np.percentile(C,np.arange(0,101,10))
+for j in range(10):
+    m=(C>=q[j])&((C<=q[j+1]) if j==9 else (C<q[j+1]))
+    if not m.sum(): continue
+    print(f"   D{j+1:<2d} {m.sum():6d} {C[m].mean():8.4f}  {A[m].mean():8.5f} {Bl[m].mean():8.5f} "
+          f"{C[m].mean():8.5f}  {100*(Bl[m].mean()-A[m].mean())/Bl[m].mean():+7.2f}% "
+          f"{100*(C[m].mean()-A[m].mean())/C[m].mean():+7.1f}%")
+print("\nA vs B > 0 => the channel helps;  A vs C > 0 => Stage 2 beats the raw prediction")
