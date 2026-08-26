@@ -185,6 +185,15 @@ def parse_args():
     p.add_argument("--learning_rate", type=float, default=None)
     p.add_argument("--snr_db",        type=float, default=None)
     p.add_argument("--D_jscc",        type=int,   default=None)
+    p.add_argument("--beta",          type=float, default=None,
+                   help="Stage-2 rate weight β. 0 = no rate penalty at all "
+                        "(diagnostic: does the channel get used when nothing "
+                        "pushes the encoder to stay quiet?).")
+    p.add_argument("--channel",       type=str,   default=None,
+                   choices=["awgn", "rayleigh", "cdl"],
+                   help="Stage-2 analog channel model (default from config)")
+    p.add_argument("--cdl_model",     type=str,   default=None,
+                   help="CDL profile A–E when --channel cdl")
 
     p.add_argument("--use_stub", action="store_true",
                    help="Use stub VAE, Ctrl-World, and policy (no GPU, no downloads). For testing only.")
@@ -196,6 +205,13 @@ def parse_args():
     p.add_argument("--ctrl_ckpt",   type=str, default=None,
                    help="CTRL-WORLD .pt checkpoint to initialise Action_encoder2 "
                         "(usually not needed — loaded from stage1_best.pt in Stage 2).")
+    p.add_argument("--stage1_ckpt", type=str, default=None,
+                   help="Frozen Stage-1 Ctrl-World checkpoint for Stage 2 "
+                        "(default: <output_dir>/stage1_best.pt).")
+    p.add_argument("--disturbed",   action="store_true",
+                   help="Load demos_disturbed.hdf5 (not demos.hdf5) for each --tasks entry.")
+    p.add_argument("--val_split",   type=float, default=None,
+                   help="Fraction held out for validation (0 = train on all data).")
     p.add_argument("--num_history", type=int, default=None,
                    help="History frames for Ctrl-World (default: config.num_history = 6).")
     p.add_argument("--num_pred",    type=int, default=None,
@@ -230,6 +246,12 @@ def main():
     # CLI overrides
     if args.snr_db        is not None: CONFIG["snr_db"]        = args.snr_db
     if args.D_jscc        is not None: CONFIG["D_jscc"]        = args.D_jscc
+    if args.beta          is not None:
+        CONFIG["beta_rate"] = args.beta
+        CONFIG["lambda_rate"] = args.beta
+    if args.channel       is not None: CONFIG["channel_type"]  = args.channel
+    if args.cdl_model     is not None: CONFIG["cdl_model"]     = args.cdl_model
+    if args.val_split     is not None: CONFIG["val_split"]     = args.val_split
     if args.batch_size    is not None: CONFIG["batch_size"]    = args.batch_size
     if args.epoch         is not None: CONFIG["epochs"]        = args.epoch
     if args.learning_rate is not None: CONFIG["learning_rate"] = args.learning_rate
@@ -256,18 +278,23 @@ def main():
     if is_main:
         os.makedirs(args.output_data_dir, exist_ok=True)
         print(f"[main] World size : {world_size} GPU(s)  |  Device : {device}")
-        print(f"[main] snr_db={CONFIG['snr_db']}dB  D_jscc={CONFIG['D_jscc']}  "
+        chan = CONFIG.get("channel_type", "rayleigh")
+        chan_str = f"{chan}(CDL-{CONFIG['cdl_model']})" if chan == "cdl" else chan
+        print(f"[main] snr_db={CONFIG['snr_db']}dB  channel={chan_str}  "
+              f"D_jscc={CONFIG['D_jscc']}  "
               f"num_history={num_hist}  t''={CONFIG['noise_level_second']}")
 
     # ── Resolve data paths ────────────────────────────────────────────── #
     if args.tasks:
         task_names = resolve_tasks(args.tasks)
         task_cfgs  = [load_task_config(t, args.data_dir) for t in task_names]
+        demos_file = "demos_disturbed.hdf5" if args.disturbed else "demos.hdf5"
         data_paths = [
-            os.path.join(args.data_dir, t, "demos.hdf5") for t in task_names
+            os.path.join(args.data_dir, t, demos_file) for t in task_names
         ]
         if is_main:
-            print(f"[main] Multi-task training: {task_names}")
+            kind = "disturbed" if args.disturbed else "clean"
+            print(f"[main] Multi-task training ({kind}): {task_names}")
     else:
         # Backward-compat: single HDF5 via --stored_data
         single_path = (
@@ -300,16 +327,22 @@ def main():
             ).train()
 
         elif args.stage == 2:
-            ckpt = os.path.join(out, "stage1_best.pt")
+            ckpt = args.stage1_ckpt or os.path.join(out, "stage1_best.pt")
             if not os.path.exists(ckpt) and not args.use_stub:
                 raise FileNotFoundError(
                     f"Stage-1 checkpoint not found at '{ckpt}'. "
-                    "Run --train --stage 1 first, or pass --use_stub for testing."
+                    "Run --train --stage 1 first, pass --stage1_ckpt, "
+                    "or pass --use_stub for testing."
                 )
+            # Stage 2 can train on multiple HDF5 files (concatenated clips).
+            stage2_data = data_paths if len(data_paths) > 1 else data_path
             if is_main:
                 print("\n[main] ===== STAGE 2: JSCC + Refinement Diffusion =====")
+                print(f"[main] Stage-1 ckpt: {ckpt}")
+                if len(data_paths) > 1:
+                    print(f"[main] Stage 2 over {len(data_paths)} files: {data_paths}")
             Stage2Trainer(
-                CONFIG, data_path, ckpt, device, vae, rank, world_size,
+                CONFIG, stage2_data, ckpt, device, vae, rank, world_size,
                 ctrl_world  = ctrl_world,
                 resume_ckpt = args.resume,
             ).train()
