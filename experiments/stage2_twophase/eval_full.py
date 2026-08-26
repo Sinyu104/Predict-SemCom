@@ -6,14 +6,18 @@ This scores the model across the whole deviation range, in deciles.
 
   A = refine with s~_t     B = refine with s~_t ZEROED     C = z_hat alone
 """
-import os, sys, pathlib, glob, numpy as np, torch
+import os, sys, pathlib, glob, argparse, numpy as np, torch
 REPO=str(pathlib.Path(__file__).resolve().parents[2]); sys.path.insert(0,REPO)
 from config import CONFIG
 from models import SemComSystem
 SC=os.path.dirname(os.path.abspath(__file__)); DEV="cuda:0"
+_ap=argparse.ArgumentParser()
+_ap.add_argument("--pre",  default=os.path.join(SC,"pre"), help="precompute shard dir")
+_ap.add_argument("--ckpt", default=f"{REPO}/outputs/stage2_twophase_full/phase2.pt")
+_a=_ap.parse_args()
 
 ZT=[];ZH=[]
-for f in sorted(glob.glob(os.path.join(SC,"pre","shard*.pt"))):
+for f in sorted(glob.glob(os.path.join(_a.pre,"shard*.pt"))):
     d=torch.load(f); ZT.append(d["ZT"]); ZH.append(d["ZH"])
 ZT=torch.cat(ZT).float().reshape(-1,4,28,28); ZH=torch.cat(ZH).float().reshape(-1,4,28,28)
 dev=((ZT-ZH)**2).mean(dim=(1,2,3)); N=len(dev)
@@ -23,8 +27,7 @@ k=int(0.20*N); trained_idx=set(torch.argsort(dev,descending=True)[:k].tolist())
 print(f"total samples {N}   trained on top 20% ({k})   evaluating on ALL\n")
 
 sysm=SemComSystem(CONFIG).to(DEV)
-sysm.load_state_dict(torch.load(f"{REPO}/outputs/stage2_twophase_full/phase2.pt",
-                                map_location="cpu")["system_state"]); sysm.eval()
+sysm.load_state_dict(torch.load(_a.ckpt, map_location="cpu")["system_state"]); sysm.eval()
 A=[];B=[]
 with torch.no_grad():
     for i in range(0,N,16):
