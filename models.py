@@ -358,41 +358,99 @@ class RefinementDiffusion(nn.Module):
 
 
 # ========================================================================== #
-#  4. RAYLEIGH CHANNEL                                                        #
+#  4. FADING CHANNEL  (awgn / rayleigh / cdl)                                #
 # ========================================================================== #
 
-class RayleighChannel(nn.Module):
+class FadingChannel(nn.Module):
     """
-    Flat Rayleigh fading channel: y = h·x + n,  h, n ~ CN(0,1)
+    Analog fading channel for deep-JSCC symbols with coherent zero-forcing
+    (matched-filter) reception:
 
-    Coherent equalization divides by |h|² after reception.
+        y = h·s + n                         h = complex fading gain, n ~ CN(0, σ²_n)
+        ŝ = Re(conj(h)·y) / |h|²  =  s + effective noise      (post-ZF, σ²_n/|h|²)
+
+    `channel_type` selects how the per-symbol complex gain `h` is drawn — the
+    only thing that changes between channels (the receiver is identical). This
+    mirrors the Sionna SSCC baseline (`baselines/traditional/sionna_channel.py`),
+    so the SNR axis is comparable across the two systems:
+
+        "awgn"      h = 1                                    no fading (RD reference)
+        "rayleigh"  h ~ CN(0,1), one gain per sample         flat / block fading
+        "cdl"       h from a Sionna 3GPP TR-38.901 CDL model  frequency/time-selective
+
+    All channels are normalized (E|h|² = 1), so N0 = sig_power / snr_lin for
+    every channel type — matching the baseline convention.
+
+    `cdl_kwargs` is forwarded to the Sionna CDL generator (model, delay_spread,
+    carrier_frequency, min_speed, max_speed, ...); Sionna is imported lazily and
+    is only required when `channel_type == "cdl"`.
     """
 
-    def __init__(self, snr_db: float = 10.0):
+    CHANNELS = ("awgn", "rayleigh", "cdl")
+
+    def __init__(
+        self,
+        snr_db: float = 10.0,
+        channel_type: str = "rayleigh",
+        cdl_kwargs: dict | None = None,
+    ):
         super().__init__()
-        self.snr_db = snr_db
+        channel_type = str(channel_type).lower()
+        if channel_type not in self.CHANNELS:
+            raise ValueError(
+                f"channel_type must be one of {self.CHANNELS}, got '{channel_type}'."
+            )
+        self.snr_db       = snr_db
+        self.channel_type = channel_type
+        self.cdl_kwargs   = cdl_kwargs or {}
+        self._cdl         = None      # lazily-built Sionna CDL gain generator
 
     @property
     def sigma_n_sq(self) -> float:
         return 1.0 / (10.0 ** (self.snr_db / 10.0))
 
+    def _sample_gains(self, B: int, D: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (h_re, h_im), each broadcastable to (B, D). E|h|² = 1."""
+        if self.channel_type == "awgn":
+            ones = torch.ones(B, 1, device=device)
+            return ones, torch.zeros(B, 1, device=device)
+
+        if self.channel_type == "rayleigh":
+            # Flat / block fading: one complex gain per sample, shared across symbols.
+            h_re = torch.randn(B, 1, device=device) / math.sqrt(2)
+            h_im = torch.randn(B, 1, device=device) / math.sqrt(2)
+            return h_re, h_im
+
+        # cdl — per-symbol frequency-selective gains from Sionna TR-38.901.
+        if self._cdl is None:
+            from baselines.traditional.sionna_channel import _CDLGains
+            self._cdl = _CDLGains(device=str(device), **self.cdl_kwargs)
+        h = self._cdl(B * D).reshape(B, D).to(device)
+        return h.real.contiguous(), h.imag.contiguous()
+
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         """s: (B, D_jscc) → s̃: (B, D_jscc)"""
-        B         = s.size(0)
+        B, D      = s.shape
         sig_power = s.pow(2).mean(dim=-1, keepdim=True).clamp(min=1e-8)
         snr_lin   = 10.0 ** (self.snr_db / 10.0)
         noise_std = (sig_power / snr_lin).sqrt()
 
-        h_re = torch.randn(B, 1, device=s.device) / math.sqrt(2)
-        h_im = torch.randn(B, 1, device=s.device) / math.sqrt(2)
+        h_re, h_im = self._sample_gains(B, D, s.device)
 
-        y_re = h_re * s
-        y_im = h_im * s
         n_re = noise_std * torch.randn_like(s) / math.sqrt(2)
         n_im = noise_std * torch.randn_like(s) / math.sqrt(2)
+        y_re = h_re * s + n_re
+        y_im = h_im * s + n_im
 
         h_mag_sq = (h_re.pow(2) + h_im.pow(2)).clamp(min=1e-8)
-        return ((y_re + n_re) * h_re + (y_im + n_im) * h_im) / h_mag_sq
+        return (y_re * h_re + y_im * h_im) / h_mag_sq
+
+
+class RayleighChannel(FadingChannel):
+    """Backward-compatible flat Rayleigh fading channel (channel_type='rayleigh')."""
+
+    def __init__(self, snr_db: float = 10.0):
+        super().__init__(snr_db, channel_type="rayleigh")
 
 
 # ========================================================================== #
@@ -428,7 +486,16 @@ class SemComSystem(nn.Module):
         self.refinement_diffusion = RefinementDiffusion(
             D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l
         )
-        self.channel              = RayleighChannel(snr_db)
+
+        channel_type = config.get("channel_type", "rayleigh")
+        cdl_kwargs = {
+            "model":             config.get("cdl_model",        "C"),
+            "delay_spread":      config.get("cdl_delay_spread", 100e-9),
+            "carrier_frequency": config.get("cdl_carrier_freq", 3.5e9),
+            "max_speed":         config.get("cdl_max_speed",    3.0),
+        }
+        self.channel = FadingChannel(snr_db, channel_type=channel_type,
+                                     cdl_kwargs=cdl_kwargs)
 
     @staticmethod
     def rate_loss(
@@ -437,9 +504,10 @@ class SemComSystem(nn.Module):
         mu_prior:      torch.Tensor,
         log_var_prior: torch.Tensor,
         snr_db:        float,
+        per_sample:    bool = False,      # return (B,) per-sample KL, not a scalar
     ) -> torch.Tensor:
         """
-        KL( q(s_t | z_t) || p(s_t | ẑ_t) )
+        KL( q(s̃_t | z_t) || p(s̃_t | ẑ_t) )    — over the received signal s̃_t
 
         q : N(μ_enc,   σ²_enc + σ²_n)   where σ²_n = 1/snr_lin (physical channel noise)
         p : N(μ_prior, σ²_prior)         σ²_n absorbed into learned σ²_prior
@@ -452,4 +520,4 @@ class SemComSystem(nn.Module):
             + (q_var + (mu_enc - mu_prior).pow(2)) / p_var
             - 1.0
         )
-        return kl.mean()
+        return kl.mean(dim=-1) if per_sample else kl.mean()
