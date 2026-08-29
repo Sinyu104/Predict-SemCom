@@ -4,7 +4,7 @@ inference.py  —  Evaluation for the VAE-latent Predictive SemCom System.
 Metrics
 -------
   L_distortion  MSE(z̃_t, z_t) in VAE latent space
-  L_rate        KL(q(ŝ_t|z_t) || p(ŝ_t|ẑ_t))
+  L_rate        KL(q(s̃_t|z_t) || p(s̃_t|ẑ_t))
   PSNR          Peak signal-to-noise ratio of decoded image x̃_t vs x_t
   Action MSE    ||â_t − a_t||² (first action of predicted chunk vs GT)
 """

@@ -14,7 +14,7 @@ Stage 2 — JSCC + Refinement Diffusion (second diffusion)
             with frozen Ctrl-World providing ẑ_t as Wyner-Ziv side information.
     Loss:   L = L_distortion + β·L_rate
             L_distortion = RefinementDiffusion DDPM x₀-prediction loss (MSE)
-            L_rate       = KL( q(s_t|z_t) || p(s_t|ẑ_t) )
+            L_rate       = KL( q(s̃_t|z_t) || p(s̃_t|ẑ_t) )
     Launch: torchrun --nproc_per_node=4 main.py --train --stage 2 \\
                 --svd_path stabilityai/stable-video-diffusion-img2vid \\
                 --stored_data data/train.hdf5
@@ -82,33 +82,51 @@ def _has_latents(loader: DataLoader) -> bool:
 
 
 def build_ddp_loaders(
-    config: dict, hdf5_path: str, rank: int, world_size: int,
+    config: dict, hdf5_path, rank: int, world_size: int,
     clip_length: int = 1,
 ) -> tuple[DataLoader, DataLoader]:
-    from torch.utils.data import random_split
+    from torch.utils.data import random_split, ConcatDataset
+
+    # hdf5_path may be a single path (str) or a list of paths (multi-task).
+    paths = [hdf5_path] if isinstance(hdf5_path, str) else list(hdf5_path)
 
     if clip_length > 1:
-        full_ds = ClipDataset(
-            hdf5_path    = hdf5_path,
-            obs_height   = config["obs_height"],
-            obs_width    = config["obs_width"],
-            obs_channels = config["obs_channels"],
-            clip_length  = clip_length,
-            stride       = config.get("clip_stride", 1),
-        )
+        sub_ds = [
+            ClipDataset(
+                hdf5_path    = p,
+                obs_height   = config["obs_height"],
+                obs_width    = config["obs_width"],
+                obs_channels = config["obs_channels"],
+                clip_length  = clip_length,
+                stride       = config.get("clip_stride", 1),
+                obs_key      = config.get("obs_key"),
+                max_episodes = config.get("max_episodes_per_task"),
+            )
+            for p in paths
+        ]
+        full_ds = sub_ds[0] if len(sub_ds) == 1 else ConcatDataset(sub_ds)
+        # Propagate has_latents so the trainer's online/precomputed switch works.
+        full_ds.has_latents = all(d.has_latents for d in sub_ds)
     else:
         full_ds = GNMTrajectoryDataset(
-            hdf5_path    = hdf5_path,
+            hdf5_path    = paths[0],
             obs_height   = config["obs_height"],
             obs_width    = config["obs_width"],
             obs_channels = config["obs_channels"],
         )
 
-    n_total = len(full_ds)
-    n_val   = max(1, int(0.2 * n_total))
-    n_train = n_total - n_val
-    generator = torch.Generator().manual_seed(config.get("seed", 42))
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+    n_total   = len(full_ds)
+    val_split = config.get("val_split", 0.2)
+    if val_split and val_split > 0:
+        n_val   = max(1, int(val_split * n_total))
+        n_train = n_total - n_val
+        generator = torch.Generator().manual_seed(config.get("seed", 42))
+        train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=generator)
+    else:
+        # val_split <= 0: train on ALL data; reuse the full set for monitoring
+        # (reported "val" metric equals the train-set metric in this mode).
+        train_ds, val_ds = full_ds, full_ds
+        n_train = n_val = n_total
 
     train_sampler = DistributedSampler(
         train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
@@ -187,7 +205,11 @@ class BaseTrainer:
     ):
         self.config     = config
         self.device     = device
-        self.vae        = vae
+        # VAEWrapper resolves its compute device from an internal buffer, so it MUST be
+        # moved here — build_vae() returns it on CPU. Left on CPU the 83.6M-param encoder
+        # runs single-threaded (torchrun sets OMP_NUM_THREADS=1) and dominates the step,
+        # ~10x slower than encoding on GPU while the GPUs sit idle.
+        self.vae        = vae.to(device) if vae is not None else None
         self.rank       = rank
         self.world_size = world_size
         self.is_main    = (rank == 0)
@@ -447,10 +469,14 @@ class Stage1Trainer(BaseTrainer):
         actions = torch.cat(actions_b, 0)[:n_samples]
         latents = torch.cat(latents_b, 0)[:n_samples]
 
+        # When the dataset has no pre-computed latents it returns zeros; encode the
+        # frames with the (frozen) VAE so the viz reflects real observations.
+        if not _has_latents(self.val_loader):
+            latents = self._encode_vae(frames).cpu().float()
+
         T_h = model.num_history
         z_history = latents[:, :T_h].to(self.device)
         T_p   = self.config.get("num_pred", 1)
-        z_gt  = latents[:, T_h + T_p - 1].cpu().float()   # ground truth for last predicted frame
 
         a_pad  = torch.zeros(n_samples, 1, actions.shape[-1], device=self.device)
         a_full = torch.cat([actions.to(self.device), a_pad], dim=1)
@@ -458,14 +484,14 @@ class Stage1Trainer(BaseTrainer):
         n_steps = self.config.get("ctrl_world_n_steps", 10)
         z_pred  = model.predict_next_latent(z_history, a_full, n_steps=n_steps)
         z_pred = z_pred[:, -1].cpu().float()
-        z_last = latents[:, T_h - 1].cpu().float()
 
         from vae_wrapper import VAEWrapper
         vae_name = self.config.get("vae_model_name", "stabilityai/sd-vae-ft-mse")
         vae_cpu  = VAEWrapper(vae_name)
 
-        imgs_hist = vae_cpu.decode(z_last)
-        imgs_gt   = vae_cpu.decode(z_gt)
+        # Cols 1-2 = raw ground-truth observations (no VAE round-trip); col 3 = decoded prediction.
+        imgs_hist = frames[:, T_h - 1].cpu().float()           # last history frame (raw)
+        imgs_gt   = frames[:, T_h + T_p - 1].cpu().float()     # target frame (raw)
         imgs_pred = vae_cpu.decode(z_pred)
         del vae_cpu
 
@@ -592,7 +618,7 @@ class Stage2Trainer(BaseTrainer):
     Ctrl-World is loaded from the Stage-1 checkpoint and kept frozen.
     It provides ẑ_t = predict_next_latent(z_history, a_t) as Wyner-Ziv side information.
 
-    Loss:  L = MSE(z̃_t, z_t) + β · KL( q(s_t|z_t) || p(s_t|ẑ_t) )
+    Loss:  L = MSE(z̃_t, z_t) + β · KL( q(s̃_t|z_t) || p(s̃_t|ẑ_t) )
     """
 
     def __init__(
@@ -607,12 +633,21 @@ class Stage2Trainer(BaseTrainer):
         ctrl_world   = None,         # CtrlWorldWrapper or StubCtrlWorld
         resume_ckpt: str | None = None,
     ):
-        # clip_length = num_history + 1 (history frames + target frame)
-        self.clip_length   = config.get("num_history", 6) + 1
+        # clip_length = num_history + num_pred — must match Stage 1, because
+        # Ctrl-World takes num_pred from its constructor and always builds a
+        # (num_history + num_pred)-frame sequence. Every one of the num_pred
+        # predicted frames is used as side information for its own target.
+        self.num_history   = config.get("num_history", 6)
+        self.num_pred      = config.get("num_pred", 1)
+        self.clip_length   = self.num_history + self.num_pred
         self.ctrl_world    = ctrl_world
         super().__init__(config, data_path, device, vae, rank, world_size)
 
-        # ── Load Stage-1 action encoder into ctrl_world ───────────────────
+        # ── Load Stage-1 weights into ctrl_world ──────────────────────────
+        # Stage 1 trains the action encoder AND (when finetune_unet_cross_attn
+        # is set) ~100M UNet attn2 params. BOTH must be restored here — loading
+        # only the action encoder leaves cross-attn at pretrained SVD values,
+        # which silently degrades ẑ_t beyond the first couple of horizons.
         if self.ctrl_world is not None:
             self.ctrl_world = self.ctrl_world.to(device)
             if stage1_ckpt and os.path.exists(stage1_ckpt):
@@ -623,6 +658,15 @@ class Stage2Trainer(BaseTrainer):
                     )
                     if self.is_main:
                         print(f"[Stage2] Loaded Action_encoder from {stage1_ckpt}")
+                if "unet_cross_attn_state" in ckpt and hasattr(self.ctrl_world, "load_unet_cross_attn_state_dict"):
+                    self.ctrl_world.load_unet_cross_attn_state_dict(ckpt["unet_cross_attn_state"])
+                    if self.is_main:
+                        n = sum(v.numel() for v in ckpt["unet_cross_attn_state"].values())
+                        print(f"[Stage2] Loaded UNet cross-attn from {stage1_ckpt} "
+                              f"({n/1e6:.2f}M params)")
+                elif getattr(self.ctrl_world, "finetune_cross_attn", False) and self.is_main:
+                    print("[Stage2] WARNING: finetune_unet_cross_attn is on but the Stage-1 "
+                          "checkpoint has no 'unet_cross_attn_state' — ẑ_t will be degraded.")
                 del ckpt
             self.ctrl_world.requires_grad_(False)
             if self.is_main:
@@ -630,23 +674,40 @@ class Stage2Trainer(BaseTrainer):
         elif self.is_main:
             print("[Stage2] No Ctrl-World provided — using previous frame as ẑ_t (fallback).")
 
-        # ── Wrap Stage-2 trainable modules with DDP ──────────────────────
-        self.system.jscc_encoder         = self._wrap_ddp(self.system.jscc_encoder)
-        self.system.side_info_encoder    = self._wrap_ddp(self.system.side_info_encoder)
-        self.system.refinement_diffusion = self._wrap_ddp(self.system.refinement_diffusion)
-
+        # ── Trainable modules: deliberately NOT DDP-wrapped ──────────────
+        # The distortion loss goes through refine.forward_ddpm(), a custom method
+        # DDP cannot dispatch, so every forward here must call the raw module.
+        # Wrapping in DDP and then calling the unwrapped module means DDP.forward —
+        # and with it prepare_for_backward — never runs, while the Reducer's autograd
+        # hooks still fire. Ranks then enqueue different numbers of collectives and
+        # NCCL dies with a collective timeout at the next explicit all_reduce (seen
+        # at the epoch-1 train->val boundary: rank 0 enqueued 10, ranks 1-3 only 9).
+        # Gradients are averaged manually in _run_epoch instead, exactly as Stage 1
+        # already does for its UNet cross-attn params.
         params = (
-            list(self._unwrap(self.system.jscc_encoder).parameters())           +
-            list(self._unwrap(self.system.side_info_encoder).parameters())      +
-            list(self._unwrap(self.system.refinement_diffusion).parameters())
+            list(self.system.jscc_encoder.parameters())           +
+            list(self.system.side_info_encoder.parameters())      +
+            list(self.system.refinement_diffusion.parameters())
         )
+        self.sync_params = [q for q in params if q.requires_grad]
         self.optimizer   = optim.AdamW(params, lr=config["learning_rate"], weight_decay=1e-4)
         self.scheduler   = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config["epochs"], eta_min=1e-6
         )
         self.beta_rate   = config.get("beta_rate", config.get("lambda_rate", 0.01))
         self.snr_db      = config["snr_db"]
-        self.noise_level = config.get("noise_level_second", 250)
+        self.noise_level = config.get("noise_level_second", 250)   # inference SDEdit start
+        # Training must span the full schedule — see forward_ddpm / config for why.
+        self.train_noise_max = config.get("noise_level_train", 1000)
+        # Deviation-weighted distortion — see _run_epoch for why.
+        # Two-phase schedule. Phase 1 withholds ẑ_t from the refinement so the decoder
+        # must build a channel pathway before it is handed the crutch; see _run_epoch.
+        self.phase1_epochs   = config.get("stage2_phase1_epochs", 0)
+        self._phase          = 1 if self.phase1_epochs > 0 else 2
+        self.zhat_dropout    = config.get("zhat_dropout", 0.15)
+        self.dev_weighting   = config.get("dev_weighting", True)
+        self.dev_weight_pow  = config.get("dev_weight_pow", 1.0)
+        self.dev_weight_max  = config.get("dev_weight_max", 10.0)
         self.start_epoch = 1
         self.best        = math.inf
 
@@ -663,29 +724,35 @@ class Stage2Trainer(BaseTrainer):
         actions:    torch.Tensor,    # (B, T-1, action_dim)
     ) -> torch.Tensor:
         """
-        Compute ẑ_t (Wyner-Ziv side information) using frozen Ctrl-World.
+        Compute ẑ (Wyner-Ziv side information) using frozen Ctrl-World.
 
-        z_clip[:, :-1] = z_history  (num_history frames)
-        z_clip[:, -1]  = z_t        (target frame)
+        z_clip[:, :num_history]  = z_history   (conditioning frames)
+        z_clip[:, num_history:]  = z_{t+1..t+num_pred}   (targets)
 
-        Returns ẑ_t : (B, 4, Hv, Wv)
+        One DDIM call yields all num_pred future latents, so ẑ[:, k-1] is the
+        k-step-ahead side information paired with target z_clip[:, num_history+k-1].
+
+        Returns ẑ : (B, num_pred, 4, Hv, Wv), float32 — Ctrl-World runs in fp16
+        but every Stage-2 module is fp32, so the result is cast on the way out.
         """
-        B         = z_clip.shape[0]
-        num_hist  = self.clip_length - 1
-        z_history = z_clip[:, :num_hist]                  # (B, T-1, 4, Hv, Wv)
+        B          = z_clip.shape[0]
+        T_h        = self.num_history
+        z_history  = z_clip[:, :T_h]                      # (B, num_history, 4, Hv, Wv)
         action_dim = actions.shape[-1]
 
         if self.ctrl_world is not None:
-            # Pad actions to (B, num_hist+1, action_dim) for predict_next_latent
+            # predict_next_latent needs one action per frame of the full
+            # (num_history + num_pred) sequence; the loader supplies T-1, so pad 1.
             a_pad   = torch.zeros(B, 1, action_dim, device=self.device)
-            a_full  = torch.cat([actions, a_pad], dim=1)  # (B, num_hist+1, D)
+            a_full  = torch.cat([actions, a_pad], dim=1)  # (B, clip_length, D)
             n_steps = self.config.get("ctrl_world_n_steps", 10)
             with torch.no_grad():
                 z_hat = self.ctrl_world.predict_next_latent(z_history, a_full, n_steps=n_steps)
-            return z_hat[:, 0]                             # (B, 4, Hv, Wv)
+            return z_hat.float()                           # (B, num_pred, 4, Hv, Wv)
         else:
-            # Fallback: use last history frame as a trivial side-info estimate
-            return z_clip[:, -2].detach()
+            # Fallback: repeat the last history frame as a trivial side-info estimate
+            last = z_clip[:, T_h - 1].detach().unsqueeze(1)
+            return last.expand(-1, self.num_pred, -1, -1, -1).clone()
 
     def _run_epoch(self, loader, train: bool, epoch: int) -> dict:
         jscc  = self._unwrap(self.system.jscc_encoder)
@@ -701,7 +768,9 @@ class Stage2Trainer(BaseTrainer):
             src = "pre-computed HDF5 latents" if use_precomp_lats else "online VAE encode"
             print(f"  [Stage2] latent source: {src}")
 
-        totals = {"distortion": 0.0, "rate": 0.0, "total": 0.0}
+        totals = {"distortion": 0.0, "rate": 0.0, "total": 0.0,
+                  "rate_hi": 0.0, "rate_lo": 0.0, "gs": 0.0}
+        n_gs   = 0
         n      = 0
         phase  = "train" if train else "val"
         pbar   = tqdm(loader, desc=f"  {phase} ep {epoch}",
@@ -717,32 +786,97 @@ class Stage2Trainer(BaseTrainer):
                 else:
                     z_clip = self._encode_vae(frames)
 
-                z_t   = z_clip[:, -1]                          # (B, 4, Hv, Wv) — target
-                z_hat = self._get_z_hat(z_clip, actions)       # (B, 4, Hv, Wv) — side info ẑ_t
+                # All num_pred horizons are trained on: one Ctrl-World call gives
+                # ẑ_{t+1..t+num_pred}, each paired with its own target, then the
+                # horizon axis is folded into the batch (every Stage-2 module is
+                # per-frame, so (B*num_pred, C, Hv, Wv) needs no other change).
+                z_tgt = z_clip[:, self.num_history:]           # (B, P, 4, Hv, Wv) — targets
+                z_sid = self._get_z_hat(z_clip, actions)       # (B, P, 4, Hv, Wv) — side info
+
+                # Phase 1: withhold ẑ_t from the REFINEMENT entirely — input,
+                # conditioning and residual base. The decoder then cannot emit
+                # anything without decoding s̃_t, so it is forced to build a channel
+                # pathway. Without this it converges to ignoring the channel: it
+                # holds ẑ_t (~95% correct), suppressing a noisy s̃_t is locally
+                # optimal, and that zeroes ∂L/∂s̃ — the only route by which gradient
+                # reaches the encoder (measured: 3.27e-06 collapsed vs 1.72e-03 at
+                # init). β does not fix this; at β=0 the encoder sends 250
+                # bits/frame and they are still ignored.
+                # ẑ_t still reaches the SideInfoEncoder, so the rate stays the
+                # conditional KL and the Wyner-Ziv structure is unchanged.
+                z_ref = torch.zeros_like(z_sid) if self._phase == 1 else z_sid
+
+                z_t   = z_tgt.reshape(-1, *z_tgt.shape[2:])    # (B*P, 4, Hv, Wv)
+                z_hat = z_sid.reshape(-1, *z_sid.shape[2:])    # (B*P, 4, Hv, Wv) — real ẑ_t
+                z_in  = z_ref.reshape(-1, *z_ref.shape[2:])    # what the REFINEMENT sees
 
                 # JSCC Encoder: z_t → q(s_t | z_t)
                 mu_enc, log_var_enc, s_t = jscc(z_t, sample=train)
                 s_tilde = self.system.channel(s_t)             # (B, D_jscc) — received signal
 
-                # Side Info Encoder: ẑ_t → p(s_t | ẑ_t)   [rate loss only]
+                # Side Info Encoder: ẑ_t → p(s̃_t | ẑ_t)   [rate loss only]
                 mu_prior, log_var_prior = side(z_hat)
 
-                # Refinement Diffusion: DDPM x₀-prediction loss
-                L_distortion = refine.forward_ddpm(z_t, z_hat, s_tilde, self.noise_level)
+                # Per-sample distortion and rate so the loss can be re-weighted.
+                # Keep a handle on s̃ so we can watch |dL/ds~| — the gradient that tells
+                # the encoder what to encode. It collapsed 500x below its init value in
+                # the previous run, which is the coordination failure ẑ-dropout targets.
+                if train:
+                    s_tilde.retain_grad()
+                d_i = refine.forward_ddpm(z_t, z_in, s_tilde,
+                                          self.train_noise_max, per_sample=True,
+                                          zhat_dropout=self.zhat_dropout)          # (B,)
+                r_i = SemComSystem.rate_loss(
+                    mu_enc, log_var_enc, mu_prior, log_var_prior, self.snr_db,
+                    per_sample=True)                                               # (B,)
 
-                # Rate: KL( q(s_t|z_t) || p(s_t|ẑ_t) )
-                L_rate = SemComSystem.rate_loss(
-                    mu_enc, log_var_enc, mu_prior, log_var_prior, self.snr_db
-                )
+                # How badly the world model missed on each sample — the operational
+                # definition of "disturbed" (no per-step labels exist in the HDF5).
+                dev = ((z_t - z_hat) ** 2).mean(dim=(1, 2, 3)).detach()            # (B,)
+
+                if self.dev_weighting:
+                    # ~95% of frames are undisturbed, where ẑ_t is already right and the
+                    # channel is useless. Averaging distortion over all of them makes
+                    # "ignore the channel" a near-optimal solution, which is what four
+                    # architectures in a row converged to (measured channel contribution
+                    # ~0.00%). Up-weighting by deviation makes the 5% that actually need
+                    # the transmission carry proportionate gradient.
+                    # NOTE: distortion only — weighting the rate identically would leave
+                    # the distortion/rate ratio unchanged and achieve nothing.
+                    w = (dev / dev.mean().clamp(min=1e-8)).pow(self.dev_weight_pow)
+                    w = w.clamp(max=self.dev_weight_max)
+                    L_distortion = (w * d_i).sum() / w.sum().clamp(min=1e-8)
+                else:
+                    L_distortion = d_i.mean()
+                L_rate = r_i.mean()
                 loss = L_distortion + self.beta_rate * L_rate
+
+                # Split the rate by deviation so adaptation is visible every epoch:
+                # rate_hi/rate_lo > 1 means more bits are spent on disturbed frames.
+                with torch.no_grad():
+                    med = dev.median()
+                    hi, lo = dev >= med, dev < med
+                    if hi.any(): totals["rate_hi"] += r_i[hi].mean().item()
+                    if lo.any(): totals["rate_lo"] += r_i[lo].mean().item()
 
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(jscc.parameters()) + list(side.parameters()) + list(refine.parameters()),
-                        max_norm=5.0,
-                    )
+                    # No DDP wrapper (see __init__) -> average grads across ranks by
+                    # hand. Iterate a FIXED list and materialise missing grads as zeros
+                    # so every rank issues exactly len(sync_params) collectives in the
+                    # same order; an unequal count is what deadlocks NCCL.
+                    if self.world_size > 1:
+                        for q in self.sync_params:
+                            if q.grad is None:
+                                q.grad = torch.zeros_like(q)
+                            dist.all_reduce(q.grad, op=dist.ReduceOp.SUM)
+                            q.grad.div_(self.world_size)
+                    if s_tilde.grad is not None:
+                        totals["gs"] += (s_tilde.grad.norm()
+                                         / s_tilde.detach().norm().clamp(min=1e-12)).item()
+                        n_gs += 1
+                    nn.utils.clip_grad_norm_(self.sync_params, max_norm=5.0)
                     self.optimizer.step()
 
                 totals["distortion"] += L_distortion.item()
@@ -756,18 +890,31 @@ class Stage2Trainer(BaseTrainer):
 
         avg = {}
         for k, v in totals.items():
-            t      = torch.tensor(v / max(n, 1), device=self.device)
+            denom = (n_gs if k == "gs" else n)
+            t      = torch.tensor(v / max(denom, 1), device=self.device)
             avg[k] = reduce_mean(t).item()
         return avg
 
     def train(self):
         best   = self.best
         epochs = self.config["epochs"]
+        p1     = self.phase1_epochs
         if self.is_main:
             print(f"\n[Stage2] JSCC + Refinement Diffusion  {epochs} epochs  "
-                  f"β={self.beta_rate}  SNR={self.snr_db}dB  t''={self.noise_level}")
+                  f"β={self.beta_rate}  SNR={self.snr_db}dB  "
+                  f"train t''~U[1,{self.train_noise_max}]  infer t''={self.noise_level}")
+            if p1 > 0:
+                print(f"[Stage2] two-phase: epochs 1-{p1} withhold ẑ_t from the "
+                      f"refinement (forces a channel pathway), {p1+1}-{epochs} restore it")
 
         for ep in range(self.start_epoch, epochs + 1):
+            # Phase 1 forces the decoder to decode s̃_t; phase 2 hands ẑ_t back so it
+            # learns WHEN to correct. Phase 2 must see the full distribution — running
+            # it on disturbed frames only gave a working channel but over-corrected
+            # calm frames badly (calmest decile ended up ~2x worse than ẑ_t alone).
+            self._phase = 1 if ep <= p1 else 2
+            if self.is_main and ep == p1 + 1 and p1 > 0:
+                print(f"[Stage2] --- entering phase 2: ẑ_t restored ---")
             tr = self._run_epoch(self.train_loader, True,  ep)
             vl = self._run_epoch(self.val_loader,   False, ep)
             self.scheduler.step()
@@ -778,7 +925,9 @@ class Stage2Trainer(BaseTrainer):
                 print(f"[Stage2] ep {ep:3d}/{epochs}  "
                       f"val_dist={vl['distortion']:.5f}  "
                       f"val_rate={vl['rate']:.5f}  "
-                      f"val_total={vl['total']:.5f}")
+                      f"val_total={vl['total']:.5f}  "
+                      f"rate_hi/lo={vl['rate_hi']/max(vl['rate_lo'],1e-12):.2f}x  "
+                      f"|dL/ds~|={tr['gs']:.2e}")
                 if vl["total"] < best:
                     best = vl["total"]
                     self.save_checkpoint("stage2_best.pt", {

@@ -39,5 +39,5 @@ Thumbs.db
 # HuggingFace cache (never commit model weights)
 .cache/
 
-# claude md
+.claude
 CLAUDE.md
