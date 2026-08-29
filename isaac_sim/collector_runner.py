@@ -186,27 +186,75 @@ class InterferenceInjector:
             self.action_events += 1
         return action
 
-    def maybe_teleport_cube(self, cube_prim_path: str) -> bool:
-        if self.rng.random() < self.pose_prob:
-            import omni.isaac.core.utils.prims as prim_utils
-            from pxr import Gf, UsdGeom
-            prim = prim_utils.get_prim_at_path(cube_prim_path)
+    def maybe_teleport_cubes(
+        self,
+        movable_prim_paths: list,
+        all_prim_paths: list | None = None,
+        x_range: tuple | None = None,
+        y_range: tuple | None = None,
+        min_dist: float = 0.12,
+    ) -> bool:
+        """
+        Single probability roll shared by all cubes; if it fires, every cube in
+        movable_prim_paths teleports together (each gets its own random offset).
+        x_range/y_range, if given, clamp each post-teleport position so cubes
+        stay within the robot's reachable workspace (e.g. scene.CUBE_X_RANGE).
+        min_dist enforces the same non-overlap spacing used at episode reset
+        (scene.MIN_CUBE_DIST) against every cube in all_prim_paths, including
+        ones not being moved (e.g. one currently grasped by the gripper).
+        """
+        if self.rng.random() >= self.pose_prob:
+            return False
+        import omni.isaac.core.utils.prims as prim_utils
+        from pxr import Gf, UsdGeom
+
+        def _get_prim_and_pos(prim_path):
+            prim = prim_utils.get_prim_at_path(prim_path)
             if not prim.IsValid():
-                return False
-            dx = self.np_rng.uniform(-self.pose_delta_max, self.pose_delta_max)
-            dy = self.np_rng.uniform(-self.pose_delta_max, self.pose_delta_max)
+                return None, None, None
             for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
                 if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                    cur = op.Get()
-                    op.Set(Gf.Vec3d(
-                        float(cur[0]) + dx,
-                        float(cur[1]) + dy,
-                        float(cur[2]),
-                    ))
+                    return prim, op, op.Get()
+            return prim, None, None
+
+        movable_set = set(movable_prim_paths)
+        placed_xy   = []  # (x, y) of every cube already fixed for this event
+        for prim_path in (all_prim_paths or []):
+            if prim_path in movable_set:
+                continue
+            _, _, cur = _get_prim_and_pos(prim_path)
+            if cur is not None:
+                placed_xy.append((float(cur[0]), float(cur[1])))
+
+        for cube_prim_path in movable_prim_paths:
+            prim, op, cur = _get_prim_and_pos(cube_prim_path)
+            if prim is None or op is None:
+                continue
+
+            new_x, new_y = float(cur[0]), float(cur[1])
+            for _attempt in range(20):
+                dx = self.np_rng.uniform(-self.pose_delta_max, self.pose_delta_max)
+                dy = self.np_rng.uniform(-self.pose_delta_max, self.pose_delta_max)
+                cand_x = float(cur[0]) + dx
+                cand_y = float(cur[1]) + dy
+                if x_range is not None:
+                    cand_x = float(np.clip(cand_x, *x_range))
+                if y_range is not None:
+                    cand_y = float(np.clip(cand_y, *y_range))
+                if all(
+                    np.hypot(cand_x - px, cand_y - py) >= min_dist
+                    for px, py in placed_xy
+                ):
+                    new_x, new_y = cand_x, cand_y
                     break
-            self.pose_events += 1
-            return True
-        return False
+                # else: too close to another cube — resample (falls back to
+                # leaving the cube where it is if no valid spot is found)
+
+            op.Set(Gf.Vec3d(new_x, new_y, float(cur[2])))
+            placed_xy.append((new_x, new_y))
+
+        self.pose_events += 1
+        return True
 
 
 # ============================================================================ #
@@ -289,6 +337,9 @@ def parse_collector_args(
     p.add_argument("--pose_delta_max",      type=float, default=0.15)
     p.add_argument("--scripted", action="store_true",
                    help="Use the scene's scripted_action() instead of the VLA server")
+    p.add_argument("--record_failures", action="store_true",
+                   help="Also save failed episodes to the HDF5 (tagged success=0) "
+                        "instead of discarding them, for debugging failure cases")
     p.add_argument("--headless", action="store_true",
                    help="Run without the Isaac Sim GUI window")
     p.add_argument("--camera", nargs="+", type=int, default=[1],
@@ -371,9 +422,23 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
                 scene.apply_action(action)
 
             if args.interference_pose and hasattr(scene, "cubes"):
-                # Teleport the first dynamic cube (task-agnostic disturbance)
-                first_prim = next(iter(scene.cubes.values()))._prim_path
-                injector.maybe_teleport_cube(first_prim)
+                # Single shared roll: if it fires, all cubes teleport together,
+                # except the one currently grasped (phase >= 2) — teleporting a
+                # cube physics is already holding via the gripper destabilises
+                # the articulation.
+                held_cube = (
+                    getattr(scene, "grasp_target", None)
+                    if getattr(scene, "phase", 0) >= 2 else None
+                )
+                x_range   = getattr(scene, "CUBE_X_RANGE", None)
+                y_range   = getattr(scene, "CUBE_Y_RANGE", None)
+                min_dist  = getattr(scene, "MIN_CUBE_DIST", 0.12)
+                all_paths = [cube.prim_path for cube in scene.cubes.values()]
+                movable_paths = [cube.prim_path for cube in scene.cubes.values()
+                                 if cube is not held_cube]
+                injector.maybe_teleport_cubes(
+                    movable_paths, all_paths, x_range, y_range, min_dist
+                )
 
             obs_buf.append(obs_t)
             act_buf.append(action)
@@ -387,9 +452,11 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
                 break
 
         if not success:
-            print(f"  ep {ep+1:4d}  FAILED — discarded")
+            print(f"  ep {ep+1:4d}  FAILED"
+                  + (" — recorded" if args.record_failures else " — discarded"))
         if success:
             n_success += 1
+        if success or args.record_failures:
             writer.write(obs_buf, act_buf, metadata={
                 "disturbed":       int(args.interference_action or args.interference_pose),
                 "n_action_events": injector.action_events,
@@ -406,11 +473,11 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
         if args.scripted:
             phase = getattr(scene, "phase", "?")
             print(f"  ep {ep+1:4d}/{args.num_episodes}  phase={phase}  "
-                  f"{success_str}  Δp={injector.pose_events}  ETA {eta:.0f}s")
+                  f"{success_str}  d_pose={injector.pose_events}  ETA {eta:.0f}s")
         else:
             avg_lat = total_latency / max(total_requests, 1)
             print(f"  ep {ep+1:4d}/{args.num_episodes}  {success_str}  "
-                  f"Δa={injector.action_events}  Δp={injector.pose_events}  "
+                  f"d_action={injector.action_events}  d_pose={injector.pose_events}  "
                   f"avg_vla={avg_lat:.0f}ms  ETA {eta:.0f}s")
 
     final_rate = 100.0 * n_success / max(args.num_episodes, 1)

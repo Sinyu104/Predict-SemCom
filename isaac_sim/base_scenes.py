@@ -284,6 +284,8 @@ class _FrankaBase(BaseScene):
         goal_pos    : (3,) ndarray   world position of the placement surface
                       goal_pos[2] is the surface z-height (e.g. 0.004 for tray)
         """
+        self.grasp_target = target_cube  # exposes which cube is currently being manipulated
+
         cube_pos, _ = target_cube.get_world_pose()
         ee_pos, _   = self.franka.end_effector.get_world_pose()
 
@@ -298,7 +300,8 @@ class _FrankaBase(BaseScene):
             target       = cube_pos.copy()
             target[2]    = cube_pos[2] + 0.01
             gripper_open = True
-            if ee_pos[2] <= cube_pos[2] + 0.06:
+            xy_aligned   = np.linalg.norm(ee_pos[:2] - cube_pos[:2]) < 0.05
+            if xy_aligned and ee_pos[2] <= cube_pos[2] + 0.06:
                 self._grasp_pos = ee_pos.copy()
                 self._phase     = 2
 
@@ -313,8 +316,16 @@ class _FrankaBase(BaseScene):
                 target    = self._grasp_pos.copy()
                 target[2] = self.LIFT_HEIGHT
                 if ee_pos[2] >= self.LIFT_HEIGHT - 0.02:
-                    self._phase      = 3
-                    self._grip_timer = 0
+                    if cube_pos[2] > self.CUBE_GROUND_Z + 0.05:
+                        # cube rose with the gripper — grasp actually succeeded
+                        self._phase      = 3
+                        self._grip_timer = 0
+                    else:
+                        # gripper closed on empty space — cube never left the
+                        # ground; re-approach instead of "transporting" nothing
+                        self._phase      = 0
+                        self._grip_timer = 0
+                        self._grasp_pos  = None
 
         elif self._phase == 3:
             gripper_open = False
