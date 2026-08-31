@@ -270,6 +270,7 @@ class MultiTaskStepDataset(TorchDataset):
         frame_stride:         int = 1,
         non_transition_prob:  float = 0.0,
         transition_lookahead: int = 16,
+        dagger_episodes_per_task: int = 0,
     ):
         self.n_per_task           = n_episodes_per_task
         self.frame_stride         = frame_stride
@@ -280,32 +281,48 @@ class MultiTaskStepDataset(TorchDataset):
         self.samples      = []
 
         for task_dir in task_dirs:
-            hdf5 = os.path.join(task_dir, "demos.hdf5")
             json_ = os.path.join(task_dir, "task.json")
-            if not os.path.isfile(hdf5):
+            if not os.path.isfile(os.path.join(task_dir, "demos.hdf5")):
                 print(f"[Dataset] Skipping {task_dir}: no demos.hdf5")
                 continue
             if not os.path.isfile(json_):
                 raise FileNotFoundError(f"task.json missing in {task_dir}")
             with open(json_) as f:
                 instr = json.load(f).get("instruction", "")
-            with h5py.File(hdf5, "r") as f:
-                ep_keys = sorted(
-                    [k for k in f.keys()
-                     if "observations_cam1" in f[k] and "actions" in f[k]],
-                    key=lambda k: int(k.split("_")[1]),
-                )
-                ep_len = {k: len(f[k]["actions"]) for k in ep_keys}
-            self._task_meta.append((hdf5, instr, ep_keys, ep_len))
-            print(f"[Dataset] {hdf5}: {len(ep_keys)} eps  instr={instr!r:.60s}")
+
+            # DAgger aggregation: register dagger.hdf5 as a second pool for this
+            # task, with its own per-epoch episode cap, so each epoch mixes
+            # expert demos with on-policy corrections (D <- D u D_new).
+            # Training on the DAgger file ALONE dropped success from 45% to 10%
+            # (2026-08, epochs 24/25) — DAgger data is failure-states only, so
+            # without the demos the policy has no successful grasp to imitate.
+            sources = [("demos.hdf5", n_episodes_per_task)]
+            if dagger_episodes_per_task > 0:
+                sources.append(("dagger.hdf5", dagger_episodes_per_task))
+
+            for fname, n_cap in sources:
+                hdf5 = os.path.join(task_dir, fname)
+                if not os.path.isfile(hdf5):
+                    print(f"[Dataset] {task_dir}: no {fname}, skipping that pool")
+                    continue
+                with h5py.File(hdf5, "r") as f:
+                    ep_keys = sorted(
+                        [k for k in f.keys()
+                         if "observations_cam1" in f[k] and "actions" in f[k]],
+                        key=lambda k: int(k.split("_")[1]),
+                    )
+                    ep_len = {k: len(f[k]["actions"]) for k in ep_keys}
+                self._task_meta.append((hdf5, instr, ep_keys, ep_len, n_cap))
+                print(f"[Dataset] {hdf5}: {len(ep_keys)} eps  "
+                      f"cap={n_cap}/epoch  instr={instr!r:.60s}")
 
         print(f"[Dataset] {len(self._task_meta)} tasks. Call resample(epoch).")
 
     def resample(self, epoch: int):
         rng = np.random.default_rng(epoch)
         self.samples = []
-        for hdf5, instr, ep_keys, ep_len in self._task_meta:
-            n = min(self.n_per_task, len(ep_keys))
+        for hdf5, instr, ep_keys, ep_len, n_cap in self._task_meta:
+            n = min(n_cap, len(ep_keys))
             chosen = rng.choice(ep_keys, size=n, replace=False)
             for ep in chosen:
                 for t in range(0, ep_len[ep], self.frame_stride):
@@ -332,8 +349,11 @@ class MultiTaskStepDataset(TorchDataset):
                   f"({100*n_transition/max(len(self.samples),1):.1f}% transition)")
 
         rng.shuffle(self.samples)
+        n_dagger = sum(1 for s in self.samples if s[0].endswith("dagger.hdf5"))
+        extra = (f", {n_dagger} from dagger.hdf5 "
+                 f"({100*n_dagger/max(len(self.samples),1):.1f}%)") if n_dagger else ""
         print(f"[Dataset] epoch={epoch}: {len(self.samples)} samples "
-              f"({len(self._task_meta)} tasks × ≤{self.n_per_task} eps)")
+              f"from {len(self._task_meta)} pools{extra}")
 
     def _h(self, path):
         if path not in self._handles:
@@ -569,6 +589,7 @@ def finetune(args):
         frame_stride=args.frame_stride,
         non_transition_prob=args.non_transition_prob,
         transition_lookahead=args.transition_lookahead,
+        dagger_episodes_per_task=args.dagger_episodes_per_task,
     )
 
     # ── Optimizer ───────────────────────────────────────────────────── #
@@ -984,6 +1005,11 @@ def parse_args():
     p.add_argument("--data_dir", type=str, default="data")
     p.add_argument("--episodes_per_task", type=int, default=25,
                    help="Episodes sampled per task per epoch")
+    p.add_argument("--dagger_episodes_per_task", type=int, default=0,
+                   help="Also sample this many episodes per task from "
+                        "data/<task>/dagger.hdf5 each epoch (0=off). Aggregates "
+                        "on-policy corrections WITH the expert demos; never "
+                        "train on dagger.hdf5 alone.")
     p.add_argument("--frame_stride", type=int, default=1)
 
     # Training hyper-params
