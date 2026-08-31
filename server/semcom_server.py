@@ -324,13 +324,27 @@ class PolicyClient:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print("[SemCom] Policy server connected.")
 
-    def predict(self, img_rgb: np.ndarray, instruction: str) -> list:
-        buf = io.BytesIO()
-        Image.fromarray(img_rgb).save(buf, format="JPEG", quality=self.jpeg_quality)
+    def predict(self, img_rgb: np.ndarray, instruction: str,
+                passthrough_b64: str | None = None) -> list:
+        """
+        passthrough_b64 : the client's original JPEG, forwarded byte-for-byte.
+
+        Only valid when the pipeline did NOT modify the image (bypass mode).
+        Re-encoding an unchanged frame would put it through JPEG a second time
+        — measured at 0.73/255 mean abs change — which would make the bypass
+        control merely close to the old two-process path instead of identical
+        to it.
+        """
+        if passthrough_b64 is not None:
+            jpeg_b64 = passthrough_b64
+        else:
+            buf = io.BytesIO()
+            Image.fromarray(img_rgb).save(buf, format="JPEG", quality=self.jpeg_quality)
+            jpeg_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         self._seq += 1
         payload = json.dumps({
             "seq":         self._seq,
-            "jpeg_b64":    base64.b64encode(buf.getvalue()).decode("utf-8"),
+            "jpeg_b64":    jpeg_b64,
             "instruction": instruction,
             "unnorm_key":  "franka_isaac",
         }).encode()
@@ -406,11 +420,19 @@ def run_server(args):
                 # -- episode boundary -------------------------------------- #
                 ep = data.get("episode")
                 if ep is None:
-                    if not warned_no_episode and args.mode != "bypass":
-                        print("[SemCom] WARNING: client sent no 'episode' field. "
-                              "History will NOT be reset between episodes, so the "
-                              "predictor will condition on frames from the previous "
-                              "scene. Update isaac_sim/vla_runner.py.", flush=True)
+                    # Warn in EVERY mode, including bypass. Bypass keeps no
+                    # history so it is harmless here — but bypass is precisely
+                    # the run used to validate the protocol, so staying quiet
+                    # would let a missing field reach `full` undetected.
+                    if not warned_no_episode:
+                        harmless = " (harmless in bypass, FATAL in other modes)" \
+                                   if args.mode == "bypass" else ""
+                        print(f"[SemCom] WARNING: client sent no 'episode' field"
+                              f"{harmless}. History will NOT be reset between "
+                              f"episodes, so the predictor would condition on "
+                              f"frames from the previous scene. The Windows "
+                              f"checkout needs commit 196730e "
+                              f"(VLAClient.new_episode()).", flush=True)
                         warned_no_episode = True
                 elif ep != pipeline.episode:
                     pipeline.episode = ep
@@ -432,7 +454,12 @@ def run_server(args):
 
                 t0 = time.perf_counter()
                 x_tilde, timings = pipeline.step(obs_rgb, prev_act)
-                action = policy.predict(x_tilde, instr)
+                # In bypass the frame is untouched, so forward the client's own
+                # bytes and keep the control bit-exact with the 2-process path.
+                action = policy.predict(
+                    x_tilde, instr,
+                    passthrough_b64=data["jpeg_b64"] if args.mode == "bypass" else None,
+                )
                 prev_act = action
                 ms = (time.perf_counter() - t0) * 1000
 
