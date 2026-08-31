@@ -136,6 +136,7 @@ def evaluate_task(task_name: str, args) -> dict:
 
     for ep in range(args.num_episodes):
         scene.reset(randomise=True)
+        client.new_episode()   # stateful servers reset per-episode history on this
         obs_t   = scene.get_obs()
         success = False
         step    = 0

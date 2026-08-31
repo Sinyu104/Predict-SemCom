@@ -65,6 +65,7 @@ class VLAClient:
         self.jpeg_quality = jpeg_quality
 
         self._seq     = 0
+        self._episode = 0
         self._pending = {}
         self._results = {}
         self._lock    = threading.Lock()
@@ -105,6 +106,15 @@ class VLAClient:
         pil.save(buf, format="JPEG", quality=self.jpeg_quality)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+    def new_episode(self):
+        """
+        Mark the start of a new episode.  Stateful servers (semcom_server.py)
+        key their per-episode history off this, so it MUST be called after every
+        scene.reset() — otherwise the world model conditions on frames from the
+        previous episode.  Stateless servers ignore the field.
+        """
+        self._episode += 1
+
     def request_action(self, obs_rgb: np.ndarray) -> np.ndarray:
         """Publish obs, block until server replies, return (7,) float32 action."""
         from std_msgs.msg import String
@@ -118,6 +128,7 @@ class VLAClient:
         msg      = String()
         msg.data = json.dumps({
             "seq":         seq,
+            "episode":     self._episode,
             "jpeg_b64":    self._compress(obs_rgb),
             "instruction": self.instruction,
             "unnorm_key":  self.unnorm_key,

@@ -15,8 +15,11 @@ Stage 2 — JSCC + Refinement Diffusion (second diffusion):
       --svd_path stabilityai/stable-video-diffusion-img2vid \\
       --stored_data data/train.hdf5
 
-Inference:
-  python main.py --inference --snr_db 10 --stored_data data/eval.hdf5
+Evaluation (not in this file):
+  Online, closed-loop with the policy and Isaac Sim:
+    python server/semcom_server.py --mode full --snr_db 10 ...
+  Offline latent-space metrics (channel contribution vs raw prediction):
+    python experiments/stage2_twophase/twophase.py --pre <shards> --out <dir>
 """
 
 import argparse
@@ -176,7 +179,7 @@ def resolve_tasks(tasks_arg: list[str]) -> list[str]:
 def parse_args():
     p = argparse.ArgumentParser(description="VAE-latent Wyner-Ziv SemCom System")
     p.add_argument("--train",     action="store_true")
-    p.add_argument("--inference", action="store_true")
+    # (--inference removed: inference.py was stale since 2026-05 and unreachable)
     p.add_argument("--val_only",  action="store_true")
 
     p.add_argument("--stage",         type=int,   default=1)
@@ -364,22 +367,11 @@ def main():
             resume_ckpt  = ckpt_path,
         ).validate()
 
-    elif args.inference:
-        for candidate in ["stage2_best.pt", "stage1_best.pt"]:
-            ckpt = os.path.join(out, candidate)
-            if os.path.exists(ckpt):
-                break
-        else:
-            raise FileNotFoundError(f"No checkpoint found in '{out}'.")
-
-        vae    = build_vae(args, CONFIG)
-        policy = build_policy(args, CONFIG, vae)
-        from inference import run_inference
-        print(f"\n[main] ===== INFERENCE  snr={CONFIG['snr_db']}dB  ckpt={os.path.basename(ckpt)} =====")
-        run_inference(CONFIG, data_path, ckpt, device, vae, policy)
-
     else:
-        print("[main] Specify --train, --inference, or --val_only.")
+        print("[main] Specify --train or --val_only. "
+              "For evaluation, run server/semcom_server.py (online, closed-loop "
+              "with the policy) or experiments/stage2_twophase/twophase.py "
+              "(offline latent-space metrics).")
 
     cleanup_distributed()
 
