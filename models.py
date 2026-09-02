@@ -519,21 +519,49 @@ class FadingChannel(nn.Module):
         return h.real.contiguous(), h.imag.contiguous()
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        """s: (B, D_jscc) → s̃: (B, D_jscc)"""
+        """
+        s: (B, D_jscc) → s̃: (B, D_jscc)
+
+        Consecutive real values are paired into complex baseband symbols, so
+        D_jscc reals occupy D_jscc/2 complex channel uses:
+
+            x_k   = s_{2k} + j s_{2k+1}
+            y_k   = h_k x_k + n_k ,   n_k ~ CN(0, N0),  N0 = E|x|^2 / snr_lin
+            x̂_k   = y_k conj(h_k) / |h_k|^2            (coherent ZF)
+
+        This makes the measured SNR equal the nominal `snr_db` exactly.  The
+        earlier formulation put a REAL s on both quadratures with N0/2 of noise
+        in each, then discarded the imaginary branch for AWGN (h_im = 0) — so
+        only half the noise was ever seen and every measurement came out 3 dB
+        optimistic.
+        """
         B, D      = s.shape
+        if D % 2 != 0:
+            raise ValueError(
+                f"D_jscc must be even to form complex symbols, got {D}.")
         sig_power = s.pow(2).mean(dim=-1, keepdim=True).clamp(min=1e-8)
         snr_lin   = 10.0 ** (self.snr_db / 10.0)
+
+        x_re, x_im = s[:, 0::2], s[:, 1::2]                    # (B, D/2) each
+        # E|x|^2 = 2*sig_power, so N0 = 2*sig_power/snr_lin and each quadrature
+        # carries N0/2 = sig_power/snr_lin.
         noise_std = (sig_power / snr_lin).sqrt()
 
-        h_re, h_im = self._sample_gains(B, D, s.device)
+        h_re, h_im = self._sample_gains(B, D // 2, s.device)
 
-        n_re = noise_std * torch.randn_like(s) / math.sqrt(2)
-        n_im = noise_std * torch.randn_like(s) / math.sqrt(2)
-        y_re = h_re * s + n_re
-        y_im = h_im * s + n_im
+        # y = h x + n   (complex multiply)
+        y_re = h_re * x_re - h_im * x_im + noise_std * torch.randn_like(x_re)
+        y_im = h_re * x_im + h_im * x_re + noise_std * torch.randn_like(x_im)
 
+        # ZF: x̂ = y conj(h) / |h|^2
         h_mag_sq = (h_re.pow(2) + h_im.pow(2)).clamp(min=1e-8)
-        return (y_re * h_re + y_im * h_im) / h_mag_sq
+        xh_re = ( y_re * h_re + y_im * h_im) / h_mag_sq
+        xh_im = (-y_re * h_im + y_im * h_re) / h_mag_sq
+
+        out = torch.empty_like(s)
+        out[:, 0::2] = xh_re
+        out[:, 1::2] = xh_im
+        return out
 
 
 class RayleighChannel(FadingChannel):

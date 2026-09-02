@@ -271,6 +271,7 @@ class MultiTaskStepDataset(TorchDataset):
         non_transition_prob:  float = 0.0,
         transition_lookahead: int = 16,
         dagger_episodes_per_task: int = 0,
+        dagger_files:         tuple = ("dagger.hdf5",),
     ):
         self.n_per_task           = n_episodes_per_task
         self.frame_stride         = frame_stride
@@ -298,7 +299,10 @@ class MultiTaskStepDataset(TorchDataset):
             # without the demos the policy has no successful grasp to imitate.
             sources = [("demos.hdf5", n_episodes_per_task)]
             if dagger_episodes_per_task > 0:
-                sources.append(("dagger.hdf5", dagger_episodes_per_task))
+                # One pool per DAgger generation, each with its own cap, so
+                # successive rounds accumulate instead of the newest replacing
+                # the previous one.
+                sources += [(f, dagger_episodes_per_task) for f in dagger_files]
 
             for fname, n_cap in sources:
                 hdf5 = os.path.join(task_dir, fname)
@@ -349,7 +353,8 @@ class MultiTaskStepDataset(TorchDataset):
                   f"({100*n_transition/max(len(self.samples),1):.1f}% transition)")
 
         rng.shuffle(self.samples)
-        n_dagger = sum(1 for s in self.samples if s[0].endswith("dagger.hdf5"))
+        n_dagger = sum(1 for s in self.samples
+                       if os.path.basename(s[0]).startswith("dagger"))
         extra = (f", {n_dagger} from dagger.hdf5 "
                  f"({100*n_dagger/max(len(self.samples),1):.1f}%)") if n_dagger else ""
         print(f"[Dataset] epoch={epoch}: {len(self.samples)} samples "
@@ -590,6 +595,7 @@ def finetune(args):
         non_transition_prob=args.non_transition_prob,
         transition_lookahead=args.transition_lookahead,
         dagger_episodes_per_task=args.dagger_episodes_per_task,
+        dagger_files=tuple(args.dagger_files),
     )
 
     # ── Optimizer ───────────────────────────────────────────────────── #
@@ -1010,6 +1016,10 @@ def parse_args():
                         "data/<task>/dagger.hdf5 each epoch (0=off). Aggregates "
                         "on-policy corrections WITH the expert demos; never "
                         "train on dagger.hdf5 alone.")
+    p.add_argument("--dagger_files", nargs="+", default=["dagger.hdf5"],
+                   help="DAgger filenames under data/<task>/, one pool each, "
+                        "so successive rounds accumulate (e.g. dagger.hdf5 "
+                        "dagger_round1.hdf5).")
     p.add_argument("--frame_stride", type=int, default=1)
 
     # Training hyper-params
