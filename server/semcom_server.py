@@ -152,10 +152,13 @@ class SemComPipeline:
         static, so repeat-padding is a mild approximation.  It only affects the
         first `num_history` steps of a ~300-step episode.
         """
-        frames = list(self.z_hist)
+        frames = list(self.z_hist)          # each (C, H, W)
         while len(frames) < self.num_history:
             frames.insert(0, frames[0])
-        return torch.stack(frames, dim=1)
+        out = torch.stack(frames, dim=0).unsqueeze(0)   # (1, num_history, C, H, W)
+        assert out.ndim == 5 and out.shape[1] == self.num_history, \
+            f"history tensor must be (1, {self.num_history}, C, H, W), got {tuple(out.shape)}"
+        return out
 
     def _action_tensor(self) -> torch.Tensor:
         """(1, num_history + num_pred, action_dim), oldest first."""
@@ -198,7 +201,8 @@ class SemComPipeline:
             z_pred = self.ctrl_world.predict_next_latent(
                 self._history_tensor(), self._action_tensor(), n_steps=self.n_ddim,
             )                                            # (1, num_pred, C, H, W)
-            z_hat = z_pred[:, 0]
+            # Ctrl-World runs in fp16; the refinement network is fp32.
+            z_hat = z_pred[:, 0].float()
         t["ctrl_world"] = time.perf_counter() - t0
 
         # -- transmitter: JSCC over the channel ---------------------------- #

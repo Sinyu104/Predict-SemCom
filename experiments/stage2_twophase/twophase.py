@@ -35,7 +35,27 @@ ap.add_argument("--drop2",type=float, default=0.30, help="phase-2 z_hat dropout"
 ap.add_argument("--bs",   type=int, default=64)
 ap.add_argument("--lr",   type=float, default=1e-4)
 ap.add_argument("--beta", type=float, default=0.01)
+ap.add_argument("--t2max", type=int, default=0,
+                help="SDEdit level t'' for phase 2: sample t~U[1,t2max], noise z_hat, "
+                     "denoise conditioned on (z_hat, s~). 0 = the current direct "
+                     "single-step corrector, which has NO mechanism to distrust z_hat. "
+                     "A prior sweep found 0 optimal, but that was measured when z_hat "
+                     "was ~95% correct; in the closed loop it carries 0.10-0.24 error, "
+                     "so noising it costs far less.")
+ap.add_argument("--eval_steps", type=int, default=10,
+                help="DDIM steps at evaluation when --t2max > 0.")
+ap.add_argument("--init", type=str, default=None,
+                help="Warm-start from an existing checkpoint (e.g. a phase1.pt with "
+                     "an already-working s~ decoder). Use with --ep1 0 to skip "
+                     "phase 1 and spend the budget on phase 2 only.")
+ap.add_argument("--D_jscc", type=int, default=None,
+                help="Override CONFIG['D_jscc'] (channel symbols per step). The "
+                     "channel can only help where it beats the predictor: phase-1 "
+                     "val_dist is what s~ ALONE supports, so sweep this and compare "
+                     "it against the mean deviation ||z_t - z_hat||^2.")
 a=ap.parse_args()
+if a.D_jscc is not None:
+    CONFIG["D_jscc"]=a.D_jscc
 DEV="cuda:0"; os.makedirs(a.out, exist_ok=True)
 
 ZT=[];ZH=[]
@@ -62,6 +82,12 @@ print(flush=True)
 devk=dev
 
 sysm=SemComSystem(CONFIG).to(DEV)
+if a.init:
+    _d=torch.load(a.init,map_location="cpu")
+    _st=_d.get("system_state",_d)
+    _miss,_unexp=sysm.load_state_dict(_st,strict=False)
+    print(f"[init] warm-started from {a.init}  "
+          f"({len(_st)} tensors, {len(_miss)} missing, {len(_unexp)} unexpected)",flush=True)
 params=list(sysm.jscc_encoder.parameters())+list(sysm.side_info_encoder.parameters())+ \
        list(sysm.refinement_diffusion.parameters())
 opt=torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
@@ -88,8 +114,15 @@ def run(idx, train, phase, drop):
                 h_ref=h*(1-m)                            # dropped => base gone too
             else:
                 h_ref=h
-            pred=sysm.refinement_diffusion._denoise_x0(
-                    h_ref, torch.zeros(B,dtype=torch.long,device=DEV), h_ref, st)
+            rd=sysm.refinement_diffusion
+            if a.t2max>0 and phase==2:
+                tmax=min(int(a.t2max), len(rd.alphas_cumprod)-1)
+                tt=torch.randint(1,tmax+1,(B,),device=DEV)
+                ab=rd.alphas_cumprod[tt].view(B,1,1,1).float()
+                x_in=ab.sqrt()*h_ref+(1.0-ab).sqrt()*torch.randn_like(h_ref)
+            else:
+                tt=torch.zeros(B,dtype=torch.long,device=DEV); x_in=h_ref
+            pred=rd._denoise_x0(x_in, tt, h_ref, st)
             d=((pred-z)**2).mean()
             q=lv_e.exp()+sig_n; pv=lv_p.exp().clamp(min=1e-8)
             r=(0.5*(pv.log()-q.log()+(q+(mu_e-mu_p).pow(2))/pv-1.0)).mean()
@@ -129,9 +162,16 @@ def evaluate(idx, label):
         for i in range(0,len(idx),a.bs):
             sel=idx[i:i+a.bs]; z=ZT[sel].to(DEV); h=ZH[sel].to(DEV); B=len(z)
             _,_,s=sysm.jscc_encoder(z,sample=False); st=sysm.channel(s)
-            t0=torch.zeros(B,dtype=torch.long,device=DEV)
-            pa=sysm.refinement_diffusion._denoise_x0(h,t0,h,st)
-            pb=sysm.refinement_diffusion._denoise_x0(h,t0,h,torch.zeros_like(st))
+            if a.t2max>0:
+                pa=sysm.refinement_diffusion.sdedit_refine(h,st,noise_level=a.t2max,
+                                                           n_steps=a.eval_steps)
+                pb=sysm.refinement_diffusion.sdedit_refine(h,torch.zeros_like(st),
+                                                           noise_level=a.t2max,
+                                                           n_steps=a.eval_steps)
+            else:
+                t0=torch.zeros(B,dtype=torch.long,device=DEV)
+                pa=sysm.refinement_diffusion._denoise_x0(h,t0,h,st)
+                pb=sysm.refinement_diffusion._denoise_x0(h,t0,h,torch.zeros_like(st))
             A.append(((pa-z)**2).mean(dim=(1,2,3)).cpu())
             Bl.append(((pb-z)**2).mean(dim=(1,2,3)).cpu())
     A=torch.cat(A).numpy(); Bl=torch.cat(Bl).numpy(); C=dev[idx].numpy()
