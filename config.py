@@ -53,21 +53,37 @@ CONFIG = {
 
     # ── JSCC / Channel ───────────────────────────────────────────────── #
     "D_jscc":      256,    # transmitted symbols per step
-    "snr_db":      10.0,   # Rayleigh channel SNR in dB (sweep for ablation)
+    "snr_db":      10.0,   # channel SNR in dB (sweep for ablation)
+
+    # Stage-2 analog channel model (mirrors baselines/traditional/sionna_channel.py).
+    # channel_type: "awgn" (no fading) | "rayleigh" (flat) | "cdl" (3GPP TR-38.901).
+    # The cdl_* keys are only used when channel_type == "cdl" (needs Sionna).
+    "channel_type":     "rayleigh",
+    "cdl_model":        "C",       # CDL profile A–E
+    "cdl_delay_spread": 100e-9,    # RMS delay spread (s)
+    "cdl_carrier_freq": 3.5e9,     # carrier frequency (Hz)
+    "cdl_max_speed":    3.0,       # max UE speed (m/s) → Doppler
 
     # ── JSCC module dims ─────────────────────────────────────────────── #
     "jscc_d_hidden": 512,  # hidden dim for JsccEncoder / SideInfoEncoder MLPs
 
     # ── Ctrl-World (Stage 1 — first diffusion, SVD-based) ────────────── #
     "svd_model_name":          "stabilityai/stable-video-diffusion-img2vid",
+    "obs_key":                  "observations_cam1",  # camera to train on (cam1 = left base)
     "num_history":              6,    # history frames fed to Ctrl-World
-    "num_pred":                 10,   # future frames to predict
+    "num_pred":                 8,    # predict K=8 steps ahead (delay-pipeline horizon; uses K known past actions)
     "noise_level_first":        500,  # max DDPM timestep t' sampled during Ctrl-World training
     "ctrl_world_n_steps":       10,   # DDIM denoising steps at Ctrl-World inference (pure noise → z_hat)
     "finetune_unet_cross_attn": True, # unfreeze UNet attn2 layers to help with gripper/OOD regions
 
     # ── Refinement Diffusion (Stage 2 — second diffusion) ────────────── #
-    "noise_level_second": 250,  # SDEdit noise level t'' < t'; controls how much to deviate from ẑ_t
+    "noise_level_second":   0,  # 0 = direct single forward pass at inference
+                                # (INFERENCE only — the sdedit_refine starting point)
+    # Training samples t'' ~ U[1, noise_level_train]. Now that forward_ddpm noises ẑ_t
+    # instead of z_t, the target is never present in the input, so there is no leak to
+    # guard against and the full 1000-step schedule is no longer needed. Train over the
+    # same range inference uses so no capacity is spent on levels never seen.
+    "noise_level_train":    0,   # 0 = direct correction, no diffusion loop (measured optimal)
     "refine_d_model":     256,  # internal dim for RefinementDiffusion denoiser transformer
     "refine_n_heads":       8,  # cross-attention heads in RefinementDiffusion
     "refine_n_layers":      4,  # number of transformer blocks in RefinementDiffusion
@@ -75,10 +91,40 @@ CONFIG = {
 
     # ── Clip length for Stage 1/2 training ───────────────────────────── #
     # clip_length = num_history + num_pred (auto-overridden in main.py)
-    "clip_length": 16,   # 6 history + 10 pred
-    "clip_stride": 4,    # sample every k-th frame; actions summed over k steps
+    "clip_length": 14,   # 6 history + 8 pred (auto-overridden in main.py)
+    "clip_stride": 1,    # consecutive frames; one action per step (no summing)
+
+    # ── Stage 2 two-phase schedule ───────────────────────────────────── #
+    # Epochs 1..N withhold ẑ_t from the refinement entirely (input, conditioning and
+    # residual base), so the decoder cannot emit anything without decoding s̃_t and is
+    # forced to build a channel pathway. Without this it converges to ignoring the
+    # channel — it holds ẑ_t (~95% correct), so suppressing a noisy s̃_t is locally
+    # optimal, and that zeroes ∂L/∂s̃, the only route by which gradient reaches the
+    # encoder. Measured |∂L/∂s̃| 3.27e-06 collapsed vs 1.72e-03 at init; with the
+    # two-phase schedule it held at ~1e-04 and kept rising.
+    # ẑ_t still reaches the SideInfoEncoder throughout, so the rate stays the
+    # conditional KL and the encoder never sees ẑ_t — Wyner-Ziv is unchanged.
+    # 0 disables the schedule (single-phase, the old behaviour).
+    "stage2_phase1_epochs": 3,
 
     # ── Stage 2 loss ─────────────────────────────────────────────────── #
+    # ẑ_t-dropout: hide the prediction from the correction path on this fraction of
+    # samples, so the decoder cannot converge to ignoring the channel. Default OFF:
+    # this variant KEEPS the residual base on dropped samples, which lets the network
+    # emit delta=0 and fall back to ẑ_t rather than decoding s̃_t — measured ineffective
+    # (|dL/ds̃| still collapsed to 2.9e-06, vs 1.7e-03 at init). The variant that works
+    # drops the residual base too; see the two-phase schedule.
+    "zhat_dropout":    0.0,
+
+    # Deviation-weighted distortion: weight each sample by ||z_t - ẑ_t||² so the ~5% of
+    # genuinely disturbed frames (pose_prob=0.05 in the collector) are not drowned out
+    # by the 95% where ẑ_t is already correct and the channel is useless. Default OFF:
+    # measured a 2.65x gradient shift onto disturbed frames, which was not on its own
+    # enough to make the decoder use the channel.
+    "dev_weighting":   False,
+    "dev_weight_pow":  1.0,   # w = (dev/mean_dev)^pow ; raise for sharper targeting
+    "dev_weight_max": 10.0,   # clamp so one outlier cannot dominate a batch
+
     "beta_rate":  0.01,   # β weighting L_rate = KL(q||p)
     "lambda_rate": 0.01,  # alias for beta_rate (backward compatibility)
 
