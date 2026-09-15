@@ -2,6 +2,11 @@
 
 A research implementation of a **Predictive Semantic Communication System** for bandwidth-efficient robot control over Rayleigh fading wireless channels.
 
+> **Running PI0Fast fine-tuning on the Narval (Compute Canada / Alliance) cluster?**
+> See [`NARVAL_SETUP.md`](NARVAL_SETUP.md) first — the environment setup below is for
+> the lab's own server and does not apply there (different venv, different `lerobot`
+> version pin, offline-cluster quirks, login-node compute-policy rules).
+
 ---
 
 ## Core Idea

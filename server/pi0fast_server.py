@@ -39,6 +39,15 @@ Fine-tune (action-expert only — less VRAM):
         --finetune_output outputs/pi0fast_finetuned \\
         --freeze_vision --freeze_language
 
+Full fine-tune (all params — like `lerobot-train --policy.type=pi0_fast`):
+    python server/pi0fast_server.py \\
+        --model_dir /path/to/pi0-fast \\
+        --tasks all \\
+        --finetune_output outputs/pi0fast_full_finetuned \\
+        --full_finetune
+    # Needs much more VRAM/host RAM than LoRA (fp32 AdamW: params + 2 moments,
+    # ~3x model size, sharded via FSDP). Checkpoints write full_weights.pt.
+
 Resume from checkpoint:
     python server/pi0fast_server.py \\
         --resume_from outputs/pi0fast_finetuned/checkpoint_epoch5 \\
@@ -325,15 +334,19 @@ class MultiTaskDemoDataset(torch.utils.data.Dataset):
         chunk_size:         int = 30,
         n_episodes_per_task: int = 25,
         frame_stride:       int = 1,
+        val_split:          float = 0.0,
+        val_seed:           int = 0,
     ):
         self.chunk_size          = chunk_size
         self.n_episodes_per_task = n_episodes_per_task
         self.frame_stride        = frame_stride
+        self.val_split           = val_split
 
         # Metadata only — no pixel arrays loaded
-        self._task_meta = []   # list of (hdf5_path, instruction, ep_keys, ep_lengths)
-        self._handles   = {}   # hdf5_path → open h5py.File (opened lazily)
-        self.samples    = []   # populated by resample()
+        self._task_meta  = []   # list of (hdf5_path, instruction, train_ep_keys, ep_lengths)
+        self._handles    = {}   # hdf5_path → open h5py.File (opened lazily)
+        self.samples     = []   # populated by resample() — training samples only
+        self.val_samples = []   # fixed held-out samples, built once here
 
         for task_dir in task_dirs:
             hdf5_path = os.path.join(task_dir, "demos.hdf5")
@@ -355,20 +368,42 @@ class MultiTaskDemoDataset(torch.utils.data.Dataset):
                 )
                 ep_lengths = {k: len(f[k]["actions"]) for k in ep_keys}
 
-            self._task_meta.append((hdf5_path, instruction, ep_keys, ep_lengths))
-            print(f"[MultiTaskDemoDataset] Scanned {hdf5_path}: "
-                  f"{len(ep_keys)} episodes")
+            # Episode-level split (not frame-level): chunks within an episode
+            # overlap, so splitting by frame would leak near-identical windows
+            # into both train and val. Fixed seed independent of the training
+            # epoch RNG so the held-out episodes never change across epochs —
+            # that's what makes val_loss comparable epoch-to-epoch.
+            if val_split > 0 and len(ep_keys) > 1:
+                shuffled = list(ep_keys)
+                np.random.default_rng(val_seed).shuffle(shuffled)
+                n_val         = max(1, round(len(shuffled) * val_split))
+                val_ep_keys   = shuffled[:n_val]
+                train_ep_keys = shuffled[n_val:]
+            else:
+                val_ep_keys, train_ep_keys = [], ep_keys
 
-        print(f"[MultiTaskDemoDataset] {len(self._task_meta)} tasks ready. "
-              f"Call resample(epoch) to build sample index.")
+            self._task_meta.append((hdf5_path, instruction, train_ep_keys, ep_lengths))
+
+            for ep_key in val_ep_keys:
+                T = ep_lengths[ep_key]
+                for t in range(0, T - self.chunk_size, self.frame_stride):
+                    self.val_samples.append((hdf5_path, ep_key, t, instruction))
+
+            print(f"[MultiTaskDemoDataset] Scanned {hdf5_path}: "
+                  f"{len(ep_keys)} episodes "
+                  f"({len(train_ep_keys)} train / {len(val_ep_keys)} val)")
+
+        print(f"[MultiTaskDemoDataset] {len(self._task_meta)} tasks ready, "
+              f"{len(self.val_samples)} fixed validation samples. "
+              f"Call resample(epoch) to build the training sample index.")
 
     def resample(self, epoch: int):
-        """Randomly select n_episodes_per_task episodes per task for this epoch."""
+        """Randomly select n_episodes_per_task TRAIN episodes per task for this epoch."""
         rng = np.random.default_rng(epoch)
         self.samples = []   # (hdf5_path, ep_key, t, instruction)
-        for hdf5_path, instruction, ep_keys, ep_lengths in self._task_meta:
-            n = min(self.n_episodes_per_task, len(ep_keys))
-            chosen = rng.choice(ep_keys, size=n, replace=False)
+        for hdf5_path, instruction, train_ep_keys, ep_lengths in self._task_meta:
+            n = min(self.n_episodes_per_task, len(train_ep_keys))
+            chosen = rng.choice(train_ep_keys, size=n, replace=False)
             for ep_key in chosen:
                 T = ep_lengths[ep_key]
                 for t in range(0, T - self.chunk_size, self.frame_stride):
@@ -385,8 +420,7 @@ class MultiTaskDemoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
-        hdf5_path, ep_key, t, instruction = self.samples[idx]
+    def _load_sample(self, hdf5_path, ep_key, t, instruction):
         f = self._get_handle(hdf5_path)
 
         def to_tensor(arr):
@@ -402,6 +436,27 @@ class MultiTaskDemoDataset(torch.utils.data.Dataset):
         act_chunk = torch.from_numpy(chunk)
 
         return cam1, cam2, act_chunk, instruction
+
+    def __getitem__(self, idx):
+        return self._load_sample(*self.samples[idx])
+
+
+class MultiTaskValView(TorchDataset):
+    """Fixed held-out view over a MultiTaskDemoDataset's val_samples.
+
+    Separate from the main dataset so DataLoader's __len__/__getitem__ see
+    only the validation samples, while resample() keeps mutating the parent's
+    training self.samples independently.
+    """
+
+    def __init__(self, parent: "MultiTaskDemoDataset"):
+        self.parent = parent
+
+    def __len__(self):
+        return len(self.parent.val_samples)
+
+    def __getitem__(self, idx):
+        return self.parent._load_sample(*self.parent.val_samples[idx])
 
 
 # ========================================================================== #
@@ -489,61 +544,88 @@ def finetune_pi0fast(args):
     cam2_key = args.cam2_key
     log(f"[finetune] Batch image keys: '{cam1_key}', '{cam2_key}'")
 
-    # ── Freeze everything first ───────────────────────────────────────── #
-    for p in policy.parameters():
-        p.requires_grad_(False)
+    if args.full_finetune:
+        # ── Full fine-tune: every parameter trainable, no LoRA ────────── #
+        # Mirrors `lerobot-train --policy.type=pi0` / `pi0_fast` semantics
+        # (lerobot's own trainer has no LoRA option — it always fine-tunes
+        # the whole model). from_pretrained() already leaves requires_grad
+        # True everywhere, but set it explicitly so behavior doesn't depend
+        # on that default.
+        for p in policy.parameters():
+            p.requires_grad_(True)
+        log("[finetune] Full fine-tune: all parameters trainable "
+            "(no LoRA adapters injected).")
 
-    # ── Apply LoRA (manual, FSDP-compatible) ─────────────────────────── #
-    # Targets: lm_head + Q/V projections in all transformer layers.
-    # Camera views and scene are domain-shifted from pre-training, so the
-    # frozen transformer's cross-modal attention needs to adapt — lm_head
-    # alone cannot fix poor hidden representations for new visual inputs.
-    class LoRALinear(torch.nn.Module):
-        def __init__(self, linear, rank, alpha):
-            super().__init__()
-            in_f, out_f = linear.in_features, linear.out_features
-            self.weight = linear.weight
-            self.bias   = getattr(linear, "bias", None)
-            self.lora_A = torch.nn.Parameter(torch.randn(rank, in_f) * 0.01)
-            self.lora_B = torch.nn.Parameter(torch.zeros(out_f, rank))
-            self.scale  = alpha / rank
+        # ── Load full weights from previous checkpoint (if resuming) ──── #
+        if args.resume_from:
+            full_pt = os.path.join(args.resume_from, "full_weights.pt")
+            if os.path.isfile(full_pt):
+                resume_sd = torch.load(full_pt, map_location="cpu")
+                missing, unexpected = policy.load_state_dict(resume_sd, strict=False)
+                log(f"[finetune] Resumed full model weights from {full_pt} "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            else:
+                log(f"[finetune] WARNING: no full_weights.pt found at {full_pt}")
+    else:
+        # ── Freeze everything first ───────────────────────────────────── #
+        for p in policy.parameters():
+            p.requires_grad_(False)
 
-        def forward(self, x):
-            out = F.linear(x, self.weight, self.bias)
-            out = out + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
-            return out
+        # ── Apply LoRA (manual, FSDP-compatible) ───────────────────────── #
+        # Targets: lm_head + Q/V projections in all transformer layers.
+        # Camera views and scene are domain-shifted from pre-training, so the
+        # frozen transformer's cross-modal attention needs to adapt — lm_head
+        # alone cannot fix poor hidden representations for new visual inputs.
+        class LoRALinear(torch.nn.Module):
+            def __init__(self, linear, rank, alpha):
+                super().__init__()
+                in_f, out_f = linear.in_features, linear.out_features
+                self.weight = linear.weight
+                self.bias   = getattr(linear, "bias", None)
+                self.lora_A = torch.nn.Parameter(torch.randn(rank, in_f) * 0.01)
+                self.lora_B = torch.nn.Parameter(torch.zeros(out_f, rank))
+                self.scale  = alpha / rank
 
-    lora_rank, lora_alpha = args.lora_rank, args.lora_rank * 2
+            def forward(self, x):
+                out = F.linear(x, self.weight, self.bias)
+                out = out + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
+                return out
 
-    # Q, K, V, O projections + lm_head.
-    pali = policy.model.paligemma_with_expert.paligemma
-    for layer in pali.model.language_model.layers:
-        attn = layer.self_attn
-        attn.q_proj = LoRALinear(attn.q_proj, lora_rank, lora_alpha)
-        attn.k_proj = LoRALinear(attn.k_proj, lora_rank, lora_alpha)
-        attn.v_proj = LoRALinear(attn.v_proj, lora_rank, lora_alpha)
-        attn.o_proj = LoRALinear(attn.o_proj, lora_rank, lora_alpha)
-    pali.lm_head = LoRALinear(pali.lm_head, lora_rank, lora_alpha)
+        lora_rank, lora_alpha = args.lora_rank, args.lora_rank * 2
 
-    # ── Load LoRA weights from previous checkpoint (if resuming) ─────── #
-    if args.resume_from:
-        lora_pt = os.path.join(args.resume_from, "lora_weights.pt")
-        if os.path.isfile(lora_pt):
-            resume_sd   = torch.load(lora_pt, map_location="cpu")
-            lora_params = {n: p for n, p in policy.named_parameters() if "lora_" in n}
-            loaded = sum(
-                1 for k, v in resume_sd.items()
-                if k in lora_params and not lora_params[k].data.copy_(v) is None
-            )
-            log(f"[finetune] Resumed {loaded} LoRA tensors from {lora_pt}")
-        else:
-            log(f"[finetune] WARNING: no lora_weights.pt found at {lora_pt}")
+        # Q, K, V, O projections + lm_head.
+        pali = policy.model.paligemma_with_expert.paligemma
+        for layer in pali.model.language_model.layers:
+            attn = layer.self_attn
+            attn.q_proj = LoRALinear(attn.q_proj, lora_rank, lora_alpha)
+            attn.k_proj = LoRALinear(attn.k_proj, lora_rank, lora_alpha)
+            attn.v_proj = LoRALinear(attn.v_proj, lora_rank, lora_alpha)
+            attn.o_proj = LoRALinear(attn.o_proj, lora_rank, lora_alpha)
+        pali.lm_head = LoRALinear(pali.lm_head, lora_rank, lora_alpha)
+
+        # ── Load LoRA weights from previous checkpoint (if resuming) ──── #
+        if args.resume_from:
+            lora_pt = os.path.join(args.resume_from, "lora_weights.pt")
+            if os.path.isfile(lora_pt):
+                resume_sd   = torch.load(lora_pt, map_location="cpu")
+                lora_params = {n: p for n, p in policy.named_parameters() if "lora_" in n}
+                loaded = sum(
+                    1 for k, v in resume_sd.items()
+                    if k in lora_params and not lora_params[k].data.copy_(v) is None
+                )
+                log(f"[finetune] Resumed {loaded} LoRA tensors from {lora_pt}")
+            else:
+                log(f"[finetune] WARNING: no lora_weights.pt found at {lora_pt}")
 
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in policy.parameters())
-    log(f"[finetune] LoRA rank={args.lora_rank} (Q/K/V/O + lm_head): "
-        f"{n_train:,} trainable / {n_total:,} total  "
-        f"({100*n_train/n_total:.3f}%)  chunk={args.chunk_size}")
+    if args.full_finetune:
+        log(f"[finetune] Full fine-tune: {n_train:,} / {n_total:,} trainable "
+            f"(100%)  chunk={args.chunk_size}")
+    else:
+        log(f"[finetune] LoRA rank={args.lora_rank} (Q/K/V/O + lm_head): "
+            f"{n_train:,} trainable / {n_total:,} total  "
+            f"({100*n_train/n_total:.3f}%)  chunk={args.chunk_size}")
 
     # lerobot's init mixes bf16/fp32 internally; FSDP requires uniform dtype.
     # Use fp32 throughout: no logit overflow, no NaN, at cost of 2× memory vs fp16.
@@ -588,17 +670,24 @@ def finetune_pi0fast(args):
             chunk_size           = args.chunk_size,
             n_episodes_per_task  = args.episodes_per_task,
             frame_stride         = args.frame_stride,
+            val_split            = args.val_split,
         )
         multi_task = True
+        val_dataset = MultiTaskValView(dataset) if args.val_split > 0 else None
         log(f"[finetune] Multi-task: {len(task_names)} tasks, "
-            f"{args.episodes_per_task} eps/task per epoch")
+            f"{args.episodes_per_task} eps/task per epoch"
+            + (f", val_split={args.val_split}" if args.val_split > 0 else ""))
     else:
         dataset    = DemoDataset(
             path         = args.demo_data,
             chunk_size   = args.chunk_size,
             frame_stride = args.frame_stride,
         )
-        multi_task = False
+        multi_task  = False
+        val_dataset = None
+        if args.val_split > 0:
+            log("[finetune] WARNING: --val_split is only implemented for --tasks "
+                "(multi-task) mode; ignoring for this single-task run.")
 
     # ── Optimizer and scheduler ──────────────────────────────────────── #
     total_epochs = start_epoch + args.epochs
@@ -619,6 +708,45 @@ def finetune_pi0fast(args):
                 log(f"[finetune] Restored optimizer + scheduler from {state_path}")
             except ValueError:
                 log(f"[finetune] Optimizer state mismatch (LoRA structure changed) — starting fresh optimizer")
+
+    # ── Shared batch → loss (used by both the training and validation loops) ── #
+    def compute_batch_loss(batch_data):
+        if multi_task:
+            cam1_imgs, cam2_imgs, action_chunks, instructions = batch_data
+        else:
+            cam1_imgs, cam2_imgs, action_chunks = batch_data
+            instructions = None
+
+        cam1_imgs     = cam1_imgs.to(device)
+        cam2_imgs     = cam2_imgs.to(device)
+        action_chunks = action_chunks.to(device)
+        B             = cam1_imgs.size(0)
+
+        # raw_policy for tokenizer access (FSDP wraps forward only)
+        raw_policy = policy._fsdp_wrapped_module if world_size > 1 else policy
+        act_tokens, act_masks = tokenize_action_chunks(action_chunks, raw_policy)
+        act_tokens = act_tokens.to(device)
+        act_masks  = act_masks.to(device)
+
+        if multi_task:
+            lang_ids, lang_masks = build_language_tokens_batch(
+                list(instructions), args.state_dim, raw_policy, device,
+            )
+        else:
+            lang_ids, lang_masks = build_language_tokens(
+                args.instruction, args.state_dim, raw_policy, B, device,
+            )
+
+        batch = {
+            cam1_key:                              cam1_imgs,
+            cam2_key:                              cam2_imgs,
+            "observation.language.tokens":         lang_ids,
+            "observation.language.attention_mask": lang_masks.bool(),
+            "action.tokens":                       act_tokens,
+            "action.token_mask":                   act_masks.bool(),
+        }
+        loss, loss_dict = policy(batch)
+        return loss, loss_dict, B
 
     # ── Training loop ────────────────────────────────────────────────── #
     os.makedirs(args.finetune_output, exist_ok=True)
@@ -647,43 +775,8 @@ def finetune_pi0fast(args):
                         unit="batch", leave=False, disable=(rank != 0))
 
         for batch_data in step_bar:
-            if multi_task:
-                cam1_imgs, cam2_imgs, action_chunks, instructions = batch_data
-            else:
-                cam1_imgs, cam2_imgs, action_chunks = batch_data
-                instructions = None
-
-            cam1_imgs     = cam1_imgs.to(device)
-            cam2_imgs     = cam2_imgs.to(device)
-            action_chunks = action_chunks.to(device)
-            B             = cam1_imgs.size(0)
-
-            # raw_policy for tokenizer access (FSDP wraps forward only)
-            raw_policy = policy._fsdp_wrapped_module if world_size > 1 else policy
-            act_tokens, act_masks = tokenize_action_chunks(action_chunks, raw_policy)
-            act_tokens = act_tokens.to(device)
-            act_masks  = act_masks.to(device)
-
-            if multi_task:
-                lang_ids, lang_masks = build_language_tokens_batch(
-                    list(instructions), args.state_dim, raw_policy, device,
-                )
-            else:
-                lang_ids, lang_masks = build_language_tokens(
-                    args.instruction, args.state_dim, raw_policy, B, device,
-                )
-
-            batch = {
-                cam1_key:                              cam1_imgs,
-                cam2_key:                              cam2_imgs,
-                "observation.language.tokens":         lang_ids,
-                "observation.language.attention_mask": lang_masks.bool(),
-                "action.tokens":                       act_tokens,
-                "action.token_mask":                   act_masks.bool(),
-            }
-
             optimizer.zero_grad()
-            loss, loss_dict = policy(batch)
+            loss, loss_dict, B = compute_batch_loss(batch_data)
 
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_skip_count += 1
@@ -706,8 +799,39 @@ def finetune_pi0fast(args):
         avg_loss = total_loss / max(n_steps, 1)
         scheduler.step()
 
+        # ── Validation: fixed held-out episodes, forward-only ──────────── #
+        val_loss_str = ""
+        if val_dataset is not None and len(val_dataset) > 0:
+            policy.eval()
+            if world_size > 1:
+                val_sampler = DistributedSampler(
+                    val_dataset, num_replicas=world_size, rank=rank,
+                    shuffle=False, drop_last=False,
+                )
+                val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                        sampler=val_sampler, num_workers=0)
+            else:
+                val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                        shuffle=False, num_workers=0)
+
+            val_loss_sum = torch.zeros(1, device=device)
+            val_count    = torch.zeros(1, device=device)
+            with torch.no_grad():
+                for batch_data in val_loader:
+                    v_loss, _, v_B = compute_batch_loss(batch_data)
+                    if not (torch.isnan(v_loss) or torch.isinf(v_loss)):
+                        val_loss_sum += v_loss.item() * v_B
+                        val_count    += v_B
+
+            if world_size > 1:
+                dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(val_count,    op=dist.ReduceOp.SUM)
+            avg_val_loss = (val_loss_sum / val_count.clamp(min=1)).item()
+            val_loss_str = f"  val_loss={avg_val_loss:.4f}"
+            policy.train()
+
         log(f"[finetune] Epoch {ep+1}/{total_epochs}  "
-            f"loss={avg_loss:.4f}  lr={scheduler.get_last_lr()[0]:.2e}  "
+            f"loss={avg_loss:.4f}{val_loss_str}  lr={scheduler.get_last_lr()[0]:.2e}  "
             f"nan_skipped={nan_skip_count}")
 
         # ── Checkpoint: save LoRA weights only (rank 0) ──────────────── #
@@ -722,15 +846,19 @@ def finetune_pi0fast(args):
         if rank == 0:
             ckpt_dir = os.path.join(args.finetune_output, f"checkpoint_epoch{ep+1}")
             os.makedirs(ckpt_dir, exist_ok=True)
-            lora_sd = {k: v for k, v in full_sd.items() if "lora_" in k}
-            torch.save(lora_sd, os.path.join(ckpt_dir, "lora_weights.pt"))
+            if args.full_finetune:
+                torch.save(full_sd, os.path.join(ckpt_dir, "full_weights.pt"))
+                log(f"[finetune] Checkpoint → {ckpt_dir}  ({len(full_sd)} tensors, full model)")
+            else:
+                lora_sd = {k: v for k, v in full_sd.items() if "lora_" in k}
+                torch.save(lora_sd, os.path.join(ckpt_dir, "lora_weights.pt"))
+                log(f"[finetune] Checkpoint → {ckpt_dir}  ({len(lora_sd)} LoRA tensors, incl. lm_head)")
             torch.save(
                 {"optimizer": optimizer.state_dict(),
                  "scheduler": scheduler.state_dict(),
                  "epoch":     ep + 1},
                 os.path.join(ckpt_dir, "training_state.pt"),
             )
-            log(f"[finetune] Checkpoint → {ckpt_dir}  ({len(lora_sd)} LoRA tensors, incl. lm_head)")
             if ep > start_epoch:
                 prev = os.path.join(args.finetune_output, f"checkpoint_epoch{ep}")
                 if os.path.isdir(prev):
@@ -749,10 +877,14 @@ def finetune_pi0fast(args):
         full_sd = policy.state_dict()
 
     if rank == 0:
-        lora_sd = {k: v for k, v in full_sd.items() if "lora_" in k}
-        torch.save(lora_sd, os.path.join(args.finetune_output, "lora_weights.pt"))
-        log(f"\n[finetune] Done. LoRA weights → {args.finetune_output}/lora_weights.pt")
-        log(f"[finetune] Load: replace lm_head with LoRALinear, then load lora_weights.pt")
+        if args.full_finetune:
+            torch.save(full_sd, os.path.join(args.finetune_output, "full_weights.pt"))
+            log(f"\n[finetune] Done. Full model weights → {args.finetune_output}/full_weights.pt")
+        else:
+            lora_sd = {k: v for k, v in full_sd.items() if "lora_" in k}
+            torch.save(lora_sd, os.path.join(args.finetune_output, "lora_weights.pt"))
+            log(f"\n[finetune] Done. LoRA weights → {args.finetune_output}/lora_weights.pt")
+            log(f"[finetune] Load: replace lm_head with LoRALinear, then load lora_weights.pt")
 
     if world_size > 1:
         dist.destroy_process_group()
@@ -795,6 +927,13 @@ def parse_args():
                    help="Sample every Nth frame per episode")
     p.add_argument("--episodes_per_task", type=int, default=25,
                    help="Episodes to sample per task per epoch (lazy resampling)")
+    p.add_argument("--val_split", type=float, default=0.0,
+                   help="Fraction of episodes per task held out for validation "
+                        "(episode-level split — whole episodes, not frames, so "
+                        "overlapping chunks never leak across the split). "
+                        "Multi-task (--tasks) mode only. 0 = no split (default). "
+                        "When set, reports val_loss each epoch from a forward-only "
+                        "pass over the fixed held-out episodes.")
 
     # Training
     p.add_argument("--chunk_size",  type=int,   default=10,
@@ -807,9 +946,17 @@ def parse_args():
     p.add_argument("--instruction", type=str,
                    default="pick up the blue cube and place it on the tray")
 
-    # LoRA
+    # LoRA / full fine-tune
     p.add_argument("--lora_rank", type=int, default=16,
-                   help="LoRA rank for lm_head fine-tuning (default 16 ≈ 8M params)")
+                   help="LoRA rank for lm_head fine-tuning (default 16 ≈ 8M params). "
+                        "Ignored when --full_finetune is set.")
+    p.add_argument("--full_finetune", action="store_true",
+                   help="Train every parameter instead of injecting LoRA adapters — "
+                        "mirrors `lerobot-train --policy.type=pi0` / `pi0_fast` semantics. "
+                        "Needs far more VRAM/host RAM: fp32 AdamW keeps ~3x the model size "
+                        "(params + 2 optimizer moments) sharded across GPUs, vs ~0.2% of "
+                        "that for LoRA. Checkpoints save full_weights.pt (~13.8GB) instead "
+                        "of lora_weights.pt.")
 
     return p.parse_args()
 
