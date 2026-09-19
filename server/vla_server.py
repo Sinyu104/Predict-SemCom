@@ -37,6 +37,11 @@ On the Linux server (run BEFORE starting isaac_sim/vla_runner.py):
         --model_dir physical-intelligence/pi0-fast \\
         --lora_path outputs/pi0fast_finetuned/checkpoint_epoch10/lora_weights.pt
 
+    # Full fine-tune checkpoint (no LoRA) — pass --full_weights instead:
+    python server/vla_server.py \\
+        --model_dir lerobot/pi0fast-base \\
+        --full_weights outputs/pi0fast_so101_full_finetuned/full_weights.pt
+
 Dependencies
 ------------
     pip install torch lerobot pillow numpy
@@ -74,32 +79,55 @@ def _mock_groot():
 
 class Pi0FastServer:
     """
-    Loads PI0FastPolicy onto GPU, applies LoRALinear adapters (same structure
-    as fine-tuning), loads LoRA weights from checkpoint, and runs inference.
+    Loads PI0FastPolicy onto GPU and runs inference.  Two weight sources,
+    mutually exclusive:
+
+      • lora_path    — the base model plus LoRALinear adapters (same structure
+                       as pi0fast_server.py's LoRA fine-tune), then lora_weights.pt.
+      • full_weights — a full fine-tune checkpoint (full_weights.pt), which is a
+                       plain PI0FastPolicy.state_dict() with NO adapters.  It is
+                       loaded straight into the un-wrapped policy; the LoRA
+                       insertion is skipped entirely, because full_weights.pt was
+                       produced without LoRALinear and its keys are the vanilla
+                       q_proj.weight / lm_head.weight, not q_proj.lora_A/B.
 
     Parameters
     ----------
-    model_dir   : str   HuggingFace ID or local path to base PI0Fast weights
-    lora_path   : str   Path to lora_weights.pt from fine-tuning checkpoint
-    cam1_key    : str   Image key for base camera in policy batch
-    cam2_key    : str   Image key for wrist camera in policy batch
-    chunk_size  : int   Number of action steps to generate per request
-    lora_rank   : int   LoRA rank (must match fine-tuning)
-    state_dim   : int   Robot state dim used in language prompt (zeros)
-    device      : str   Torch device for inference
+    model_dir    : str          HuggingFace ID or local path to base PI0Fast weights
+    lora_path    : str | None   Path to lora_weights.pt from a LoRA fine-tune
+    full_weights : str | None   Path to full_weights.pt from a full fine-tune
+                                 (takes precedence over lora_path)
+    cam1_key     : str   Image key for base camera in policy batch
+    cam2_key     : str   Image key for wrist camera in policy batch
+    chunk_size   : int   Number of action steps to generate per request
+    lora_rank    : int   LoRA rank (must match fine-tuning; ignored for full_weights)
+    state_dim    : int   Robot state dim used in language prompt (zeros)
+    action_dim   : int   Robot's REAL action DoF: 7 for Franka, 6 for SO-101
+                         (5 joints + gripper).  NOT read from the model config —
+                         pi0fast-base reports 32 there (the FAST tokeniser's padded
+                         max_action_dim), so the returned chunk is sliced to this
+                         many leading dims while detokenisation still uses the 32.
+    device       : str   Torch device for inference
     """
 
     def __init__(
         self,
-        model_dir:  str,
-        lora_path:  str,
+        model_dir:    str,
+        lora_path:    str | None = None,
+        full_weights: str | None = None,
         cam1_key:   str = "observation.images.base_0_rgb",
         cam2_key:   str = "observation.images.right_wrist_0_rgb",
         chunk_size: int = 10,
         lora_rank:  int = 16,
         state_dim:  int = 6,
+        action_dim: int = 7,
         device:     str = "cuda:0",
     ):
+        if (lora_path is None) == (full_weights is None):
+            raise ValueError(
+                "Pass exactly one of lora_path / full_weights "
+                f"(got lora_path={lora_path!r}, full_weights={full_weights!r})."
+            )
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
@@ -111,6 +139,10 @@ class Pi0FastServer:
         self.chunk_size = chunk_size
         self.state_dim  = state_dim
         self.device     = torch.device(device if torch.cuda.is_available() else "cpu")
+        # Per-dim action de-normalisation stats, loaded from norm_stats.json next
+        # to a full-finetune checkpoint. None → the model was trained on raw
+        # actions and predict() returns them as-is.
+        self.action_low = self.action_high = None
 
         import time as _time
         print(f"[Pi0FastServer] Loading base model from '{model_dir}' …", flush=True)
@@ -123,54 +155,101 @@ class Pi0FastServer:
         policy.config.chunk_size     = chunk_size
         policy.config.n_action_steps = chunk_size
 
-        # ── Apply LoRA structure — must exactly match pi0fast_server.py ── #
-        # Create lora_A/B on the same device as the model weights to avoid
-        # mixed CPU/GPU tensors which cause slow dtype conversion later.
-        class LoRALinear(nn.Module):
-            def __init__(self, linear, rank, alpha):
-                super().__init__()
-                dev  = linear.weight.device
-                dtype = linear.weight.dtype
-                in_f, out_f = linear.in_features, linear.out_features
-                self.weight = linear.weight
-                self.bias   = getattr(linear, "bias", None)
-                self.lora_A = nn.Parameter(torch.randn(rank, in_f, device=dev, dtype=dtype) * 0.01)
-                self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=dev, dtype=dtype))
-                self.scale  = alpha / rank
+        if full_weights is not None:
+            # ── Full fine-tune: load a vanilla state_dict, no adapters ──── #
+            # full_weights.pt is PI0FastPolicy.state_dict() gathered on rank 0
+            # by pi0fast_server.py --full_finetune.  Its keys are the standard
+            # q_proj.weight / lm_head.weight, so it must load into the UNMODIFIED
+            # policy — inserting LoRALinear first would rename modules and leave
+            # every trained tensor unmatched.
+            t2 = _time.time()
+            print(f"[Pi0FastServer] Loading full weights from '{full_weights}' …", flush=True)
+            # Load to CPU, not the GPU: the base model already occupies ~13.8 GB
+            # of GPU RAM, and mapping the 13.8 GB state_dict onto the same device
+            # would need a second full copy and OOM a 15 GB card. load_state_dict
+            # copies each CPU tensor into the existing GPU param in place.
+            full_sd = torch.load(full_weights, map_location="cpu")
+            n_tensors = len(full_sd)
+            missing, unexpected = policy.load_state_dict(full_sd, strict=False)
+            del full_sd   # free the 13.8 GB CPU copy once it's been copied into params
+            print(f"[Pi0FastServer] Full weights loaded: {n_tensors} tensors in "
+                  f"{_time.time()-t2:.1f}s  ({len(missing)} missing, {len(unexpected)} unexpected)",
+                  flush=True)
+            if unexpected:
+                # A LoRA checkpoint fed here (lora_A/B keys) would show up as
+                # unexpected and load nothing — fail loud rather than serve base.
+                print(f"[Pi0FastServer] WARNING: unexpected keys (first 5): {unexpected[:5]}", flush=True)
+            if missing:
+                print(f"[Pi0FastServer] WARNING: missing keys (first 5): {missing[:5]}", flush=True)
 
-            def forward(self, x):
-                out = F.linear(x, self.weight, self.bias)
-                out = out + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
-                return out
-
-        t1 = _time.time()
-        lora_alpha = lora_rank * 2
-        pali = policy.model.paligemma_with_expert.paligemma
-
-        for layer in pali.model.language_model.layers:
-            attn = layer.self_attn
-            attn.q_proj = LoRALinear(attn.q_proj, lora_rank, lora_alpha)
-            attn.k_proj = LoRALinear(attn.k_proj, lora_rank, lora_alpha)
-            attn.v_proj = LoRALinear(attn.v_proj, lora_rank, lora_alpha)
-            attn.o_proj = LoRALinear(attn.o_proj, lora_rank, lora_alpha)
-        pali.lm_head = LoRALinear(pali.lm_head, lora_rank, lora_alpha)
-        print(f"[Pi0FastServer] LoRA insertion done in {_time.time()-t1:.1f}s", flush=True)
-
-        # ── Load fine-tuned LoRA weights ──────────────────────────────── #
-        t2 = _time.time()
-        print(f"[Pi0FastServer] Loading LoRA weights from '{lora_path}' …", flush=True)
-        lora_sd = torch.load(lora_path, map_location=self.device)
-        lora_params = {n: p for n, p in policy.named_parameters() if "lora_" in n}
-        loaded, missing = 0, []
-        for k, v in lora_sd.items():
-            if k in lora_params:
-                lora_params[k].data.copy_(v)
-                loaded += 1
+            # ── Load normalisation stats persisted with the checkpoint ──── #
+            # A full-finetune trained WITH normalisation emits actions in [-1,1];
+            # predict() denormalises them with EXACTLY these per-dim stats. They
+            # must come from the checkpoint, never be recomputed/hardcoded — a
+            # mismatch reintroduces a silent per-dim offset.
+            stats_path = os.path.join(
+                os.path.dirname(os.path.abspath(full_weights)), "norm_stats.json")
+            if os.path.isfile(stats_path):
+                with open(stats_path) as sf:
+                    st = json.load(sf)
+                self.action_low  = np.asarray(st["action_low"],  dtype=np.float32)
+                self.action_high = np.asarray(st["action_high"], dtype=np.float32)
+                print(f"[Pi0FastServer] norm_stats.json loaded ({len(self.action_low)} dims) — "
+                      f"actions will be denormalised from [-1,1].", flush=True)
             else:
-                missing.append(k)
-        print(f"[Pi0FastServer] LoRA tensors loaded: {loaded}/{len(lora_sd)} in {_time.time()-t2:.1f}s", flush=True)
-        if missing:
-            print(f"[Pi0FastServer] WARNING: missing LoRA keys: {missing[:5]}")
+                print(f"[Pi0FastServer] WARNING: no norm_stats.json next to the checkpoint — "
+                      f"returning RAW model output. Correct ONLY for a checkpoint trained "
+                      f"WITHOUT action normalisation; a normalised checkpoint MUST ship one.",
+                      flush=True)
+        else:
+            # ── Apply LoRA structure — must exactly match pi0fast_server.py ── #
+            # Create lora_A/B on the same device as the model weights to avoid
+            # mixed CPU/GPU tensors which cause slow dtype conversion later.
+            class LoRALinear(nn.Module):
+                def __init__(self, linear, rank, alpha):
+                    super().__init__()
+                    dev  = linear.weight.device
+                    dtype = linear.weight.dtype
+                    in_f, out_f = linear.in_features, linear.out_features
+                    self.weight = linear.weight
+                    self.bias   = getattr(linear, "bias", None)
+                    self.lora_A = nn.Parameter(torch.randn(rank, in_f, device=dev, dtype=dtype) * 0.01)
+                    self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=dev, dtype=dtype))
+                    self.scale  = alpha / rank
+
+                def forward(self, x):
+                    out = F.linear(x, self.weight, self.bias)
+                    out = out + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
+                    return out
+
+            t1 = _time.time()
+            lora_alpha = lora_rank * 2
+            pali = policy.model.paligemma_with_expert.paligemma
+
+            for layer in pali.model.language_model.layers:
+                attn = layer.self_attn
+                attn.q_proj = LoRALinear(attn.q_proj, lora_rank, lora_alpha)
+                attn.k_proj = LoRALinear(attn.k_proj, lora_rank, lora_alpha)
+                attn.v_proj = LoRALinear(attn.v_proj, lora_rank, lora_alpha)
+                attn.o_proj = LoRALinear(attn.o_proj, lora_rank, lora_alpha)
+            pali.lm_head = LoRALinear(pali.lm_head, lora_rank, lora_alpha)
+            print(f"[Pi0FastServer] LoRA insertion done in {_time.time()-t1:.1f}s", flush=True)
+
+            # ── Load fine-tuned LoRA weights ──────────────────────────────── #
+            t2 = _time.time()
+            print(f"[Pi0FastServer] Loading LoRA weights from '{lora_path}' …", flush=True)
+            lora_sd = torch.load(lora_path, map_location=self.device)
+            lora_params = {n: p for n, p in policy.named_parameters() if "lora_" in n}
+            loaded, missing = 0, []
+            for k, v in lora_sd.items():
+                if k in lora_params:
+                    lora_params[k].data.copy_(v)
+                    loaded += 1
+                else:
+                    missing.append(k)
+            print(f"[Pi0FastServer] LoRA tensors loaded: {loaded}/{len(lora_sd)} in {_time.time()-t2:.1f}s", flush=True)
+            if missing:
+                print(f"[Pi0FastServer] WARNING: missing LoRA keys: {missing[:5]}")
 
         t3 = _time.time()
         policy = policy.float()
@@ -184,9 +263,15 @@ class Pi0FastServer:
         self.policy    = policy
         self._pali_tok = policy._paligemma_tokenizer
         self._tok_max  = getattr(policy.config, "tokenizer_max_length", 200)
+        # Robot's real action DoF (from the --action_dim flag, NOT the config,
+        # which reports the padded 32).  Used to slice the returned chunk and to
+        # size the error fallback for whichever robot is being served.
+        self.action_dim = action_dim
+        cfg_dim = policy.config.output_features["action"].shape[0]
 
         n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        print(f"[Pi0FastServer] {n_gpu} GPU(s) available. Model ready.\n")
+        print(f"[Pi0FastServer] {n_gpu} GPU(s) available. action_dim={self.action_dim} "
+              f"(config/detok dim={cfg_dim}). Model ready.\n")
         self._debug_first_call = True
 
     def _build_language_tokens(self, instruction: str):
@@ -252,7 +337,14 @@ class Pi0FastServer:
         # so we let it generate those text tokens freely, then force FAST tokens.
         bos_id            = pali_tok.bos_token_id
         action_prefix_ids = pali_tok.encode("Action: ", add_special_tokens=False)
-        n_text_prefix     = len(action_prefix_ids)   # number of text tokens to generate freely
+        # Free text tokens to generate INSIDE the loop. The prefill step below
+        # already samples the FIRST prefix token ("Action") before the loop, so
+        # only the remaining len-1 prefix tokens (":", "▁") should be free.
+        # Using the full len ran one extra free iteration, which consumed and
+        # DISCARDED the first FAST codeword token — the one carrying dim0's
+        # leading DCT coefficient — making dim0 decode to ~1190 (verified: a
+        # dropped first token offsets dim0 alone, all other dims intact).
+        n_text_prefix     = len(action_prefix_ids) - 1
 
         bos_tok     = torch.tensor([[bos_id]], dtype=torch.long, device=device)
         bos_mask    = torch.ones((1, 1), dtype=torch.bool, device=device)
@@ -276,6 +368,16 @@ class Pi0FastServer:
         fast_end   = vocab_size - fast_skip
         fast_logit_mask = torch.full((vocab_size,), float("-inf"), device=device)
         fast_logit_mask[fast_start:fast_end] = 0.0  # additive mask: 0 = keep
+
+        # Also permit the "|" end-of-action terminator during the FAST phase.
+        # detokenize_actions() finds the action codeword by truncating at the first
+        # "|"; training appended it after the FAST tokens. If generation never emits
+        # it (the old forced-FAST-only loop couldn't — "|" is outside the FAST range),
+        # the entire fixed-length token stream is DCT-decoded and junk coefficients
+        # past the true codeword corrupt an action dimension (~20x out of range,
+        # migrating between dims). Allowing "|" restores the boundary.
+        pipe_id = pali_tok.convert_tokens_to_ids("|")
+        fast_logit_mask[pipe_id] = 0.0
 
         generated = torch.zeros((1, max_steps), dtype=torch.long, device=device)
 
@@ -313,6 +415,7 @@ class Pi0FastServer:
         # ── Decoding: generate text prefix freely, then force FAST tokens ── #
         # We collect only the FAST tokens (after the text prefix) in `generated`.
         fast_idx   = 0   # index into generated[]
+        terminated = False   # True once the model emits "|" and closes the codeword
         text_generated = []
 
         for t in range(max_steps + n_text_prefix):
@@ -349,7 +452,7 @@ class Pi0FastServer:
                     next_token = torch.argmax(last_logits[:, -1], dim=-1, keepdim=True)
                 text_generated.append(next_token.item())
             else:
-                # FAST phase — force FAST token
+                # FAST phase — allow FAST tokens plus the "|" terminator.
                 masked_logits = last_logits + fast_logit_mask
                 if temperature > 0:
                     next_token = torch.multinomial(torch.softmax(masked_logits[:, -1] / temperature, dim=-1), 1)
@@ -358,14 +461,25 @@ class Pi0FastServer:
                 if fast_idx < max_steps:
                     generated[:, fast_idx] = next_token.squeeze(-1)
                     fast_idx += 1
+                # Stop as soon as the model closes the action with "|". Everything up
+                # to and including it is the real codeword (detokenize_actions truncates
+                # at the "|"); this both removes the junk-coefficient corruption and
+                # ends early instead of always running max_decoding_steps.
+                if next_token.item() == pipe_id:
+                    terminated = True
+                    break
 
             if fast_idx >= max_steps:
                 break
 
         # Prepend "Action: " so detokenize_actions sees the expected prefix.
-        action_dim        = self.policy.config.output_features["action"].shape[0]
+        # detok_dim is the tokeniser's padded width (32 for pi0fast-base); the
+        # real robot DoF (self.action_dim) is sliced out of the result below.
+        detok_dim         = self.policy.config.output_features["action"].shape[0]
         prefix_tensor     = torch.tensor([action_prefix_ids], dtype=torch.long, device=device)
-        generated_full    = torch.cat([prefix_tensor, generated], dim=1)
+        # Only the tokens actually generated (including the closing "|"), NOT the
+        # full max_steps buffer — trailing zero slots would decode to junk too.
+        generated_full    = torch.cat([prefix_tensor, generated[:, :fast_idx]], dim=1)
 
         # Debug: show what the model generated
         gen_ids  = generated[0, :10].tolist()
@@ -374,12 +488,23 @@ class Pi0FastServer:
         print(f"[DIAG] text prefix generated: {txt_strs}", flush=True)
         print(f"[DIAG] generated[:10] ids  : {gen_ids}", flush=True)
         print(f"[DIAG] generated[:10] strs : {gen_strs}", flush=True)
+        print(f"[DIAG] fast tokens used={fast_idx}/{max_steps}  terminated_by_'|'={terminated}", flush=True)
         print(f"[DIAG] vocab_size={pali_tok.vocab_size}  fast_skip={self.policy.config.fast_skip_tokens}", flush=True)
 
         continuous = self.policy.detokenize_actions(
-            generated_full, action_horizon=self.chunk_size, action_dim=action_dim)
-        # continuous: (1, chunk_size, action_dim)
-        actions = continuous[0, :, :7].cpu().float().tolist()
+            generated_full, action_horizon=self.chunk_size, action_dim=detok_dim)
+        # continuous: (1, chunk_size, detok_dim=32) — the first self.action_dim
+        # dims are the real robot channels (7 Franka / 6 SO-101), the rest are
+        # tokeniser padding.  Slice to the robot's DoF.
+        actions_t = continuous[0, :, :self.action_dim].cpu().float()
+        # If the checkpoint was trained with per-dim normalisation, the model
+        # emits actions in [-1,1]; map them back to physical units with the SAME
+        # stats used at training (loaded from norm_stats.json).
+        if self.action_low is not None:
+            lo = torch.as_tensor(self.action_low[:self.action_dim], dtype=actions_t.dtype)
+            hi = torch.as_tensor(self.action_high[:self.action_dim], dtype=actions_t.dtype)
+            actions_t = (actions_t + 1.0) / 2.0 * (hi - lo) + lo
+        actions = actions_t.tolist()
 
         if self._debug_first_call:
             self._debug_first_call = False
@@ -407,26 +532,32 @@ def run_server(args):
     """
     import socket
 
-    # Resolve lora_weights.pt (accept either a .pt file or a checkpoint directory)
-    lora_path = args.lora_path
-    if not os.path.isfile(lora_path):
-        candidate = os.path.join(lora_path, "lora_weights.pt")
+    def _resolve(path, filename):
+        """Accept either the .pt file directly or a checkpoint dir containing it."""
+        if os.path.isfile(path):
+            return path
+        candidate = os.path.join(path, filename)
         if os.path.isfile(candidate):
-            lora_path = candidate
-        else:
-            raise FileNotFoundError(
-                f"lora_weights.pt not found at '{args.lora_path}'. "
-                "Pass --lora_path outputs/pi0fast_finetuned/lora_weights.pt"
-            )
+            return candidate
+        raise FileNotFoundError(f"{filename} not found at '{path}'.")
+
+    # Full weights take precedence; the two sources are mutually exclusive.
+    lora_path = full_weights = None
+    if args.full_weights is not None:
+        full_weights = _resolve(args.full_weights, "full_weights.pt")
+    else:
+        lora_path = _resolve(args.lora_path, "lora_weights.pt")
 
     server = Pi0FastServer(
-        model_dir  = args.model_dir,
-        lora_path  = lora_path,
+        model_dir    = args.model_dir,
+        lora_path    = lora_path,
+        full_weights = full_weights,
         cam1_key   = args.cam1_key,
         cam2_key   = args.cam2_key,
         chunk_size = args.chunk_size,
         lora_rank  = args.lora_rank,
         state_dim  = args.state_dim,
+        action_dim = args.action_dim,
         device     = args.device,
     )
 
@@ -481,7 +612,7 @@ def run_server(args):
                             dtype=np.uint8,
                         )
                 except Exception as e:
-                    response = {"seq": seq, "action": [[0.0] * 7],
+                    response = {"seq": seq, "action": [[0.0] * server.action_dim],
                                 "status": "error", "message": f"Image decode error: {e}"}
                     payload  = json.dumps(response).encode()
                     conn.sendall(len(payload).to_bytes(4, "big") + payload)
@@ -531,7 +662,12 @@ def parse_args():
                    help="HuggingFace model ID or local path to base PI0Fast weights")
     p.add_argument("--lora_path",   type=str,
                    default="outputs/pi0fast_finetuned/lora_weights.pt",
-                   help="Path to lora_weights.pt (or checkpoint directory containing it)")
+                   help="Path to lora_weights.pt (or checkpoint directory containing it). "
+                        "Used only when --full_weights is not given.")
+    p.add_argument("--full_weights", type=str, default=None,
+                   help="Path to full_weights.pt from a --full_finetune run (or a checkpoint "
+                        "directory containing it). Loads a full state_dict with NO LoRA "
+                        "adapters; takes precedence over --lora_path.")
     p.add_argument("--cam1_key",    type=str,
                    default="observation.images.base_0_rgb")
     p.add_argument("--cam2_key",    type=str,
@@ -541,6 +677,10 @@ def parse_args():
     p.add_argument("--lora_rank",   type=int,   default=16,
                    help="LoRA rank (must match fine-tuning)")
     p.add_argument("--state_dim",   type=int,   default=6)
+    p.add_argument("--action_dim",  type=int,   default=7,
+                   help="Robot's real action DoF: 7 for Franka, 6 for SO-101. "
+                        "The model emits 32 padded dims; the reply is sliced to this many. "
+                        "NOT read from the model config (which reports the padded 32).")
     p.add_argument("--device",      type=str,   default="cuda:0")
     p.add_argument("--host",        type=str,   default="127.0.0.1",
                    help="TCP host to listen on (ros2_bridge.py must use the same)")

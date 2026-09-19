@@ -95,6 +95,8 @@ def _mock_groot():
 def tokenize_action_chunks(
     action_chunks: torch.Tensor,   # (B, K, action_dim) float32
     policy,
+    action_low=None,               # (action_dim,) per-dim min, or None
+    action_high=None,              # (action_dim,) per-dim max, or None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Convert continuous action chunks to FAST token IDs using the tokenisers
@@ -102,6 +104,14 @@ def tokenize_action_chunks(
 
     Replicates ActionTokenizerProcessorStep._tokenize_action without the
     full lerobot processor pipeline.
+
+    If action_low/action_high are given, the real action dims are first
+    normalised per-dim to [-1, 1] (affine min->-1, max->+1).  This is REQUIRED:
+    the FAST tokenizer expects normalised actions; feeding raw values (e.g.
+    SO-101 degrees, range ~-80..102) overflows its representable DC range and
+    floors anything below ~-6.46, silently destroying strongly-negative targets
+    (measured: shoulder_lift/wrist_roll saturated).  Inference must denormalise
+    with the SAME stats, which are persisted alongside the checkpoint.
 
     Returns
     -------
@@ -118,6 +128,13 @@ def tokenize_action_chunks(
         pali_tok.encode("Action: ", add_special_tokens=False), dtype=torch.long)
     end_token     = torch.tensor(
         pali_tok.encode("|"), dtype=torch.long)
+
+    # Per-dim affine normalise to [-1, 1] on the REAL dims, BEFORE zero-padding
+    # to max_action_dim (the padding dims stay 0 = the [-1,1] midpoint).
+    if action_low is not None and action_high is not None:
+        lo = torch.as_tensor(action_low, dtype=action_chunks.dtype, device=action_chunks.device)
+        hi = torch.as_tensor(action_high, dtype=action_chunks.dtype, device=action_chunks.device)
+        action_chunks = 2.0 * (action_chunks - lo) / (hi - lo) - 1.0
 
     # pi0-fast was trained with actions padded to max_action_dim=32.
     # Tokenizing raw 7-DoF actions produces wrong token IDs vs training distribution.
@@ -160,6 +177,59 @@ def tokenize_action_chunks(
         masks_list.append(mask)
 
     return torch.stack(tokens_list), torch.stack(masks_list)
+
+
+# ========================================================================== #
+#  Action normalisation stats                                                 #
+# ========================================================================== #
+
+def compute_action_stats(dataset):
+    """Per-dim [min, max] over ALL actions in the dataset — the FULL range, not a
+    per-epoch subset. Works for DemoDataset (actions held in RAM) and
+    MultiTaskDemoDataset (scans every episode's actions from disk). Constant dims
+    (max==min) get their range widened to 1 to avoid a divide-by-zero at
+    normalise time. Returns (low, high) float32 arrays of length action_dim.
+    """
+    lo = hi = None
+
+    def _upd(a):
+        nonlocal lo, hi
+        a = np.asarray(a, dtype=np.float64)
+        amin, amax = a.min(axis=0), a.max(axis=0)
+        lo = amin if lo is None else np.minimum(lo, amin)
+        hi = amax if hi is None else np.maximum(hi, amax)
+
+    if getattr(dataset, "_acts", None):                       # DemoDataset (in RAM)
+        for a in dataset._acts:
+            _upd(a)
+    elif hasattr(dataset, "_task_meta"):                      # MultiTaskDemoDataset
+        for hdf5_path, _instr, ep_keys, _lens in dataset._task_meta:
+            with h5py.File(hdf5_path, "r") as f:
+                for k in ep_keys:
+                    _upd(f[k]["actions"])
+    else:
+        raise ValueError("compute_action_stats: unsupported dataset type "
+                         f"{type(dataset).__name__}")
+
+    rng = hi - lo
+    hi = np.where(rng < 1e-6, lo + 1.0, hi)
+    return lo.astype(np.float32), hi.astype(np.float32)
+
+
+def save_norm_stats(out_dir, action_low, action_high, action_order=None):
+    """Persist normalisation stats next to the checkpoint as norm_stats.json, so
+    inference (vla_server.py) denormalises with EXACTLY these numbers rather than
+    recomputing or hardcoding — a train/infer mismatch reintroduces a silent
+    per-dim offset."""
+    stats = {
+        "action_low":  [float(x) for x in action_low],
+        "action_high": [float(x) for x in action_high],
+        "normalization": "affine_per_dim_[-1,1]",
+    }
+    if action_order is not None:
+        stats["action_order"] = list(action_order)
+    with open(os.path.join(out_dir, "norm_stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
 
 
 # ========================================================================== #
@@ -689,6 +759,19 @@ def finetune_pi0fast(args):
             log("[finetune] WARNING: --val_split is only implemented for --tasks "
                 "(multi-task) mode; ignoring for this single-task run.")
 
+    # ── Action normalisation stats (per-dim min/max over the FULL dataset) ── #
+    # The FAST tokenizer needs actions in ~[-1,1]; raw values overflow it and floor
+    # negatives at ~-6.46 (destroying strongly-negative targets). Compute per-dim
+    # min/max over EVERY episode (not a per-epoch subset), normalise targets at
+    # tokenise time, and persist the stats with the checkpoint so inference
+    # denormalises with exactly these numbers.
+    action_low, action_high = compute_action_stats(dataset)
+    action_dim = len(action_low)
+    log(f"[finetune] Action normalisation to [-1,1] (per-dim, full dataset), "
+        f"action_dim={action_dim}:")
+    for d in range(action_dim):
+        log(f"           dim{d}: [{action_low[d]:+.4f}, {action_high[d]:+.4f}]")
+
     # ── Optimizer and scheduler ──────────────────────────────────────── #
     total_epochs = start_epoch + args.epochs
     trainable    = [p for p in policy.parameters() if p.requires_grad]
@@ -724,7 +807,8 @@ def finetune_pi0fast(args):
 
         # raw_policy for tokenizer access (FSDP wraps forward only)
         raw_policy = policy._fsdp_wrapped_module if world_size > 1 else policy
-        act_tokens, act_masks = tokenize_action_chunks(action_chunks, raw_policy)
+        act_tokens, act_masks = tokenize_action_chunks(
+            action_chunks, raw_policy, action_low, action_high)
         act_tokens = act_tokens.to(device)
         act_masks  = act_masks.to(device)
 
@@ -859,6 +943,9 @@ def finetune_pi0fast(args):
                  "epoch":     ep + 1},
                 os.path.join(ckpt_dir, "training_state.pt"),
             )
+            # Persist the normalisation stats WITH the checkpoint (inference reads
+            # them from here to denormalise — must match what tokenisation used).
+            save_norm_stats(ckpt_dir, action_low, action_high)
             if ep > start_epoch:
                 prev = os.path.join(args.finetune_output, f"checkpoint_epoch{ep}")
                 if os.path.isdir(prev):
@@ -885,6 +972,8 @@ def finetune_pi0fast(args):
             torch.save(lora_sd, os.path.join(args.finetune_output, "lora_weights.pt"))
             log(f"\n[finetune] Done. LoRA weights → {args.finetune_output}/lora_weights.pt")
             log(f"[finetune] Load: replace lm_head with LoRALinear, then load lora_weights.pt")
+        save_norm_stats(args.finetune_output, action_low, action_high)
+        log(f"[finetune] Normalisation stats → {args.finetune_output}/norm_stats.json")
 
     if world_size > 1:
         dist.destroy_process_group()
