@@ -103,6 +103,12 @@ ap.add_argument("--spatial", action="store_true",
                      "with flat runs: train from scratch, no --init.")
 ap.add_argument("--grid", type=int, default=8,
                 help="g for --spatial. D_jscc must be divisible by g*g (256 = 4 x 8 x 8).")
+ap.add_argument("--dist_weight", type=float, default=0.0,
+                help="Up-weight TRUE disturbed frames in the distortion by (1 + dist_weight*"
+                     "disturbed), using the per-frame label from disturbed.hdf5. The channel "
+                     "exists to fix the ~6%% disturbed frames; without weighting they are "
+                     "swamped by the 94%% calm ones. Uses the ground-truth flag, not the "
+                     "deviation proxy (--lam). Try 5-15. No-op if the cache has no DIST.")
 ap.add_argument("--disagree_gate", action="store_true",
                 help="Disagreement-gated fusion: the refiner emits a per-location gate g in "
                      "[0,1] and returns z_hat + g*delta, so it corrects only where the channel "
@@ -122,12 +128,18 @@ if a.spatial:
           f"x {a.grid}x{a.grid} grid = {CONFIG['D_jscc']} symbols (rate unchanged)")
 DEV="cuda:0"; os.makedirs(a.out, exist_ok=True)
 
-ZT=[];ZH=[]
+ZT=[];ZH=[];DIST=[]
 for f in sorted(glob.glob(os.path.join(a.pre,"shard*.pt"))):
     d=torch.load(f); ZT.append(d["ZT"]); ZH.append(d["ZH"])
+    DIST.append(d["DIST"].reshape(-1) if "DIST" in d else None)
 ZT=torch.cat(ZT).float(); ZH=torch.cat(ZH).float()
 ZT=ZT.reshape(-1,4,28,28); ZH=ZH.reshape(-1,4,28,28)
+# TRUE per-frame disturbance label (from disturbed.hdf5). None if the cache predates it.
+DIST = torch.cat(DIST).float() if all(x is not None for x in DIST) else None
 dev=((ZT-ZH)**2).mean(dim=(1,2,3))
+if DIST is not None:
+    print(f"[data] true disturbance labels present: {int(DIST.sum())}/{len(DIST)} "
+          f"frames ({100*DIST.mean():.1f}%) disturbed")
 N=len(dev); order=torch.argsort(dev,descending=True)
 top2 = a.top if a.top2 is None else a.top2
 idx1 = order[:int(a.top*N)]          # phase-1 pool
@@ -198,9 +210,17 @@ def run(idx, train, phase, drop):
                 # --beta keeps its old meaning.
                 e=((z-h)**2).mean(1,keepdim=True)
                 w=1.0+a.lam*e/e.mean().clamp(min=1e-8)
-                d=(w*(pred-z)**2).mean()/w.mean()
+                ds=(w*(pred-z)**2).mean(dim=(1,2,3))/w.mean()   # per-sample
             else:
-                d=((pred-z)**2).mean()
+                ds=((pred-z)**2).mean(dim=(1,2,3))              # per-sample
+            if a.dist_weight>0 and DIST is not None:
+                # Up-weight the TRUE disturbed frames (per-frame label from disturbed.hdf5),
+                # so the ~6% of frames the channel actually exists to fix are not drowned out
+                # by the 94% where z_hat is already right. Cleaner than --lam (deviation proxy).
+                fw=1.0+a.dist_weight*DIST[sel].to(DEV)
+                d=(fw*ds).sum()/fw.sum()
+            else:
+                d=ds.mean()
             q=lv_e.exp()+sig_n; pv=lv_p.exp().clamp(min=1e-8)
             r=(0.5*(pv.log()-q.log()+(q+(mu_e-mu_p).pow(2))/pv-1.0)).mean()
             loss=d+a.beta*r

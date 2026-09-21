@@ -27,9 +27,12 @@ for f in sorted(glob.glob(os.path.join(a.src, "shard*.pt"))):
     zt, zh = d["ZT_roll"], d["ZH"]
     assert zt.shape == zh.shape, f"{f}: ZT_roll {tuple(zt.shape)} != ZH {tuple(zh.shape)}"
     out = os.path.join(a.dst, os.path.basename(f))
-    torch.save({"ZT": zt, "ZH": zh,
-                "SNR": d.get("SNR"), "CH": d.get("CH"),
-                "meta": {**d.get("meta", {}), "converted_from": f}}, out)
+    save = {"ZT": zt, "ZH": zh,
+            "SNR": d.get("SNR"), "CH": d.get("CH"),
+            "meta": {**d.get("meta", {}), "converted_from": f}}
+    if "DIST" in d:                       # per-frame disturbance flag, aligned with ZT/ZH
+        save["DIST"] = d["DIST"]
+    torch.save(save, out)
     n = zt.shape[0] * zt.shape[1]
     tot += n
     dev = ((zt.float() - zh.float()) ** 2).mean().item()

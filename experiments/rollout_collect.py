@@ -155,6 +155,7 @@ if not a.pure_wm:
 T_SECOND = CONFIG.get("noise_level_second", 0)
 ZT_all, ZR_all, A_all, ZH_all = [], [], [], []
 SNR_all, CH_all = [], []
+DIST_all = []           # per-rollout-frame disturbance flag (from disturbed.hdf5), if present
 rng = np.random.default_rng(a.seed + a.shard)
 CH_CODES = {"awgn": 0, "rayleigh": 1, "cdl": 2}
 t_start = time.perf_counter()
@@ -173,6 +174,12 @@ for i, (p, e) in enumerate(index):
         x = x.permute(0, 3, 1, 2)
         # +K so the final chunk's action window is still full length
         act = torch.from_numpy(np.array(g["actions"][:n + K], dtype=np.float32))
+        # Per-frame disturbance flag (disturbed.hdf5 has it; demos_disturbed.hdf5 does not).
+        # Lets Stage 2 train/eval on the TRUE disturbed frames instead of a deviation proxy.
+        if "disturbed" in g:
+            dist = np.array(g["disturbed"][:n]).astype(np.float32)
+        else:
+            dist = np.zeros(n, dtype=np.float32)
 
     with torch.no_grad():
         Z = torch.cat([vae.encode(x[j:j + 4].to(DEV)) for j in range(0, len(x), 4)])
@@ -211,6 +218,7 @@ for i, (p, e) in enumerate(index):
     ZR_all.append(torch.stack(recon, 0).half().cpu())
     A_all.append(act[:n].cpu())
     SNR_all.append(ep_snr); CH_all.append(CH_CODES[ep_ch])
+    DIST_all.append(torch.from_numpy(dist[SEED:n]))     # aligned with zhats / ZT_roll
 
     if i % 5 == 0:
         el = time.perf_counter() - t_start
@@ -225,8 +233,9 @@ ZH = torch.stack(ZH_all)                      # (n_ep, rollout_len, C, H, W)
 # aligned with the true latent at the same step.  twophase.py reshapes both to
 # (-1, C, H, W), so the leading dims only have to match.
 ZT_roll = ZT[:, SEED:]
+DIST = torch.stack(DIST_all)                  # (n_ep, rollout_len) per-frame disturbed flag
 torch.save({"ZT": ZT, "ZR": ZR, "A": A, "SNR": SNR, "CH": CH,
-            "ZH": ZH, "ZT_roll": ZT_roll,
+            "ZH": ZH, "ZT_roll": ZT_roll, "DIST": DIST,
             "meta": {"ddim_steps": a.ddim_steps, "rollout_len": a.rollout_len,
                      "num_history": T_H, "num_pred": K, "history_stride": M,
                      "seed": SEED, "ch_codes": CH_CODES,
