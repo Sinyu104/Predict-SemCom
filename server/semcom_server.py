@@ -40,8 +40,12 @@ Modes (--mode), in increasing order of what is exercised:
                 exactly — the control for validating ROS plumbing, the episode
                 state machine, and the reset protocol before any diffusion runs.
     vae         VAE encode -> decode only.  Isolates codec loss.
-    nochannel   full pipeline with s~_t zeroed.  Shows what the Ctrl-World
-                prediction alone supports (the "C" baseline in the Stage-2 eval).
+    predict     z_hat decoded straight to the policy.  Stage 1 ALONE, no Stage 2
+                loaded at all.  Pair with --clean_history for the predictor's
+                ceiling with drift removed.
+    nochannel   refinement with s~_t zeroed.  NOT the raw prediction: the
+                refinement is residual (z_hat + delta), so this emits
+                z_hat + delta(0).  Use `predict` to see z_hat itself.
     full        the complete pipeline.
 
 Build up one mode at a time: each has a predictable expected result, so a
@@ -122,16 +126,37 @@ class SemComPipeline:
         self.n_ddim      = config.get("ctrl_world_n_steps", 10)
         self.t_second    = config.get("noise_level_second", 0)
 
+        # Strided history + keyframe re-anchoring, matching experiments/rollout_collect.py.
+        # Consecutive history was measured at 0.2759 latent error (copy-last-frame is
+        # 0.287, i.e. no better than doing nothing); stride 8 drops it to 0.1639 with
+        # no retraining, and N=16 anchors take it to 0.0838.
+        self.stride   = int(config.get("history_stride", 1))
+        self.reanchor = int(config.get("reanchor", 0))
+        # Feed the TRUE latent into the history instead of the reconstruction.
+        # Not deployable — the receiver never holds z_t for a non-anchor frame —
+        # but it removes closed-loop drift entirely, so whatever damage survives
+        # belongs to the channel and the refinement rather than to accumulation.
+        self.clean_history = bool(config.get("clean_history", False))
+        # Frames the strided window reaches back over.
+        self.span = (self.num_history - 1) * self.stride + 1
+
         self.episode = None
         self.reset()
 
     def reset(self):
         """Clear per-episode state.  Called on every episode boundary."""
-        self.z_hist = deque(maxlen=self.num_history)
-        self.a_hist = deque(maxlen=self.num_history + self.num_pred)
+        # Buffers must span the whole strided window, not just num_history frames.
+        self.z_hist = deque(maxlen=self.span)
+        # One longer than the latent buffer: the newest action a_t belongs to the
+        # future slots, so a full strided history still needs `span` entries behind it.
+        self.a_hist = deque(maxlen=self.span + 1)
         # Actions are zero-padded until the robot has actually moved.
-        for _ in range(self.num_history + self.num_pred):
+        for _ in range(self.span + 1):
             self.a_hist.append(np.zeros(self.action_dim, dtype=np.float32))
+        self.frame_idx = 0        # index within the episode
+        self.chunk     = None     # cached (1, num_pred, C, H, W) prediction
+        self.chunk_pos = 0        # which frame of the cached chunk comes next
+        self.last_zhat = None     # last Ctrl-World prediction latent (for the 3-panel dump)
 
     # -- helpers ---------------------------------------------------------- #
 
@@ -152,18 +177,45 @@ class SemComPipeline:
         static, so repeat-padding is a mild approximation.  It only affects the
         first `num_history` steps of a ~300-step episode.
         """
-        frames = list(self.z_hist)          # each (C, H, W)
-        while len(frames) < self.num_history:
-            frames.insert(0, frames[0])
-        out = torch.stack(frames, dim=0).unsqueeze(0)   # (1, num_history, C, H, W)
+        frames = list(self.z_hist)          # each (C, H, W), oldest first
+        idx = self._hidx(len(frames))
+        out = torch.stack([frames[j] for j in idx], dim=0).unsqueeze(0)
         assert out.ndim == 5 and out.shape[1] == self.num_history, \
             f"history tensor must be (1, {self.num_history}, C, H, W), got {tuple(out.shape)}"
         return out
 
+    def _hidx(self, n):
+        """Strided history indices into a buffer of length n, oldest first.
+
+        Identical to rollout_collect.py / the offline rollouts: slots sit at
+        n-1, n-1-stride, n-1-2*stride, ...  Clamped at 0, so early in an episode
+        the oldest slots repeat the first frame rather than reaching off the end.
+        """
+        return [max(0, n - 1 - i * self.stride) for i in range(self.num_history)][::-1]
+
     def _action_tensor(self) -> torch.Tensor:
-        """(1, num_history + num_pred, action_dim), oldest first."""
+        """(1, num_history + num_pred, action_dim), oldest first.
+
+        History slots use the SAME strided indices as the latents.  The num_pred
+        future slots are the actions the world model is being asked to predict
+        under — offline those come from the recorded demo, but online the policy
+        has not produced them yet, so they repeat the most recent action.  With
+        num_pred=1 there is no approximation: the single future slot is a_t, the
+        action the robot just executed.  For num_pred>1 this is an approximation
+        that only a chunking policy could remove.
+        """
         a = np.stack(list(self.a_hist), axis=0)
-        return torch.from_numpy(a).unsqueeze(0).to(self.device)
+        # a[-1] is a_t, the action that produced the frame being predicted, so the
+        # history slots must come from a[:-1] (ending at a_{t-1}) and the future
+        # slots start at a_t.  Offline this is cat([act[hidx], act[t:t+K]]), where
+        # hidx tops out at t-1 — matching that split exactly matters, because an
+        # off-by-one here shifts every history slot by one control step.
+        past = a[:-1]
+        idx = self._hidx(len(past))
+        hist = past[idx]                                     # (num_history, action_dim)
+        fut = np.repeat(a[-1][None, :], self.num_pred, axis=0)
+        out = np.concatenate([hist, fut], axis=0)
+        return torch.from_numpy(out).unsqueeze(0).to(self.device)
 
     # -- main entry ------------------------------------------------------- #
 
@@ -191,6 +243,24 @@ class SemComPipeline:
             self.z_hist.append(z_t[0])
             return self._to_uint8(x_tilde), t
 
+        # -- keyframe / warm-up anchoring ---------------------------------- #
+        # The offline rollouts seed the loop with `span` ground-truth latents and
+        # then re-anchor every `reanchor` frames.  An anchor is a frame the robot
+        # sends uncoded, so the receiver holds the true latent; error at an anchor
+        # is 0.0000 and the loop cannot accumulate past it.
+        is_anchor = (
+            self.frame_idx < self.span                                  # warm-up seed
+            or (self.reanchor > 0 and self.frame_idx % self.reanchor == 0)
+        )
+        if is_anchor:
+            x_tilde = self.vae.decode(z_t)
+            self.z_hist.append(z_t[0])
+            self.frame_idx += 1
+            self.chunk = None                     # history jumped; drop stale chunk
+            self.last_zhat = None                 # anchor: no prediction this frame
+            t["anchor"] = True
+            return self._to_uint8(x_tilde), t
+
         # -- Wyner-Ziv side information (receiver-only, no access to s~_t) -- #
         t0 = time.perf_counter()
         if len(self.z_hist) == 0:
@@ -198,12 +268,30 @@ class SemComPipeline:
             # the observed latent so the refinement still has a sane prior.
             z_hat = z_t
         else:
-            z_pred = self.ctrl_world.predict_next_latent(
-                self._history_tensor(), self._action_tensor(), n_steps=self.n_ddim,
-            )                                            # (1, num_pred, C, H, W)
+            # One Ctrl-World call per num_pred frames, matching the offline loop.
+            if self.chunk is None or self.chunk_pos >= self.num_pred:
+                self.chunk = self.ctrl_world.predict_next_latent(
+                    self._history_tensor(), self._action_tensor(), n_steps=self.n_ddim,
+                )                                        # (1, num_pred, C, H, W)
+                self.chunk_pos = 0
             # Ctrl-World runs in fp16; the refinement network is fp32.
-            z_hat = z_pred[:, 0].float()
+            z_hat = self.chunk[:, self.chunk_pos].float()
+            self.chunk_pos += 1
+        self.last_zhat = z_hat        # stash the prediction (latent only, no decode cost)
         t["ctrl_world"] = time.perf_counter() - t0
+
+        # -- raw prediction, no Stage 2 at all ----------------------------- #
+        # `nochannel` is NOT this: it zeroes s~ but still runs the refinement, and
+        # the refinement is residual (`z_hat + delta`), so it emits z_hat + delta(0).
+        # Nothing else in this file renders z_hat itself, which is what separates a
+        # Stage-1 failure from a Stage-2 one.  Pair with --clean_history to drop
+        # drift as well and see the predictor's ceiling.
+        if self.mode == "predict":
+            x_tilde = self.vae.decode(z_hat)
+            self.z_hist.append(z_t[0] if self.clean_history else z_hat[0])
+            self.frame_idx += 1
+            t["vae_dec"] = time.perf_counter() - t0
+            return self._to_uint8(x_tilde), t
 
         # -- transmitter: JSCC over the channel ---------------------------- #
         t0 = time.perf_counter()
@@ -226,7 +314,10 @@ class SemComPipeline:
 
         # History is the RECONSTRUCTED latent — what the receiver would actually
         # have at the next step, not the ground-truth z_t.
-        self.z_hist.append(z_tilde[0])
+        # The policy always sees the reconstruction; only what goes BACK into the
+        # history changes, so --clean_history isolates the refinement from drift.
+        self.z_hist.append(z_t[0] if self.clean_history else z_tilde[0])
+        self.frame_idx += 1
         return self._to_uint8(x_tilde), t
 
 
@@ -246,7 +337,7 @@ def build_pipeline(args, config, device):
     ctrl_world = None
     system     = None
 
-    if args.mode in ("nochannel", "full"):
+    if args.mode in ("predict", "nochannel", "full"):
         from ctrl_world_wrapper import CtrlWorldWrapper
         svd_path = args.svd_path or config.get("svd_model_name")
         print(f"[SemCom] Ctrl-World: SVD={svd_path}  num_pred={config['num_pred']}")
@@ -279,13 +370,18 @@ def build_pipeline(args, config, device):
             print("[SemCom] WARNING: no unet_cross_attn_state — the UNet is stock SVD.")
         ctrl_world.eval()
 
-        system = SemComSystem(config).to(device)
-        sk = torch.load(args.stage2_ckpt, map_location="cpu")
-        state = sk.get("system_state", sk)
-        missing, unexpected = system.load_state_dict(state, strict=False)
-        print(f"[SemCom] Stage-2 restored from {args.stage2_ckpt} "
-              f"({len(state)} tensors, {len(missing)} missing, {len(unexpected)} unexpected)")
-        system.eval()
+        # `predict` renders z_hat and never touches Stage 2, so it must not require
+        # a Stage-2 checkpoint — the whole point is to score Stage 1 on its own.
+        if args.mode != "predict":
+            system = SemComSystem(config).to(device)
+            sk = torch.load(args.stage2_ckpt, map_location="cpu")
+            state = sk.get("system_state", sk)
+            missing, unexpected = system.load_state_dict(state, strict=False)
+            print(f"[SemCom] Stage-2 restored from {args.stage2_ckpt} "
+                  f"({len(state)} tensors, {len(missing)} missing, {len(unexpected)} unexpected)")
+            system.eval()
+        else:
+            print("[SemCom] mode=predict — Stage 2 not loaded; the policy sees z_hat.")
 
     return SemComPipeline(config, vae, ctrl_world, system, device, args.mode)
 
@@ -371,15 +467,36 @@ def run_server(args):
                      ("noise_level_second", args.noise_level_second)]:
         if val is not None:
             CONFIG[key] = val
-    # Closed loop knows one step at a time; K>1 needs future actions we do not have.
-    CONFIG["num_pred"]    = 1
-    CONFIG["clip_length"] = CONFIG["num_history"] + 1
+    # K>1 needs future actions the receiver does not have: to predict z_t..z_{t+K-1}
+    # the world model is conditioned on a_t..a_{t+K-1}, but the policy emits one
+    # action at a time from images this loop has not rendered yet.  The offline
+    # rollouts read those actions from the recorded demo, which deployment cannot.
+    # K=1 is therefore the deployable default; K>1 is allowed for comparison
+    # against the offline numbers, with the future slots repeating the last action.
+    CONFIG["num_pred"]       = args.num_pred
+    CONFIG["clip_length"]    = CONFIG["num_history"] + CONFIG["num_pred"]
+    CONFIG["history_stride"] = args.history_stride
+    CONFIG["reanchor"]       = args.reanchor
+    CONFIG["clean_history"]  = args.clean_history
+    if args.clean_history:
+        print("[SemCom] clean_history=ON — Ctrl-World sees TRUE latents. DIAGNOSTIC ONLY, "
+              "not a deployable configuration; numbers from this run are an upper bound.")
 
     print(f"[SemCom] mode={args.mode}  snr={CONFIG['snr_db']}dB  "
           f"channel={CONFIG.get('channel_type')}  D_jscc={CONFIG['D_jscc']}")
-    print(f"[SemCom] num_history={CONFIG['num_history']}  num_pred=1  "
+    print(f"[SemCom] num_history={CONFIG['num_history']}  num_pred={CONFIG['num_pred']}  "
+          f"stride={args.history_stride}  reanchor={args.reanchor}  "
           f"ddim_steps={CONFIG.get('ctrl_world_n_steps')}  "
           f"t''={CONFIG.get('noise_level_second')}")
+    if args.num_pred > 1:
+        print(f"[SemCom] WARNING: num_pred={args.num_pred} > 1 — the {args.num_pred} future "
+              f"action slots repeat the last action, since the policy has not produced "
+              f"them yet.  Offline rollouts used the demo's true future actions, so this "
+              f"is NOT the same conditioning those numbers were measured under.")
+    if args.reanchor > 0:
+        span = (CONFIG["num_history"] - 1) * args.history_stride + 1
+        print(f"[SemCom] anchors: first {span} frames seeded uncoded, then every "
+              f"{args.reanchor} frames.  Anchor frames bypass the channel entirely.")
 
     t_start  = time.perf_counter()
     pipeline = build_pipeline(args, CONFIG, device)
@@ -444,6 +561,16 @@ def run_server(args):
                     prev_act = None
                     print(f"[SemCom] --- episode {ep}: history reset ---", flush=True)
 
+                # -- disturbance marker ------------------------------------ #
+                # Windows tags the frames where it injected a pose/action
+                # disturbance. Read it exactly like seq/episode. It changes no
+                # data flow — it only labels the frame, so we can (a) log the
+                # moment and (b) tag its dump for later analysis of how the
+                # channel/refinement behaved on the frames that actually need it.
+                disturbed = bool(data.get("disturbed", False))
+                if disturbed:
+                    print(f"[SemCom] disturbance @ ep{ep} seq{seq}", flush=True)
+
                 try:
                     obs_rgb = np.array(
                         Image.open(io.BytesIO(base64.b64decode(data["jpeg_b64"]))).convert("RGB"),
@@ -466,6 +593,36 @@ def run_server(args):
                 )
                 prev_act = action
                 ms = (time.perf_counter() - t0) * 1000
+
+                if args.dump_dir and n_reqs % args.dump_every == 0:
+                    try:
+                        os.makedirs(args.dump_dir, exist_ok=True)
+                        obs = np.asarray(obs_rgb)
+                        rec = np.asarray(x_tilde)
+                        if rec.shape != obs.shape:      # bypass forwards the original
+                            rec = obs
+                        # 3-panel [received | predicted z_hat | reconstructed] when a
+                        # prediction exists (full/nochannel modes, non-anchor frames).
+                        # At a disturbance z_hat shows the pre-event scene and rec should
+                        # show the channel's correction, so the three side by side are the
+                        # direct read on whether the Wyner-Ziv channel did its job.
+                        panels = [obs]
+                        with torch.no_grad():
+                            if getattr(pipeline, "last_zhat", None) is not None:
+                                pred = pipeline._to_uint8(pipeline.vae.decode(pipeline.last_zhat))
+                                if pred.shape == obs.shape:
+                                    panels.append(pred)
+                        panels.append(rec)
+                        pair = np.concatenate(panels, axis=1)
+                        # "_D" marks a disturbed frame, so the frames that stress
+                        # the channel are findable with a glob after the run.
+                        tag = "_D" if disturbed else ""
+                        Image.fromarray(pair.astype(np.uint8)).save(
+                            os.path.join(args.dump_dir,
+                                         f"{str(ep) if ep is not None else 'noep'}"
+                                         f"_{n_reqs:05d}{tag}.png"))
+                    except Exception as e:                        # never kill the loop
+                        print(f"[SemCom] dump failed: {e}", flush=True)
 
                 for k, v in timings.items():
                     stage_ms[k] = stage_ms.get(k, 0.0) + v * 1000
@@ -503,10 +660,13 @@ def run_server(args):
 def parse_args():
     p = argparse.ArgumentParser(
         description="Online closed-loop SemCom + policy inference server")
-    p.add_argument("--mode", choices=["bypass", "vae", "nochannel", "full"],
+    p.add_argument("--mode",
+                   choices=["bypass", "vae", "predict", "nochannel", "full"],
                    default="bypass",
                    help="How much of the pipeline to exercise. Start with bypass "
-                        "and confirm it reproduces the policy-only success rate.")
+                        "and confirm it reproduces the policy-only success rate. "
+                        "predict renders z_hat with NO Stage 2 — the only mode that "
+                        "scores Stage 1 alone (nochannel still runs the refinement).")
 
     # Policy — a separate process (different conda env); start it first.
     p.add_argument("--policy_host", type=str, default="127.0.0.1")
@@ -515,6 +675,18 @@ def parse_args():
     p.add_argument("--instruction", type=str,
                    default="pick up the red cube and place it on the tray",
                    help="Fallback when the client sends none.")
+    p.add_argument("--clean_history", action="store_true",
+                   help="Condition Ctrl-World on TRUE latents instead of reconstructions. "
+                        "NOT deployable (the receiver never holds z_t for a coded frame) — "
+                        "a diagnostic that removes closed-loop drift, so what remains is "
+                        "the channel and refinement alone. Pair with --reanchor 0 so every "
+                        "frame actually goes through the channel.")
+    p.add_argument("--dump_dir", type=str, default=None,
+                   help="Save observation|reconstruction pairs here as PNGs. The policy "
+                        "acts on the RIGHT half; if the cube is the wrong colour or absent "
+                        "there, the policy never had the information. Off by default.")
+    p.add_argument("--dump_every", type=int, default=10,
+                   help="Save one pair every N frames when --dump_dir is set.")
 
     # SemCom checkpoints
     p.add_argument("--stage1_ckpt", type=str,
@@ -531,6 +703,19 @@ def parse_args():
                    choices=["awgn", "rayleigh", "cdl"])
     p.add_argument("--D_jscc",  type=int, default=None)
     p.add_argument("--num_history", type=int, default=None)
+    p.add_argument("--history_stride", type=int, default=1,
+                   help="m: spacing between history slots. Offline, stride 8 cut closed-loop "
+                        "latent error from 0.2759 to 0.1639 with no retraining (copy-last-frame "
+                        "is 0.287). Must match the stride the Stage-1 checkpoint was fine-tuned "
+                        "on — stride_k8 was trained at 8.")
+    p.add_argument("--reanchor", type=int, default=0,
+                   help="N: send an uncoded frame every N steps, so the receiver holds the true "
+                        "latent and drift cannot accumulate past it. 0 = off. Offline, N=16 took "
+                        "latent error from 0.1639 to 0.0838. Costs one uncoded frame per N.")
+    p.add_argument("--num_pred", type=int, default=1,
+                   help="K: frames per Ctrl-World call. 1 is the deployable default. K>1 needs "
+                        "future actions the receiver does not have (see run_server) and is only "
+                        "meaningful for comparison against the offline rollouts.")
     p.add_argument("--ctrl_world_n_steps", type=int, default=None,
                    help="DDIM steps for Ctrl-World. Dominates per-step latency; "
                         "lower it if requests approach the client timeout.")

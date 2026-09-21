@@ -40,10 +40,49 @@ ap.add_argument("--t2max", type=int, default=0,
                      "denoise conditioned on (z_hat, s~). 0 = the current direct "
                      "single-step corrector, which has NO mechanism to distrust z_hat. "
                      "A prior sweep found 0 optimal, but that was measured when z_hat "
-                     "was ~95% correct; in the closed loop it carries 0.10-0.24 error, "
+                     "was ~95%% correct; in the closed loop it carries 0.10-0.24 error, "
                      "so noising it costs far less.")
 ap.add_argument("--eval_steps", type=int, default=10,
                 help="DDIM steps at evaluation when --t2max > 0.")
+ap.add_argument("--lam", type=float, default=0.0,
+                help="Weight the distortion loss toward the cells where z_hat is ALREADY "
+                     "wrong -- i.e. what the channel exists to fix. 0 = flat MSE (original). "
+                     "Flat MSE gives the static table ~95%% of the gradient and the cube ~3%%, "
+                     "so erasing a small fast object is cheaper under L2 than placing it "
+                     "wrong: measured cube IoU falls 0.78 -> 0.12 across an episode while "
+                     "MSE barely moves. The weight uses z_t and z_hat, both training-only "
+                     "inputs, so nothing leaks to inference. Try 3-5.")
+ap.add_argument("--lam_res", type=float, default=0.0,
+                help="Residual penalty: lam_res * ||pred - z_hat||^2 on samples where the "
+                     "refiner IS given the prior (phase-2, not dropped -- the deployment "
+                     "mode). Makes 'change nothing' the default and forces the channel to "
+                     "EARN every correction. Measured cause of the failure: the trained "
+                     "refiner over-corrects and damages even a PERFECT prior (oracle_z VLA "
+                     "action error 0.0 -> 0.77 as the residual is applied 0 -> full); a "
+                     "residual-scale of ~0.4 kept most of the quality. This term is the soft "
+                     "equivalent -- optimum pred = (z_t + lam_res*z_hat)/(1+lam_res), i.e. "
+                     "effective scale 1/(1+lam_res). Start lam_res ~ 1.0 (scale ~0.5); "
+                     "sweep 0.5/1/2. Select the checkpoint on the VLA action metric "
+                     "(vla_attribution.py oracle_z), NEVER on latent MSE.")
+ap.add_argument("--res_tau", type=float, default=0.0,
+                help="Deviation gate for the residual penalty (only with --lam_res). The "
+                     "penalty weight per frame becomes exp(-||z_t - z_hat||^2 / res_tau), so "
+                     "it applies where z_hat is RELIABLE (calm, small deviation) and fades "
+                     "where z_hat is wrong (disturbed) -- there the channel s~ must be free "
+                     "to move pred away from z_hat. A flat penalty (res_tau=0) suppressed the "
+                     "channel: measured channel contribution on disturbed frames was only "
+                     "~3%%, and the reconstruction copied z_hat instead of trusting the "
+                     "transmitter. Set near the calm/disturbed boundary, e.g. 0.05.")
+ap.add_argument("--cube_eval", type=int, default=0,
+                help="Decode this many eval samples to pixels and report cube IoU (overlap "
+                     "between the cube in z_t and the cube in the reconstruction). 0 = off, "
+                     "no VAE loaded, original behaviour. Latent MSE is nearly blind to the "
+                     "cube: over one episode it moved 0.047 -> 0.065 while the cube went "
+                     "209 px -> 39 px and IoU went 0.78 -> 0.12. 256 samples is enough to "
+                     "rank two runs against each other.")
+ap.add_argument("--cube_color", type=str, default="red", choices=["red", "green", "blue"],
+                help="Which channel dominates on the cube. The table is blue, so "
+                     "colour-dominance is a safe mask for the red/green tasks.")
 ap.add_argument("--init", type=str, default=None,
                 help="Warm-start from an existing checkpoint (e.g. a phase1.pt with "
                      "an already-working s~ decoder). Use with --ep1 0 to skip "
@@ -53,9 +92,25 @@ ap.add_argument("--D_jscc", type=int, default=None,
                      "channel can only help where it beats the predictor: phase-1 "
                      "val_dist is what s~ ALONE supports, so sweep this and compare "
                      "it against the mean deviation ||z_t - z_hat||^2.")
+ap.add_argument("--spatial", action="store_true",
+                help="Spatial JSCC code: conv encoder emits a (c,g,g) GRID where symbol "
+                     "(k,i,j) describes image region (i,j), and the refinement's signal "
+                     "tokens get a geometric 2D sin-cos embedding on that grid. Same rate "
+                     "(c*g*g == D_jscc). The flat encoder moves 96%% of its symbols for a "
+                     "change confined to one corner, so position has to travel through a "
+                     "fully distributed code; measured live, colour survived and the cube "
+                     "landed 19.6 px off -- wider than the cube. Not checkpoint-compatible "
+                     "with flat runs: train from scratch, no --init.")
+ap.add_argument("--grid", type=int, default=8,
+                help="g for --spatial. D_jscc must be divisible by g*g (256 = 4 x 8 x 8).")
 a=ap.parse_args()
 if a.D_jscc is not None:
     CONFIG["D_jscc"]=a.D_jscc
+CONFIG["jscc_spatial"]=a.spatial
+CONFIG["jscc_grid"]=a.grid
+if a.spatial:
+    print(f"[cfg] spatial JSCC code: {CONFIG['D_jscc']//(a.grid*a.grid)} channels "
+          f"x {a.grid}x{a.grid} grid = {CONFIG['D_jscc']} symbols (rate unchanged)")
 DEV="cuda:0"; os.makedirs(a.out, exist_ok=True)
 
 ZT=[];ZH=[]
@@ -109,11 +164,14 @@ def run(idx, train, phase, drop):
             # what the REFINEMENT is allowed to see
             if phase==1:
                 h_ref=torch.zeros_like(h)                # nothing: must decode s~
+                base_ok=torch.zeros(B,device=DEV)        # no prior -> no residual penalty
             elif drop>0 and train:
                 m=(torch.rand(B,device=DEV)<drop).float().view(B,1,1,1)
                 h_ref=h*(1-m)                            # dropped => base gone too
+                base_ok=(1.0-m).view(B)
             else:
                 h_ref=h
+                base_ok=torch.ones(B,device=DEV)
             rd=sysm.refinement_diffusion
             if a.t2max>0 and phase==2:
                 tmax=min(int(a.t2max), len(rd.alphas_cumprod)-1)
@@ -123,10 +181,39 @@ def run(idx, train, phase, drop):
             else:
                 tt=torch.zeros(B,dtype=torch.long,device=DEV); x_in=h_ref
             pred=rd._denoise_x0(x_in, tt, h_ref, st)
-            d=((pred-z)**2).mean()
+            if a.lam>0:
+                # Weight by where z_hat is already wrong. Uses the REAL h even in phase 1
+                # (where the refinement is shown zeros): the weight describes the DATA, not
+                # what the decoder is allowed to see, so it does not reopen the phase-1
+                # withholding. Renormalised by w.mean() so d stays on the flat-MSE scale and
+                # --beta keeps its old meaning.
+                e=((z-h)**2).mean(1,keepdim=True)
+                w=1.0+a.lam*e/e.mean().clamp(min=1e-8)
+                d=(w*(pred-z)**2).mean()/w.mean()
+            else:
+                d=((pred-z)**2).mean()
             q=lv_e.exp()+sig_n; pv=lv_p.exp().clamp(min=1e-8)
             r=(0.5*(pv.log()-q.log()+(q+(mu_e-mu_p).pow(2))/pv-1.0)).mean()
             loss=d+a.beta*r
+            if a.lam_res>0:
+                # ||pred - z_hat||^2 only where the refiner was actually given the prior
+                # (base_ok): penalising the phase-1 / dropped samples would fight the very
+                # withholding that builds the channel pathway. z_hat here is the REAL h.
+                sq=((pred-h)**2).mean(dim=(1,2,3))       # (B,)
+                # DEVIATION-AWARE gate. A flat penalty punishes moving away from z_hat
+                # everywhere -- including disturbed frames where the truth IS far from
+                # z_hat and the channel is what carries it, so it suppresses exactly the
+                # channel corrections we want. Gate the penalty to frames where z_hat is
+                # RELIABLE (small deviation): stay near the prior when it is right, move
+                # freely (let s~ decide) when it is wrong. res_tau=0 keeps the flat penalty.
+                if a.res_tau>0:
+                    dev=((z-h)**2).mean(dim=(1,2,3))     # (B,) true deviation z_t vs z_hat
+                    calm=torch.exp(-dev/a.res_tau)       # ~1 calm, ~0 disturbed
+                else:
+                    calm=torch.ones_like(sq)
+                wgt=base_ok*calm
+                res=(wgt*sq).sum()/wgt.sum().clamp(min=1.0)
+                loss=loss+a.lam_res*res
         if train:
             opt.zero_grad(); loss.backward()
             if st.grad is not None:
@@ -156,6 +243,29 @@ for ph,neps,drop in ((1,a.ep1,0.0),(2,a.ep2,a.drop2)):
 # The DECILE breakdown is not optional. An aggregate hides regime-specific
 # failure: an earlier configuration read +5.3% overall while DOUBLING the error
 # on the calmest decile, which is 90% of real frames.
+_vae=[None]
+def vae():
+    """Loaded lazily so --cube_eval 0 keeps the no-VAE promise in the docstring."""
+    if _vae[0] is None:
+        from vae_wrapper import VAEWrapper
+        _vae[0]=VAEWrapper(CONFIG["vae_model_name"]).to(DEV).eval()
+    return _vae[0]
+
+def cube_mask(im):
+    """im: (B,H,W,3) in 0..255.  Colour-dominance; the table is blue and the gripper grey."""
+    c={"red":0,"green":1,"blue":2}[a.cube_color]
+    o=[i for i in range(3) if i!=c]
+    return (im[...,c]>90)&(im[...,c]-im[...,o[0]]>45)&(im[...,c]-im[...,o[1]]>45)
+
+@torch.no_grad()
+def cube_stats(z_true, z_rec):
+    dec=lambda z: vae().decode(z).clamp(0,1).permute(0,2,3,1).cpu().numpy()*255.
+    mg,mr=cube_mask(dec(z_true)),cube_mask(dec(z_rec))
+    keep=mg.sum((1,2))>20                      # only frames where the cube is really visible
+    if not keep.any(): return None
+    inter=(mg&mr).sum((1,2))[keep]; union=np.maximum((mg|mr).sum((1,2))[keep],1)
+    return inter/union, mg.sum((1,2))[keep], mr.sum((1,2))[keep]
+
 def evaluate(idx, label):
     A=[];Bl=[]
     with torch.no_grad():
@@ -184,6 +294,33 @@ def evaluate(idx, label):
     print(f"  A vs C = {100*(C.mean()-A.mean())/C.mean():+.2f}%   (system vs raw prediction)")
     print(f"  per-sample: helped>1% {(rel>1).sum()}/{len(rel)} "
           f"({100*(rel>1).mean():.1f}%)   best {rel.max():+.2f}%")
+    if a.cube_eval>0:
+        torch.cuda.empty_cache()          # the VAE lands on top of the training allocator
+        # Seeded RANDOM subsample, not idx[:n]: idx is in storage order for the
+        # full-distribution call, so a prefix is the opening frames of one episode
+        # (calm, cube at rest) rather than a sample of the distribution.  Same seed
+        # => same frames across runs, so the number is comparable run-to-run.
+        gsub=torch.Generator().manual_seed(1234)
+        sub=idx[torch.randperm(len(idx),generator=gsub)[:a.cube_eval]]
+        U=[];G=[];R2=[]
+        with torch.no_grad():
+            for i in range(0,len(sub),16):
+                sel=sub[i:i+16]; z=ZT[sel].to(DEV); h=ZH[sel].to(DEV); B=len(z)
+                _,_,s=sysm.jscc_encoder(z,sample=False); st=sysm.channel(s)
+                if a.t2max>0:
+                    p=sysm.refinement_diffusion.sdedit_refine(h,st,noise_level=a.t2max,
+                                                              n_steps=a.eval_steps)
+                else:
+                    t0=torch.zeros(B,dtype=torch.long,device=DEV)
+                    p=sysm.refinement_diffusion._denoise_x0(h,t0,h,st)
+                r=cube_stats(z,p)
+                if r is not None: U.append(r[0]); G.append(r[1]); R2.append(r[2])
+        if U:
+            U=np.concatenate(U); G=np.concatenate(G); R2=np.concatenate(R2)
+            print(f"  cube IoU    = {U.mean():.3f}  (px: true {G.mean():.0f} -> "
+                  f"recon {R2.mean():.0f}, n={len(U)})   <-- MSE cannot see this")
+        else:
+            print(f"  cube IoU    = n/a (no sample had a visible {a.cube_color} cube)")
     return A,Bl,C
 
 sysm.eval()

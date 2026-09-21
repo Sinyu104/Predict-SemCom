@@ -54,6 +54,55 @@ def _make_2d_sincos_pos(H: int, W: int, d_model: int, device, dtype) -> torch.Te
 #  1. JSCC ENCODER                                                            #
 # ========================================================================== #
 
+class _SpatialCode(nn.Module):
+    """Conv trunk producing a (c, g, g) GRID of code symbols instead of a flat vector.
+
+    Why this exists.  The flatten->MLP encoder puts every one of the 784 spatial
+    positions into every hidden unit, so no transmitted symbol corresponds to a
+    location; the receiver then re-localises through global cross-attention over
+    `n_sig` chunks carrying LEARNED (not geometric) positional embeddings.  That is
+    the hardest possible way to send position, and it shows: measured live with a
+    perfect predictor context, cube COLOUR survived (a global, low-frequency
+    property a distributed code carries easily) while cube POSITION was off by
+    12.9 px -- about one cube width -- and the target vanished outright on some
+    frames.  The robot located the right cube and could not grasp it.
+
+    Here symbol (k, i, j) is tied to image region (i, j), so moving a cube two
+    cells left is a local change to a few symbols rather than a global recoding.
+
+    Rate is UNCHANGED: c*g*g == D_jscc exactly, and the flattened output keeps the
+    same (B, D_jscc) interface, so FadingChannel and the KL rate term are untouched.
+    """
+
+    def __init__(self, C_in: int, D_jscc: int, grid: int, width: int = 128):
+        super().__init__()
+        assert D_jscc % (grid * grid) == 0, \
+            f"D_jscc={D_jscc} must be divisible by grid^2={grid*grid}"
+        self.grid = grid
+        self.c_out = D_jscc // (grid * grid)
+        # STRIDE-1 throughout, pool exactly once at the end.  An earlier version
+        # strided 28->14->7 and then pooled up to `grid`, which both upsampled for
+        # grid>7 and averaged the cube away before the pool: a ~15 px cube is under
+        # one cell wide at grid=8, so code(z) and code(z_hat) came out nearly equal
+        # and the KL had nothing to bill.  Measured separation-to-variance ratio at
+        # init: flat 0.106, grid=8 0.021 (5x worse), grid=16 0.309 (3x better).
+        # Keep grid fine enough that a cell is no wider than the object that moves.
+        self.trunk = nn.Sequential(
+            nn.Conv2d(C_in, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, width, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(width, width, 3, padding=1), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(grid),
+        )
+        self.head_mu = nn.Conv2d(width, self.c_out, 1)
+        self.head_lv = nn.Conv2d(width, self.c_out, 1)
+
+    def forward(self, z):
+        h = self.trunk(z)
+        mu = self.head_mu(h).flatten(1)                       # (B, D_jscc)
+        lv = self.head_lv(h).flatten(1).clamp(-10.0, 2.0)
+        return mu, lv
+
+
 class JsccEncoder(nn.Module):
     """
     Probabilistic JSCC encoder: z_t → q(s_t | z_t) = N(μ_enc, σ²_enc)
@@ -70,8 +119,14 @@ class JsccEncoder(nn.Module):
     Flattening keeps the full spatial layout.
     """
 
-    def __init__(self, C_vae: int, H_vae: int, W_vae: int, D_jscc: int, d_hidden: int = 512):
+    def __init__(self, C_vae: int, H_vae: int, W_vae: int, D_jscc: int, d_hidden: int = 512,
+                 spatial: bool = False, grid: int = 8):
         super().__init__()
+        self.spatial = spatial
+        self.D_jscc = D_jscc
+        if spatial:
+            self.code = _SpatialCode(C_vae, D_jscc, grid)
+            return
         self.in_dim = C_vae * H_vae * W_vae
         self.shared = nn.Sequential(
             nn.Linear(self.in_dim, d_hidden),
@@ -81,7 +136,6 @@ class JsccEncoder(nn.Module):
         )
         self.fc_mu      = nn.Linear(d_hidden, D_jscc)
         self.fc_log_var = nn.Linear(d_hidden, D_jscc)
-        self.D_jscc = D_jscc
 
     def forward(
         self, z: torch.Tensor, sample: bool = True
@@ -90,10 +144,13 @@ class JsccEncoder(nn.Module):
         z : (B, C_vae, H_vae, W_vae)
         Returns μ_enc, log_var_enc, s_t — all (B, D_jscc)
         """
-        h       = z.flatten(1)                      # (B, C_vae*H_vae*W_vae)
-        h       = self.shared(h)
-        mu      = self.fc_mu(h)
-        log_var = self.fc_log_var(h).clamp(-10.0, 2.0)
+        if self.spatial:
+            mu, log_var = self.code(z)
+        else:
+            h       = z.flatten(1)                  # (B, C_vae*H_vae*W_vae)
+            h       = self.shared(h)
+            mu      = self.fc_mu(h)
+            log_var = self.fc_log_var(h).clamp(-10.0, 2.0)
 
         if sample and self.training:
             std = torch.exp(0.5 * log_var)
@@ -117,8 +174,16 @@ class SideInfoEncoder(nn.Module):
     strictly less capacity than the posterior.
     """
 
-    def __init__(self, C_vae: int, H_vae: int, W_vae: int, D_jscc: int, d_hidden: int = 512):
+    def __init__(self, C_vae: int, H_vae: int, W_vae: int, D_jscc: int, d_hidden: int = 512,
+                 spatial: bool = False, grid: int = 8):
         super().__init__()
+        self.spatial = spatial
+        if spatial:
+            # Must mirror JsccEncoder: the two are compared by the KL, so giving the
+            # prior a different code layout than the posterior makes the rate term
+            # measure the architecture mismatch rather than the disturbance.
+            self.code = _SpatialCode(C_vae, D_jscc, grid)
+            return
         self.in_dim = C_vae * H_vae * W_vae
         self.shared = nn.Sequential(
             nn.Linear(self.in_dim, d_hidden),
@@ -134,6 +199,8 @@ class SideInfoEncoder(nn.Module):
         z_hat : (B, C_vae, H_vae, W_vae)
         Returns μ_prior, log_var_prior — both (B, D_jscc)
         """
+        if self.spatial:
+            return self.code(z_hat)
         h       = z_hat.flatten(1)                  # (B, C_vae*H_vae*W_vae)
         h       = self.shared(h)
         mu      = self.fc_mu(h)
@@ -244,6 +311,8 @@ class RefinementDiffusion(nn.Module):
         d_model:  int   = 256,
         n_heads:  int   = 8,
         n_layers: int   = 4,
+        sig_spatial: bool = False,
+        sig_grid:    int  = 8,
     ):
         super().__init__()
         self.C_vae = C_vae
@@ -262,10 +331,26 @@ class RefinementDiffusion(nn.Module):
         # Received signal projection → single conditioning token
         # s̃_t as n_sig tokens rather than a single one, so its dedicated
         # cross-attention has something to select over. 256 -> 16 x 16.
-        self.n_sig       = 16
-        self.sig_dim     = D_jscc // self.n_sig
-        self.sig_proj    = nn.Linear(self.sig_dim, d_model)
-        self.sig_pos     = nn.Parameter(torch.zeros(1, self.n_sig, d_model))
+        # sig_spatial: s̃ arrives as a (c, g, g) GRID whose cell (i,j) describes image
+        # region (i,j), so the tokens get a GEOMETRIC 2D sin-cos embedding on that grid
+        # -- the same construction as the latent tokens' pos_embed, just at lower
+        # resolution. Cross-attention then does a local lookup instead of searching a
+        # set of chunks whose positions it had to learn. Falls back to the original
+        # 16 unanchored chunks when spatial coding is off.
+        self.sig_spatial = sig_spatial
+        if sig_spatial:
+            self.sig_grid = sig_grid
+            self.n_sig    = sig_grid * sig_grid
+            self.sig_dim  = D_jscc // self.n_sig
+            self.sig_proj = nn.Linear(self.sig_dim, d_model)
+            self.register_buffer("sig_pos_buf",
+                                 torch.zeros(1, self.n_sig, d_model), persistent=False)
+            self._sig_pos_init = False
+        else:
+            self.n_sig       = 16
+            self.sig_dim     = D_jscc // self.n_sig
+            self.sig_proj    = nn.Linear(self.sig_dim, d_model)
+            self.sig_pos     = nn.Parameter(torch.zeros(1, self.n_sig, d_model))
         self.t_embed     = _TimestepEmbedding(d_model)
         self.t_proj      = nn.Linear(d_model, d_model)
 
@@ -328,8 +413,22 @@ class RefinementDiffusion(nn.Module):
         # Conditioning sequence: ẑ_t spatial tokens + s̃_t global token
         zhat_patches = z_cond.reshape(B, C, N).transpose(1, 2)           # (B, N, C)
         cond         = self.zhat_proj(zhat_patches) + pos                 # (B, N, d)
-        sig          = self.sig_proj(
-            s_tilde.reshape(B, self.n_sig, self.sig_dim)) + self.sig_pos  # (B, n_sig, d)
+        if self.sig_spatial:
+            # s̃ is a (c, g, g) grid: tokens must be ordered by LOCATION, so move the
+            # channel axis last -- reshape(B, n_sig, c) would interleave channels and
+            # positions and silently destroy the geometry this change exists to add.
+            g = self.sig_grid
+            sig_map = s_tilde.reshape(B, self.sig_dim, g, g)               # (B, c, g, g)
+            sig_tok = sig_map.reshape(B, self.sig_dim, self.n_sig).transpose(1, 2)
+            if not self._sig_pos_init:
+                self.sig_pos_buf = _make_2d_sincos_pos(
+                    g, g, self.sig_pos_buf.shape[-1], x_noisy.device, x_noisy.dtype
+                ).unsqueeze(0)
+                self._sig_pos_init = True
+            sig = self.sig_proj(sig_tok) + self.sig_pos_buf.to(x_noisy.dtype)
+        else:
+            sig      = self.sig_proj(
+                s_tilde.reshape(B, self.n_sig, self.sig_dim)) + self.sig_pos  # (B, n_sig, d)
 
         for blk in self.blocks:
             x = blk(x, cond, sig)
@@ -599,10 +698,16 @@ class SemComSystem(nn.Module):
         refine_h = config.get("refine_n_heads",    8)
         refine_l = config.get("refine_n_layers",   4)
 
-        self.jscc_encoder         = JsccEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden)
-        self.side_info_encoder    = SideInfoEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden)
+        spatial = config.get("jscc_spatial", False)
+        grid    = config.get("jscc_grid", 8)
+
+        self.jscc_encoder         = JsccEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden,
+                                                spatial=spatial, grid=grid)
+        self.side_info_encoder    = SideInfoEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden,
+                                                    spatial=spatial, grid=grid)
         self.refinement_diffusion = RefinementDiffusion(
-            D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l
+            D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l,
+            sig_spatial=spatial, sig_grid=grid,
         )
 
         channel_type = config.get("channel_type", "rayleigh")
