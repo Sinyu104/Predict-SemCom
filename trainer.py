@@ -369,7 +369,13 @@ class Stage1Trainer(BaseTrainer):
 
         if self.is_main:
             n = sum(p.numel() for p in trainable_params)
-            print(f"[Stage1] Ctrl-World: {n/1e6:.2f}M trainable params (Action_encoder2)")
+            if getattr(self.ctrl_world, "full_finetune", False):
+                scope = "FULL UNet + Action_encoder2"
+            elif getattr(self.ctrl_world, "finetune_cross_attn", False):
+                scope = "Action_encoder2 + UNet cross-attn"
+            else:
+                scope = "Action_encoder2"
+            print(f"[Stage1] Ctrl-World: {n/1e6:.2f}M trainable params ({scope})")
 
         if trainable_params:
             self.optimizer = optim.AdamW(
@@ -409,7 +415,9 @@ class Stage1Trainer(BaseTrainer):
             ae = self.ctrl_world.action_encoder
             ae_state = (ae.module if isinstance(ae, DDP) else ae).state_dict()
         payload = {"action_encoder_state": ae_state}
-        if getattr(self.ctrl_world, "finetune_cross_attn", False):
+        if getattr(self.ctrl_world, "full_finetune", False):
+            payload["unet_full_state"] = self.ctrl_world.unet_full_state_dict()
+        elif getattr(self.ctrl_world, "finetune_cross_attn", False):
             payload["unet_cross_attn_state"] = self.ctrl_world.unet_cross_attn_state_dict()
         if extra:
             payload.update(extra)
@@ -425,7 +433,12 @@ class Stage1Trainer(BaseTrainer):
             )
             if self.is_main:
                 print(f"  [ckpt] Loaded Action_encoder ← {path}")
-        if "unet_cross_attn_state" in ckpt and hasattr(self.ctrl_world, "load_unet_cross_attn_state_dict"):
+        if "unet_full_state" in ckpt and hasattr(self.ctrl_world, "load_unet_full_state_dict"):
+            missing, unexpected = self.ctrl_world.load_unet_full_state_dict(ckpt["unet_full_state"])
+            if self.is_main:
+                print(f"  [ckpt] Loaded FULL UNet ← {path} "
+                      f"({len(missing)} missing, {len(unexpected)} unexpected)")
+        elif "unet_cross_attn_state" in ckpt and hasattr(self.ctrl_world, "load_unet_cross_attn_state_dict"):
             self.ctrl_world.load_unet_cross_attn_state_dict(ckpt["unet_cross_attn_state"])
             if self.is_main:
                 print(f"  [ckpt] Loaded UNet cross-attn ← {path}")
@@ -548,10 +561,14 @@ class Stage1Trainer(BaseTrainer):
                     self.optimizer.zero_grad()
                     self.scaler.scale(L_pred).backward()
                     self.scaler.unscale_(self.optimizer)
-                    # Cross-attn params live in the UNet (not DDP-wrapped), so we
+                    # Trained UNet params (cross-attn subset, or the whole UNet
+                    # under full fine-tune) live in the non-DDP-wrapped UNet, so we
                     # manually all_reduce their gradients across GPUs.
-                    if self.world_size > 1 and getattr(self.ctrl_world, "finetune_cross_attn", False):
-                        for p in self.ctrl_world.cross_attn_parameters():
+                    if self.world_size > 1 and (
+                        getattr(self.ctrl_world, "full_finetune", False)
+                        or getattr(self.ctrl_world, "finetune_cross_attn", False)
+                    ):
+                        for p in self.ctrl_world.unet_trainable_parameters():
                             if p.grad is not None:
                                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                                 p.grad.div_(self.world_size)
@@ -591,9 +608,22 @@ class Stage1Trainer(BaseTrainer):
                 self._log("Stage1", {"train_pred": tr["pred"], "val_pred": vl["pred"]}, ep)
                 print(f"[Stage1] ep {ep:3d}/{epochs}  "
                       f"train_pred={tr['pred']:.5f}  val_pred={vl['pred']:.5f}  lr={lr:.2e}")
+                # Under full fine-tune the AdamW state for the 1.5B UNet is ~12 GB;
+                # keep the (frequently-rewritten) best checkpoint weights-only and
+                # park optimizer state in a single rolling resume file instead.
+                opt_extra = {}
+                if not getattr(self.ctrl_world, "full_finetune", False):
+                    opt_extra = {
+                        **({"optimizer_state": self.optimizer.state_dict()} if self.optimizer else {}),
+                        **({"scheduler_state": self.scheduler.state_dict()} if self.scheduler else {}),
+                    }
                 if vl["pred"] < best:
                     best = vl["pred"]
                     self.save_checkpoint("stage1_best.pt", {
+                        "epoch": ep, "best": best, **opt_extra, **vl,
+                    })
+                if getattr(self.ctrl_world, "full_finetune", False):
+                    self.save_checkpoint("stage1_resume.pt", {
                         "epoch": ep, "best": best,
                         **({"optimizer_state": self.optimizer.state_dict()} if self.optimizer else {}),
                         **({"scheduler_state": self.scheduler.state_dict()} if self.scheduler else {}),
@@ -658,7 +688,13 @@ class Stage2Trainer(BaseTrainer):
                     )
                     if self.is_main:
                         print(f"[Stage2] Loaded Action_encoder from {stage1_ckpt}")
-                if "unet_cross_attn_state" in ckpt and hasattr(self.ctrl_world, "load_unet_cross_attn_state_dict"):
+                if "unet_full_state" in ckpt and hasattr(self.ctrl_world, "load_unet_full_state_dict"):
+                    missing, _ = self.ctrl_world.load_unet_full_state_dict(ckpt["unet_full_state"])
+                    if self.is_main:
+                        n = sum(v.numel() for v in ckpt["unet_full_state"].values())
+                        print(f"[Stage2] Loaded FULL UNet from {stage1_ckpt} "
+                              f"({n/1e6:.2f}M params, {len(missing)} missing)")
+                elif "unet_cross_attn_state" in ckpt and hasattr(self.ctrl_world, "load_unet_cross_attn_state_dict"):
                     self.ctrl_world.load_unet_cross_attn_state_dict(ckpt["unet_cross_attn_state"])
                     if self.is_main:
                         n = sum(v.numel() for v in ckpt["unet_cross_attn_state"].values())

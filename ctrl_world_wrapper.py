@@ -154,6 +154,7 @@ class CtrlWorldWrapper(nn.Module):
         ctrl_ckpt:           str | None = None,
         freeze_unet:         bool  = True,
         finetune_cross_attn: bool  = False,
+        full_finetune:       bool  = False,
         dtype:               torch.dtype = torch.float16,
     ):
         super().__init__()
@@ -164,12 +165,19 @@ class CtrlWorldWrapper(nn.Module):
         self.fps           = fps
         self.motion_bucket = motion_bucket
         self._dtype        = dtype
+        self.full_finetune = full_finetune
+
+        # For full fine-tuning we store the UNet master weights in fp32 (so
+        # GradScaler.unscale_ and AdamW updates are stable); autocast still casts
+        # them to `_dtype` (fp16) for the matmuls, exactly as the cross-attn path
+        # does. For frozen / cross-attn-only training the UNet stays in fp16.
+        unet_store_dtype = torch.float32 if full_finetune else dtype
 
         # ── UNet ──────────────────────────────────────────────────────────
         if svd_path is not None:
             print(f"[CtrlWorldWrapper] Loading SVD UNet from {svd_path} …")
             from diffusers import StableVideoDiffusionPipeline
-            pipe = StableVideoDiffusionPipeline.from_pretrained(svd_path, torch_dtype=dtype)
+            pipe = StableVideoDiffusionPipeline.from_pretrained(svd_path, torch_dtype=unet_store_dtype)
             # Swap in CTRL-WORLD's modified UNet (adds frame_level_cond support)
             unet = UNetSpatioTemporalConditionModel()
             missing, unexpected = unet.load_state_dict(pipe.unet.state_dict(), strict=False)
@@ -186,9 +194,21 @@ class CtrlWorldWrapper(nn.Module):
             from diffusers import EulerDiscreteScheduler
             self.scheduler = EulerDiscreteScheduler()
 
-        self.unet = unet.to(dtype)
+        self.unet = unet.to(unet_store_dtype)
 
-        if freeze_unet:
+        # full_finetune supersedes freeze_unet / finetune_cross_attn — the whole
+        # UNet is trainable, so the narrower flags are forced off to keep the
+        # trainable-parameter set unambiguous.
+        if full_finetune:
+            self.unet.requires_grad_(True)
+            # Gradient checkpointing is essential here: full FT of the 1.5B temporal
+            # UNet over 14-frame clips would otherwise OOM on the activation cache.
+            self.unet.enable_gradient_checkpointing()
+            print("[CtrlWorldWrapper] FULL fine-tune — entire UNet trainable "
+                  "(fp32 master weights) + gradient checkpointing enabled.")
+            freeze_unet = False
+            finetune_cross_attn = False
+        elif freeze_unet:
             self.unet.requires_grad_(False)
             # Gradient checkpointing recomputes activations during backward instead of
             # storing them. Cuts activation memory by ~50-70% at ~20% compute overhead.
@@ -470,13 +490,43 @@ class CtrlWorldWrapper(nn.Module):
                         p.data.copy_(state[key].to(p.device, dtype=p.dtype))
 
     def trainable_parameters(self):
-        """Yield action_encoder params and, if enabled, UNet cross-attn params."""
+        """Yield action_encoder params plus the trainable UNet params.
+
+        full_finetune → the whole UNet; finetune_cross_attn → attn2 only;
+        otherwise → action_encoder only.
+        """
         yield from self.action_encoder.parameters()
-        if self.finetune_cross_attn:
+        yield from self.unet_trainable_parameters()
+
+    def unet_trainable_parameters(self):
+        """Yield the UNet parameters that are being trained (empty when frozen).
+
+        Used by the trainer to manually all-reduce UNet gradients across ranks,
+        since the UNet is deliberately not DDP-wrapped (DDP + reentrant gradient
+        checkpointing needs static_graph and complicates the custom forward)."""
+        if self.full_finetune:
+            yield from self.unet.parameters()
+        elif self.finetune_cross_attn:
             yield from self.cross_attn_parameters()
 
     def num_trainable_params(self) -> int:
         return sum(p.numel() for p in self.trainable_parameters())
+
+    def unet_full_state_dict(self) -> dict:
+        """Full UNet weights as an fp16 CPU state dict (halves checkpoint size;
+        the predictor is loaded/run in fp16 everywhere it is consumed)."""
+        return {k: v.detach().to(torch.float16).cpu()
+                for k, v in self.unet.state_dict().items()}
+
+    def load_unet_full_state_dict(self, state: dict):
+        """Load full UNet weights, casting each tensor to the stored param dtype."""
+        own = self.unet.state_dict()
+        remapped = {}
+        for k, v in state.items():
+            if k in own:
+                remapped[k] = v.to(own[k].dtype)
+        missing, unexpected = self.unet.load_state_dict(remapped, strict=False)
+        return missing, unexpected
 
     def to(self, *args, **kwargs):
         # Keep _dtype in sync when moving to a new dtype

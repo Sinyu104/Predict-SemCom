@@ -75,6 +75,8 @@ CONFIG = {
     "noise_level_first":        500,  # max DDPM timestep t' sampled during Ctrl-World training
     "ctrl_world_n_steps":       10,   # DDIM denoising steps at Ctrl-World inference (pure noise → z_hat)
     "finetune_unet_cross_attn": True, # unfreeze UNet attn2 layers to help with gripper/OOD regions
+    "full_finetune":           False, # Stage 1: train the ENTIRE SVD UNet (set via --full_weights).
+                                      # Supersedes finetune_unet_cross_attn. ~24 GB static VRAM/GPU.
 
     # ── Refinement Diffusion (Stage 2 — second diffusion) ────────────── #
     "noise_level_second":   0,  # 0 = direct single forward pass at inference

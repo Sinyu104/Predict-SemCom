@@ -94,6 +94,7 @@ def build_ctrl_world(args, config: dict):
             num_pred    = num_pred,
         )
 
+    full_finetune = config.get("full_finetune", False)
     from ctrl_world_wrapper import CtrlWorldWrapper
     return CtrlWorldWrapper(
         action_dim          = config["action_dim"],
@@ -101,8 +102,9 @@ def build_ctrl_world(args, config: dict):
         num_pred            = num_pred,
         svd_path            = svd_path,
         ctrl_ckpt           = args.ctrl_ckpt,
-        freeze_unet         = True,
+        freeze_unet         = not full_finetune,
         finetune_cross_attn = config.get("finetune_unet_cross_attn", False),
+        full_finetune       = full_finetune,
         dtype               = torch.float16,
     )
 
@@ -208,6 +210,10 @@ def parse_args():
     p.add_argument("--ctrl_ckpt",   type=str, default=None,
                    help="CTRL-WORLD .pt checkpoint to initialise Action_encoder2 "
                         "(usually not needed — loaded from stage1_best.pt in Stage 2).")
+    p.add_argument("--full_weights", action="store_true",
+                   help="Stage 1: fine-tune the ENTIRE SVD UNet (fp32 master weights), "
+                        "not just Action_encoder2 / cross-attn. Much higher memory — "
+                        "see CLAUDE.md. Supersedes finetune_unet_cross_attn.")
     p.add_argument("--stage1_ckpt", type=str, default=None,
                    help="Frozen Stage-1 Ctrl-World checkpoint for Stage 2 "
                         "(default: <output_dir>/stage1_best.pt).")
@@ -260,6 +266,8 @@ def main():
     if args.learning_rate is not None: CONFIG["learning_rate"] = args.learning_rate
     if args.max_episodes_per_task is not None:
         CONFIG["max_episodes_per_task"] = args.max_episodes_per_task
+    if args.full_weights:
+        CONFIG["full_finetune"] = True
     CONFIG["output_dir"] = args.output_data_dir
 
     # Sync clip_length with num_history / num_pred
