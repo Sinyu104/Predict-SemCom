@@ -313,11 +313,21 @@ class RefinementDiffusion(nn.Module):
         n_layers: int   = 4,
         sig_spatial: bool = False,
         sig_grid:    int  = 8,
+        disagreement_gate: bool = False,
     ):
         super().__init__()
         self.C_vae = C_vae
         self.H_vae = H_vae
         self.W_vae = W_vae
+        # Disagreement-gated fusion: instead of the fixed residual z_hat + delta (which
+        # defaults to copying z_hat and needs an external deviation gate to know when to
+        # correct), emit a per-location gate g in [0,1] and return z_hat + g * delta. g is
+        # read from the token features, which have cross-attended to BOTH z_hat and s~, so
+        # it can detect where the channel disagrees with the prediction. Calm frames:
+        # channel agrees with z_hat -> g~0 -> copy (quiet, learned, no hyperparameter).
+        # Disturbed: channel contradicts z_hat locally -> g~1 there -> trust the channel.
+        # This makes adaptivity architectural rather than a tuned res_tau threshold.
+        self.disagreement_gate = disagreement_gate
 
         # DDPM noise schedule (scaled-linear, matching SD/SVD)
         betas            = torch.linspace(0.00085 ** 0.5, 0.012 ** 0.5, 1000) ** 2
@@ -362,6 +372,14 @@ class RefinementDiffusion(nn.Module):
         self.blocks   = nn.ModuleList([_RefineBlock(d_model, n_heads) for _ in range(n_layers)])
         self.norm     = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_model, C_vae)
+        if disagreement_gate:
+            # Per-location, per-channel gate head. Bias init negative so sigmoid starts
+            # near ~0.1 (default toward copying z_hat); training opens it where the channel
+            # earns a correction. Same features feed delta and gate, so the gate learns
+            # from the same z_hat/s~ evidence the correction uses.
+            self.gate_proj = nn.Linear(d_model, C_vae)
+            nn.init.zeros_(self.gate_proj.weight)
+            nn.init.constant_(self.gate_proj.bias, -2.0)   # sigmoid(-2) ~= 0.12
 
     def _init_pos(self, device, dtype):
         if not self._pos_init:
@@ -441,6 +459,13 @@ class RefinementDiffusion(nn.Module):
         # channel's job literally the Wyner-Ziv residual z_t - ẑ_t.
         delta = self.out_proj(x)                                           # (B, N, C)
         delta = delta.transpose(1, 2).reshape(B, C, H, W)
+        if self.disagreement_gate:
+            # Per-location gate in [0,1] from the same features: g*delta is applied only
+            # where the network sees the channel disagree with the prediction. The gate is
+            # stored for inspection (rate/adaptivity diagnostics) and does not affect grad.
+            gate = torch.sigmoid(self.gate_proj(x)).transpose(1, 2).reshape(B, C, H, W)
+            self.last_gate = gate.detach()
+            return z_hat + gate * delta
         return z_hat + delta
 
     def forward_ddpm(
@@ -708,6 +733,7 @@ class SemComSystem(nn.Module):
         self.refinement_diffusion = RefinementDiffusion(
             D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l,
             sig_spatial=spatial, sig_grid=grid,
+            disagreement_gate=config.get("refine_disagreement_gate", False),
         )
 
         channel_type = config.get("channel_type", "rayleigh")

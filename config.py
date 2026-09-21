@@ -87,6 +87,7 @@ CONFIG = {
     "refine_d_model":     256,  # internal dim for RefinementDiffusion denoiser transformer
     "refine_n_heads":       8,  # cross-attention heads in RefinementDiffusion
     "refine_n_layers":      4,  # number of transformer blocks in RefinementDiffusion
+    "refine_disagreement_gate": False,  # z_tilde = z_hat + g*delta with learned per-location g (adaptive trust)
     "refine_n_steps":      10,  # DDIM denoising steps at inference
 
     # ── Clip length for Stage 1/2 training ───────────────────────────── #

@@ -478,6 +478,7 @@ def run_server(args):
     CONFIG["history_stride"] = args.history_stride
     CONFIG["reanchor"]       = args.reanchor
     CONFIG["clean_history"]  = args.clean_history
+    CONFIG["refine_disagreement_gate"] = args.disagree_gate
     if args.clean_history:
         print("[SemCom] clean_history=ON — Ctrl-World sees TRUE latents. DIAGNOSTIC ONLY, "
               "not a deployable configuration; numbers from this run are an upper bound.")
@@ -702,6 +703,10 @@ def parse_args():
     p.add_argument("--channel", type=str, default=None,
                    choices=["awgn", "rayleigh", "cdl"])
     p.add_argument("--D_jscc",  type=int, default=None)
+    p.add_argument("--disagree_gate", action="store_true",
+                   help="Load a refiner trained with disagreement-gated fusion "
+                        "(z_tilde = z_hat + g*delta). Must match how the Stage-2 checkpoint "
+                        "was trained, or the gate_proj weights will be missing.")
     p.add_argument("--num_history", type=int, default=None)
     p.add_argument("--history_stride", type=int, default=1,
                    help="m: spacing between history slots. Offline, stride 8 cut closed-loop "

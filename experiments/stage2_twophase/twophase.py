@@ -103,11 +103,20 @@ ap.add_argument("--spatial", action="store_true",
                      "with flat runs: train from scratch, no --init.")
 ap.add_argument("--grid", type=int, default=8,
                 help="g for --spatial. D_jscc must be divisible by g*g (256 = 4 x 8 x 8).")
+ap.add_argument("--disagree_gate", action="store_true",
+                help="Disagreement-gated fusion: the refiner emits a per-location gate g in "
+                     "[0,1] and returns z_hat + g*delta, so it corrects only where the channel "
+                     "contradicts the prediction. Replaces the hand-tuned --res_tau with a "
+                     "LEARNED spatial gate (quiet on calm, trusts channel on disturbance). Not "
+                     "checkpoint-compatible with non-gated runs: train from scratch, no --init.")
 a=ap.parse_args()
 if a.D_jscc is not None:
     CONFIG["D_jscc"]=a.D_jscc
 CONFIG["jscc_spatial"]=a.spatial
 CONFIG["jscc_grid"]=a.grid
+CONFIG["refine_disagreement_gate"]=a.disagree_gate
+if a.disagree_gate:
+    print("[cfg] disagreement-gated fusion: z_tilde = z_hat + g*delta, g learned per location")
 if a.spatial:
     print(f"[cfg] spatial JSCC code: {CONFIG['D_jscc']//(a.grid*a.grid)} channels "
           f"x {a.grid}x{a.grid} grid = {CONFIG['D_jscc']} symbols (rate unchanged)")
