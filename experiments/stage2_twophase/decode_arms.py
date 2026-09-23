@@ -32,6 +32,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--stage1_ckpt", default="outputs/stage1_rollout_ft/stage1_rollout_ep1.pt")
 ap.add_argument("--stage2_ckpt", default="outputs/stage2_gate_aligned/phase2.pt")
 ap.add_argument("--disagree_gate", action="store_true", help="ckpt has the gate_proj head")
+ap.add_argument("--refine_arch", choices=["residual", "fusion"], default="residual",
+                help="must match the checkpoint's Stage-2 architecture")
 ap.add_argument("--demos_file", default="disturbed.hdf5")
 ap.add_argument("--history_stride", type=int, default=1)
 ap.add_argument("--ddim", type=int, default=10)
@@ -52,6 +54,7 @@ DEV = a.device
 T_H = CONFIG["num_history"]; M = a.history_stride; SPAN = (T_H - 1) * M + 1
 CONFIG["snr_db"] = a.snr_db; CONFIG["channel_type"] = a.channel
 CONFIG["refine_disagreement_gate"] = a.disagree_gate
+CONFIG["refine_arch"] = a.refine_arch
 COLOR = lambda t: t.split("_")[1]
 INSTR = lambda t: f"pick up the {COLOR(t)} cube and place it on the tray"
 rng = np.random.default_rng(a.seed)

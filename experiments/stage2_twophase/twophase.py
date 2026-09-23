@@ -115,12 +115,20 @@ ap.add_argument("--disagree_gate", action="store_true",
                      "contradicts the prediction. Replaces the hand-tuned --res_tau with a "
                      "LEARNED spatial gate (quiet on calm, trusts channel on disturbance). Not "
                      "checkpoint-compatible with non-gated runs: train from scratch, no --init.")
+ap.add_argument("--refine_arch", choices=["residual", "fusion"], default="residual",
+                help="'residual' = RefinementDiffusion (z_hat + delta, delta from z_hat+s~, post-gated). "
+                     "'fusion' = DisagreementFusionRefiner (z_hat + r, r's content strictly from s~, "
+                     "gated by per-location disagreement; z_hat is base + context only). Not "
+                     "checkpoint-compatible across archs: train from scratch, no --init.")
 a=ap.parse_args()
 if a.D_jscc is not None:
     CONFIG["D_jscc"]=a.D_jscc
 CONFIG["jscc_spatial"]=a.spatial
 CONFIG["jscc_grid"]=a.grid
 CONFIG["refine_disagreement_gate"]=a.disagree_gate
+CONFIG["refine_arch"]=a.refine_arch
+if a.refine_arch=="fusion":
+    print("[cfg] fusion refiner: z_tilde = z_hat + r, content(r) from s~ only, disagreement-gated per location")
 if a.disagree_gate:
     print("[cfg] disagreement-gated fusion: z_tilde = z_hat + g*delta, g learned per location")
 if a.spatial:

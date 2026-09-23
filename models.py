@@ -572,6 +572,124 @@ class RefinementDiffusion(nn.Module):
 
 
 # ========================================================================== #
+#  3b. DISAGREEMENT-FUSION REFINER  (Wyner-Ziv residual, channel-only content) #
+# ========================================================================== #
+
+class _FusionBlock(nn.Module):
+    """One disagreement-gated fusion step.
+
+    z_hat is CONTEXT only (it forms the query and drives the gate); the channel
+    tokens S are the sole source of CONTENT (they are the values of the channel
+    read). h is a correction ACCUMULATOR seeded at zero, so z_hat contributes no
+    latent values inside the block — it enters the output only as the residual
+    base z_hat + r outside. This is the structural difference from
+    RefinementDiffusion, whose delta draws values from z_hat too and is then
+    post-gated (measured: channel ignored, 0.0005 effect).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.q_proj     = nn.Linear(d_model, d_model)          # query built from the prior context P
+        self.ln_h       = nn.LayerNorm(d_model)
+        self.self_attn  = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.0, batch_first=True)
+        self.gate_mlp   = nn.Sequential(                       # disagreement -> per-location gate
+            nn.Linear(3 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1),
+        )
+        self.ln_ff      = nn.LayerNorm(d_model)
+        self.ffn        = nn.Sequential(
+            nn.Linear(d_model, int(d_model * mlp_ratio)), nn.GELU(),
+            nn.Linear(int(d_model * mlp_ratio), d_model),
+        )
+        self.last_g = None
+
+    def forward(self, h: torch.Tensor, P: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
+        # h: (B,N,d) correction accumulator | P: (B,N,d) prior context | S: (B,n_sig,d) channel tokens
+        qP = self.q_proj(P)                                    # the "question", from the prediction only
+        hn = self.ln_h(h)
+        h  = h + self.self_attn(qP, hn, hn)[0]                # coordinate the correction spatially
+        c  = self.cross_attn(qP, S, S)[0]                     # channel READ — content = values of S only
+        g  = torch.sigmoid(self.gate_mlp(torch.cat([P, c, c - P], dim=-1)))  # (B,N,1) open where they disagree
+        h  = h + g * c                                         # accumulate channel content, gated
+        h  = h + self.ffn(self.ln_ff(h))
+        self.last_g = g.detach()
+        return h
+
+
+class DisagreementFusionRefiner(nn.Module):
+    """z̃ = z_hat + r, where r is a channel-sourced correction fused by
+    disagreement gating. Drop-in for RefinementDiffusion: exposes _denoise_x0
+    (ignoring the diffusion args x_noisy/t) and forward_ddpm.
+
+    z_hat provides the base (the whole static scene, never re-synthesised) and the
+    context (queries + gates); s̃ provides all correction content. out_proj is
+    zero-initialised so training starts as the pure predictor (r=0 -> z̃=z_hat).
+    """
+
+    def __init__(self, D_jscc: int, C_vae: int = 4, H_vae: int = 28, W_vae: int = 28,
+                 d_model: int = 256, n_heads: int = 8, n_layers: int = 4, sig_grid: int = 4):
+        super().__init__()
+        self.C_vae, self.H_vae, self.W_vae = C_vae, H_vae, W_vae
+        self.N = H_vae * W_vae
+        self.sig_grid = sig_grid
+        self.n_sig    = sig_grid * sig_grid
+        assert D_jscc % self.n_sig == 0, f"D_jscc {D_jscc} not divisible by n_sig {self.n_sig}"
+        self.sig_dim  = D_jscc // self.n_sig
+
+        self.zhat_ctx = nn.Linear(C_vae, d_model)              # prior -> context (queries + gate only)
+        self.sig_proj = nn.Linear(self.sig_dim, d_model)       # channel tokens
+        self.blocks   = nn.ModuleList([_FusionBlock(d_model, n_heads) for _ in range(n_layers)])
+        self.out_norm = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, C_vae)
+        nn.init.zeros_(self.out_proj.weight); nn.init.zeros_(self.out_proj.bias)   # start as identity
+
+        self.register_buffer("pos2d",   torch.zeros(1, self.N, d_model),     persistent=False)
+        self.register_buffer("sig_pos", torch.zeros(1, self.n_sig, d_model), persistent=False)
+        self._pos_init = False
+        self.last_gate = None
+
+    def _init_pos(self, device, dtype):
+        if not self._pos_init:
+            self.pos2d   = _make_2d_sincos_pos(self.H_vae, self.W_vae,
+                                               self.pos2d.shape[-1], device, dtype).unsqueeze(0)
+            self.sig_pos = _make_2d_sincos_pos(self.sig_grid, self.sig_grid,
+                                               self.sig_pos.shape[-1], device, dtype).unsqueeze(0)
+            self._pos_init = True
+
+    def forward(self, z_hat: torch.Tensor, s_tilde: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = z_hat.shape
+        N = H * W
+        self._init_pos(z_hat.device, z_hat.dtype)
+        P = self.zhat_ctx(z_hat.reshape(B, C, N).transpose(1, 2)) + self.pos2d.to(z_hat.dtype)   # (B,N,d)
+        # channel tokens ordered by grid location (mirror RefinementDiffusion's sig layout)
+        sig_map = s_tilde.reshape(B, self.sig_dim, self.sig_grid, self.sig_grid)
+        sig_tok = sig_map.reshape(B, self.sig_dim, self.n_sig).transpose(1, 2)                   # (B,n_sig,sig_dim)
+        S = self.sig_proj(sig_tok) + self.sig_pos.to(z_hat.dtype)
+        h = torch.zeros(B, N, P.shape[-1], device=z_hat.device, dtype=z_hat.dtype)               # accumulator
+        gates = []
+        for blk in self.blocks:
+            h = blk(h, P, S); gates.append(blk.last_g)
+        r = self.out_proj(self.out_norm(h)).transpose(1, 2).reshape(B, C, H, W)                  # correction
+        self.last_gate = torch.stack(gates, 0).mean(0).detach()                                  # (B,N,1)
+        return z_hat + r                                                                          # residual base
+
+    def _denoise_x0(self, x_noisy, t, z_hat, s_tilde, drop_zhat=None):
+        """Diffusion-signature shim: x_noisy and t are ignored (single forward pass)."""
+        if drop_zhat is not None:
+            z_hat = z_hat * (~drop_zhat).to(z_hat.dtype).view(-1, 1, 1, 1)
+        return self.forward(z_hat, s_tilde)
+
+    def forward_ddpm(self, z_t, z_hat, s_tilde, noise_level: int = 0,
+                     per_sample: bool = False, zhat_dropout: float = 0.0):
+        if zhat_dropout > 0.0:
+            m = (torch.rand(z_t.shape[0], device=z_t.device) < zhat_dropout).view(-1, 1, 1, 1)
+            z_hat = z_hat * (~m)
+        z_tilde = self.forward(z_hat, s_tilde)
+        loss = ((z_tilde - z_t) ** 2).mean(dim=(1, 2, 3))
+        return loss if per_sample else loss.mean()
+
+
+# ========================================================================== #
 #  4. FADING CHANNEL  (awgn / rayleigh / cdl)                                #
 # ========================================================================== #
 
@@ -730,11 +848,17 @@ class SemComSystem(nn.Module):
                                                 spatial=spatial, grid=grid)
         self.side_info_encoder    = SideInfoEncoder(C_vae, H_vae, W_vae, D_jscc, d_hidden,
                                                     spatial=spatial, grid=grid)
-        self.refinement_diffusion = RefinementDiffusion(
-            D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l,
-            sig_spatial=spatial, sig_grid=grid,
-            disagreement_gate=config.get("refine_disagreement_gate", False),
-        )
+        if config.get("refine_arch", "residual") == "fusion":
+            self.refinement_diffusion = DisagreementFusionRefiner(
+                D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l,
+                sig_grid=config.get("refine_sig_grid", 4),
+            )
+        else:
+            self.refinement_diffusion = RefinementDiffusion(
+                D_jscc, C_vae, H_vae, W_vae, refine_d, refine_h, refine_l,
+                sig_spatial=spatial, sig_grid=grid,
+                disagreement_gate=config.get("refine_disagreement_gate", False),
+            )
 
         channel_type = config.get("channel_type", "rayleigh")
         cdl_kwargs = {

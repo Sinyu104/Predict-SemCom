@@ -90,6 +90,11 @@ CONFIG = {
     "refine_n_heads":       8,  # cross-attention heads in RefinementDiffusion
     "refine_n_layers":      4,  # number of transformer blocks in RefinementDiffusion
     "refine_disagreement_gate": False,  # z_tilde = z_hat + g*delta with learned per-location g (adaptive trust)
+    # refine_arch: "residual" = RefinementDiffusion (z_hat + delta, delta from z_hat+s~);
+    # "fusion" = DisagreementFusionRefiner (z_hat + r, r's CONTENT strictly from s~, gated by
+    # per-location disagreement; z_hat is base + context only). See DisagreementFusionRefiner.
+    "refine_arch":      "residual",
+    "refine_sig_grid":  4,   # fusion: channel laid out as sig_grid x sig_grid tokens (D_jscc/(g*g) dims each)
     "refine_n_steps":      10,  # DDIM denoising steps at inference
 
     # ── Clip length for Stage 1/2 training ───────────────────────────── #
