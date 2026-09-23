@@ -110,7 +110,12 @@ while i < len(index):
         zp = cw.predict_next_latent(H, aw, n_steps=a.ddim).float()   # (B,1,C,H,W)
     ZH.append(zp[:, 0].half().cpu())
     ZT.append(torch.stack([Z[t] for t in batch]).half())
-    DIST.append(torch.tensor([dist[t] for t in batch]))
+    # The `disturbed` flag marks the frame the teleport is APPLIED to the sim; the
+    # moved cube first appears in the observation ONE FRAME LATER, so the prediction
+    # gap (z_t deviates from the pre-teleport z_hat_t) lives at t, driven by
+    # disturbed[t-1]. Aligning here (dist[t-1], not dist[t]) points DIST at the frame
+    # that actually carries the correctable gap. t >= SPAN >= 1 so t-1 is always valid.
+    DIST.append(torch.tensor([dist[t - 1] for t in batch]))
     if len(ZT) % 20 == 0:
         done = sum(len(z) for z in ZT); el = time.perf_counter() - t0
         print(f"[shard {a.shard}] {done}/{len(index)}  {el/done*1000:.0f} ms/frame  "
