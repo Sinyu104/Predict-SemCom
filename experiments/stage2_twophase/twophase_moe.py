@@ -17,7 +17,7 @@ distortion demands otherwise -> the router learns "short on calm, long on distur
         --snr 20 --channel awgn --beta 0.02 --lam_len 0.5 --dist_weight 15 --epochs 12
 """
 import argparse, glob, os, pathlib, sys
-import torch, torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
 
 REPO = str(pathlib.Path(__file__).resolve().parents[2]); sys.path.insert(0, REPO)
 from config import CONFIG                    # noqa: E402
@@ -31,9 +31,18 @@ ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--lr", type=float, default=1e-4)
 ap.add_argument("--snr", type=float, default=20.0)
 ap.add_argument("--channel", default="awgn")
-ap.add_argument("--beta", type=float, default=0.02, help="weight on the WZ rate (KL over sent tokens)")
+ap.add_argument("--beta", type=float, default=0.0,
+                help="weight on the WZ KL rate. Default 0: for the MoE design the RATE is the code "
+                     "LENGTH (lam_len), and a nonzero KL term just competes and collapses the "
+                     "encoder to the prior (measured rate->0.0001 in warmup). Leave 0 unless you "
+                     "specifically want the KL prior active.")
 ap.add_argument("--lam_len", type=float, default=0.5, help="weight on expected code length (E[tokens]/max)")
 ap.add_argument("--dist_weight", type=float, default=15.0, help="up-weight TRUE disturbed frames in distortion")
+ap.add_argument("--lam_router", type=float, default=1.0,
+                help="Router supervision weight: CE(router_logits, DIST-based target level). The "
+                     "validated temporal-diff signal is the router's input; DIST is the training "
+                     "target (disturbed->longest level, calm->shortest). Prevents the router from "
+                     "collapsing to the minimum length. Off during warmup.")
 ap.add_argument("--warmup_epochs", type=int, default=5,
                 help="Force full-length codes (router bypassed, no length penalty) for this many "
                      "epochs so the encoder/refiner learn to USE the channel before the router is "
@@ -78,32 +87,40 @@ def run_epoch(idx, train, tau, warmup):
     sysm.train(train)
     order = idx[torch.randperm(len(idx))] if train else idx
     lam_len = 0.0 if warmup else a.lam_len          # no length pressure during warmup
-    D=Rt=Ln=G=0.0; nb=0
+    K = len(a.levels)
+    D=Rt=Ln=Ro=0.0; nb=0
     for i in range(0, len(order), a.bs):
         sel=order[i:i+a.bs]
         z=ZT[sel].to(DEV); h=ZH[sel].to(DEV); zp=ZP[sel].to(DEV); dm=DIST[sel].to(DEV)
         with torch.set_grad_enabled(train):
-            out=sysm(z, h, zp, tau=tau, hard=False, sample=train, force_full=warmup)
+            out=sysm(z, h, zp, tau=tau, hard=False, sample=train,
+                     force_full=warmup, withhold_zhat=warmup)
             ds=((out["z_tilde"]-z)**2).mean(dim=(1,2,3))
             fw=1.0+a.dist_weight*dm
             d=(fw*ds).sum()/fw.sum()
             r=out["rate"].mean()
             ln=(out["exp_tokens"]/a.max_tokens).mean()
-            loss=d + a.beta*r + lam_len*ln
+            # Router supervision: the temporal-diff signal separates disturbed/calm at 96%/1%,
+            # so teach the router directly (disturbed -> longest level, calm -> shortest) instead
+            # of hoping a length penalty discovers it (it collapses to min before it can). The
+            # router INPUT is (z_t, z_prev); DIST is only the training target.
+            target = (dm > 0.5).long() * (K - 1)
+            ro = F.cross_entropy(out["logits"], target)
+            loss = d + a.beta*r + lam_len*ln + (0.0 if warmup else a.lam_router)*ro
         if train:
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(params, 5.0); opt.step()
-        D+=d.item(); Rt+=r.item(); Ln+=ln.item(); nb+=1
-    return D/nb, Rt/nb, Ln/nb
+        D+=d.item(); Rt+=r.item(); Ln+=ln.item(); Ro+=ro.item(); nb+=1
+    return D/nb, Rt/nb, Ln/nb, Ro/nb
 
 for e in range(1, a.epochs+1):
     warmup = e <= a.warmup_epochs
     tau=a.tau0 + (a.tau1-a.tau0)*max(0,e-a.warmup_epochs-1)/max(1,a.epochs-a.warmup_epochs-1)
-    d,r,ln=run_epoch(tr, True, tau, warmup)
-    vd,vr,vln=run_epoch(va, False, tau, warmup)
+    d,r,ln,ro=run_epoch(tr, True, tau, warmup)
+    vd,vr,vln,vro=run_epoch(va, False, tau, warmup)
     tag="[warmup]" if warmup else ""
-    print(f"ep{e:>2}/{a.epochs} {tag} tau={tau:.2f}  train d={d:.4f} rate={r:.4f} len={ln:.3f}  "
-          f"val d={vd:.4f} rate={vr:.4f} len={vln:.3f}", flush=True)
+    print(f"ep{e:>2}/{a.epochs} {tag} tau={tau:.2f}  train d={d:.4f} len={ln:.3f} router={ro:.3f}  "
+          f"val d={vd:.4f} len={vln:.3f} router={vro:.3f}", flush=True)
     torch.save({"system_state": sysm.state_dict(),
                 "config": {k: CONFIG[k] for k in ("snr_db","channel_type","jscc_max_tokens",
                                                   "jscc_token_dim","jscc_levels")}},

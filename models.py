@@ -1012,8 +1012,12 @@ class AdaptiveSemComSystem(nn.Module):
         return tok.transpose(1, 2).reshape(tok.shape[0], -1)
 
     def forward(self, z_t, z_hat, z_prev, tau: float = 1.0, hard: bool = False,
-                sample: bool = True, force_full: bool = False):
+                sample: bool = True, force_full: bool = False, withhold_zhat: bool = False):
         B = z_t.shape[0]
+        # WITHHOLD z_hat from the refiner (base + context) so it MUST decode the channel —
+        # prevents the refiner from leaning on the prior and the encoder from collapsing the
+        # rate. z_hat still reaches self.prior (the WZ prior is unchanged). Used during warmup.
+        z_ref = torch.zeros_like(z_hat) if withhold_zhat else z_hat
         probs, logits, tdiff = self.router(z_t, z_prev, tau=tau, hard=hard)      # (B,K)
         if force_full:
             # WARMUP: bypass the router, transmit ALL tokens so the encoder/refiner learn to
@@ -1030,7 +1034,7 @@ class AdaptiveSemComSystem(nn.Module):
         st_flat  = self.channel(self._tokens_to_flat(s_masked))                 # (B, dim*T)
         # attention padding mask for hard/eval routing (True = ignore token)
         sig_pad = (mask < 0.5) if (hard or not self.training) else None
-        z_tilde = self.refiner._denoise_x0(None, None, z_hat, st_flat, sig_pad=sig_pad)
+        z_tilde = self.refiner._denoise_x0(None, None, z_ref, st_flat, sig_pad=sig_pad)
 
         # per-token Wyner-Ziv rate KL(q||p), q var = enc var + channel noise
         sig_n = 1.0 / (10.0 ** (self.snr_db / 10.0))
