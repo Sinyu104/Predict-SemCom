@@ -38,6 +38,11 @@ ap.add_argument("--beta", type=float, default=0.0,
                      "specifically want the KL prior active.")
 ap.add_argument("--lam_len", type=float, default=0.5, help="weight on expected code length (E[tokens]/max)")
 ap.add_argument("--dist_weight", type=float, default=15.0, help="up-weight TRUE disturbed frames in distortion")
+ap.add_argument("--lam", type=float, default=0.0,
+                help="Deviation-region weighting on the latent distortion: per-cell weight "
+                     "w = 1 + lam * ||z_t-z_hat||^2 / mean, so reconstruction fidelity is focused on "
+                     "the cells where the prediction is wrong (the cube on disturbed frames; ~0 on "
+                     "calm). Renormalised by w.mean() so the scale is unchanged. 0 = flat MSE.")
 ap.add_argument("--lam_router", type=float, default=1.0,
                 help="Router supervision weight: CE(router_logits, DIST-based target level). The "
                      "validated temporal-diff signal is the router's input; DIST is the training "
@@ -95,7 +100,12 @@ def run_epoch(idx, train, tau, warmup):
         with torch.set_grad_enabled(train):
             out=sysm(z, h, zp, tau=tau, hard=False, sample=train,
                      force_full=warmup, withhold_zhat=warmup)
-            ds=((out["z_tilde"]-z)**2).mean(dim=(1,2,3))
+            if a.lam > 0:
+                e = ((z - h) ** 2).mean(1, keepdim=True)            # (B,1,H,W) per-cell deviation from prediction
+                w = 1.0 + a.lam * e / e.mean().clamp(min=1e-8)      # up-weight the cube cells
+                ds = (w * (out["z_tilde"] - z) ** 2).mean(dim=(1,2,3)) / w.mean()
+            else:
+                ds=((out["z_tilde"]-z)**2).mean(dim=(1,2,3))
             fw=1.0+a.dist_weight*dm
             d=(fw*ds).sum()/fw.sum()
             r=out["rate"].mean()
