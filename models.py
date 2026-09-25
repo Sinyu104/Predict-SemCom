@@ -603,12 +603,16 @@ class _FusionBlock(nn.Module):
         )
         self.last_g = None
 
-    def forward(self, h: torch.Tensor, P: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, P: torch.Tensor, S: torch.Tensor,
+                sig_pad: torch.Tensor | None = None) -> torch.Tensor:
         # h: (B,N,d) correction accumulator | P: (B,N,d) prior context | S: (B,n_sig,d) channel tokens
+        # sig_pad: (B,n_sig) bool, True = token NOT transmitted (ignored in the channel read) — for
+        #          adaptive/variable-length codes where a calm frame sends fewer tokens.
         qP = self.q_proj(P)                                    # the "question", from the prediction only
         hn = self.ln_h(h)
         h  = h + self.self_attn(qP, hn, hn)[0]                # coordinate the correction spatially
-        c  = self.cross_attn(qP, S, S)[0]                     # channel READ — content = values of S only
+        c  = self.cross_attn(qP, S, S, key_padding_mask=sig_pad)[0]  # channel READ — content = values of S only
+        c  = torch.nan_to_num(c)                               # all-masked rows -> 0 (calm frame, nothing sent)
         g  = torch.sigmoid(self.gate_mlp(torch.cat([P, c, c - P], dim=-1)))  # (B,N,1) open where they disagree
         h  = h + g * c                                         # accumulate channel content, gated
         h  = h + self.ffn(self.ln_ff(h))
@@ -656,7 +660,9 @@ class DisagreementFusionRefiner(nn.Module):
                                                self.sig_pos.shape[-1], device, dtype).unsqueeze(0)
             self._pos_init = True
 
-    def forward(self, z_hat: torch.Tensor, s_tilde: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_hat: torch.Tensor, s_tilde: torch.Tensor,
+                sig_pad: torch.Tensor | None = None) -> torch.Tensor:
+        # sig_pad: (B,n_sig) bool, True = token NOT transmitted (adaptive/variable-length codes).
         B, C, H, W = z_hat.shape
         N = H * W
         self._init_pos(z_hat.device, z_hat.dtype)
@@ -668,16 +674,16 @@ class DisagreementFusionRefiner(nn.Module):
         h = torch.zeros(B, N, P.shape[-1], device=z_hat.device, dtype=z_hat.dtype)               # accumulator
         gates = []
         for blk in self.blocks:
-            h = blk(h, P, S); gates.append(blk.last_g)
+            h = blk(h, P, S, sig_pad=sig_pad); gates.append(blk.last_g)
         r = self.out_proj(self.out_norm(h)).transpose(1, 2).reshape(B, C, H, W)                  # correction
         self.last_gate = torch.stack(gates, 0).mean(0).detach()                                  # (B,N,1)
         return z_hat + r                                                                          # residual base
 
-    def _denoise_x0(self, x_noisy, t, z_hat, s_tilde, drop_zhat=None):
+    def _denoise_x0(self, x_noisy, t, z_hat, s_tilde, drop_zhat=None, sig_pad=None):
         """Diffusion-signature shim: x_noisy and t are ignored (single forward pass)."""
         if drop_zhat is not None:
             z_hat = z_hat * (~drop_zhat).to(z_hat.dtype).view(-1, 1, 1, 1)
-        return self.forward(z_hat, s_tilde)
+        return self.forward(z_hat, s_tilde, sig_pad=sig_pad)
 
     def forward_ddpm(self, z_t, z_hat, s_tilde, noise_level: int = 0,
                      per_sample: bool = False, zhat_dropout: float = 0.0):
@@ -894,3 +900,144 @@ class SemComSystem(nn.Module):
             - 1.0
         )
         return kl.mean(dim=-1) if per_sample else kl.mean()
+
+
+# ========================================================================== #
+#  6. ADAPTIVE-RATE (MoE-ROUTER) WYNER-ZIV JSCC                              #
+#                                                                            #
+#  Transmitter routes each frame to a code LENGTH from the temporal          #
+#  difference ||z_t - z_{t-1}|| (Wyner-Ziv clean: no prediction at the TX).  #
+#  Validated separability: disturbed frames jump ~4x ordinary motion, p10    #
+#  (disturbed) > p99 (ordinary); a threshold ~0.06 catches 96% at 1% FP.     #
+#  Calm -> few tokens (channel quiet -> gate closed -> z̃=z_hat); disturbed   #
+#  -> many tokens (channel carries the cube -> gate opens). The routing      #
+#  level is the CLEAN disturbance signal the receiver keys on, replacing the #
+#  global beta trade-off. Nested/prefix tokens: level L sends the first      #
+#  n_L tokens, so one encoder serves all lengths.                            #
+# ========================================================================== #
+
+def _prefix_mask(level_probs: torch.Tensor, level_tokens, max_tokens: int) -> torch.Tensor:
+    """level_probs (B,K) over K nested levels -> soft per-token active prob (B,max_tokens).
+    Token j is sent iff the chosen level's token-count > j (prefix)."""
+    K = level_probs.shape[1]
+    tok = torch.arange(max_tokens, device=level_probs.device)
+    lt  = torch.tensor(level_tokens, device=level_probs.device, dtype=torch.long)  # (K,)
+    include = (lt.view(K, 1) > tok.view(1, max_tokens)).to(level_probs.dtype)      # (K,max_tokens)
+    return level_probs @ include                                                   # (B,max_tokens) in [0,1]
+
+
+class TemporalRouter(nn.Module):
+    """(z_t, z_{t-1}) -> distribution over K code-length levels, from the temporal
+    difference. The scalar ||z_t - z_{t-1}||^2 is the validated signal; a small conv
+    on the diff map adds spatial detail. Gumbel-softmax for a differentiable choice."""
+
+    def __init__(self, C_vae: int, n_levels: int, d_hidden: int = 128):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Conv2d(C_vae, 32, 3, 2, 1), nn.GELU(),   # 28->14
+            nn.Conv2d(32, 64, 3, 2, 1), nn.GELU(),      # 14->7
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),      # (B,64)
+        )
+        self.head = nn.Sequential(nn.Linear(64 + 1, d_hidden), nn.GELU(),
+                                  nn.Linear(d_hidden, n_levels))
+
+    def forward(self, z_t, z_prev, tau: float = 1.0, hard: bool = False):
+        diff   = z_t - z_prev
+        scalar = (diff ** 2).mean(dim=(1, 2, 3), keepdim=True).flatten(1)   # (B,1) the validated signal
+        logits = self.head(torch.cat([self.enc(diff), scalar], dim=-1))     # (B,K)
+        if self.training:
+            probs = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
+        else:
+            probs = F.one_hot(logits.argmax(-1), logits.shape[-1]).to(logits.dtype)
+        return probs, logits, scalar.squeeze(1)
+
+
+class _TokenCoder(nn.Module):
+    """z -> per-token (mu, log_var) for max_tokens tokens of token_dim symbols each."""
+
+    def __init__(self, C_vae, H_vae, W_vae, max_tokens, token_dim, d_hidden=512):
+        super().__init__()
+        self.max_tokens, self.token_dim = max_tokens, token_dim
+        D = max_tokens * token_dim
+        self.net = nn.Sequential(nn.Flatten(),
+                                 nn.Linear(C_vae * H_vae * W_vae, d_hidden), nn.GELU(),
+                                 nn.Linear(d_hidden, d_hidden), nn.GELU())
+        self.mu = nn.Linear(d_hidden, D)
+        self.lv = nn.Linear(d_hidden, D)
+
+    def forward(self, z, sample: bool = True):
+        B = z.shape[0]
+        h = self.net(z)
+        mu = self.mu(h).view(B, self.max_tokens, self.token_dim)
+        lv = self.lv(h).view(B, self.max_tokens, self.token_dim)
+        s  = mu + torch.randn_like(mu) * (0.5 * lv).exp() if sample else mu
+        return mu, lv, s
+
+
+class AdaptiveSemComSystem(nn.Module):
+    """Adaptive-rate Wyner-Ziv SemCom: router + nested-prefix JSCC + fusion refiner.
+
+    forward returns a dict with the reconstruction and the rate/length terms the
+    trainer needs. The refiner is the DisagreementFusionRefiner (z̃ = z_hat + r,
+    content from s̃ only); the routing mask makes calm frames send few tokens, so
+    the channel is naturally quiet on calm (gate closed) and rich on disturbed.
+    """
+
+    def __init__(self, config: dict):
+        super().__init__()
+        C = config.get("C_vae", 4); H = config.get("H_vae", 28); W = config.get("W_vae", 28)
+        self.max_tokens = config.get("jscc_max_tokens", 64)
+        self.token_dim  = config.get("jscc_token_dim", 16)
+        self.levels     = config.get("jscc_levels", [8, 16, 32, 64])   # nested token counts
+        self.snr_db     = config["snr_db"]
+        d_hidden = config.get("jscc_d_hidden", 512)
+        grid = int(round(self.max_tokens ** 0.5))
+        assert grid * grid == self.max_tokens, "max_tokens must be a perfect square"
+        D_max = self.max_tokens * self.token_dim
+
+        self.router  = TemporalRouter(C, len(self.levels))
+        self.encoder = _TokenCoder(C, H, W, self.max_tokens, self.token_dim, d_hidden)
+        self.prior   = _TokenCoder(C, H, W, self.max_tokens, self.token_dim, d_hidden)   # p(s̃|z_hat)
+        self.refiner = DisagreementFusionRefiner(
+            D_max, C, H, W,
+            config.get("refine_d_model", 256), config.get("refine_n_heads", 8),
+            config.get("refine_n_layers", 4), sig_grid=grid,
+        )
+        channel_type = config.get("channel_type", "rayleigh")
+        self.channel = FadingChannel(self.snr_db, channel_type=channel_type, cdl_kwargs={
+            "model": config.get("cdl_model", "C"), "delay_spread": config.get("cdl_delay_spread", 100e-9),
+            "carrier_frequency": config.get("cdl_carrier_freq", 3.5e9), "max_speed": config.get("cdl_max_speed", 3.0)})
+
+    def _tokens_to_flat(self, tok):                       # (B,T,dim) -> (B, dim*T) matching refiner reshape
+        return tok.transpose(1, 2).reshape(tok.shape[0], -1)
+
+    def forward(self, z_t, z_hat, z_prev, tau: float = 1.0, hard: bool = False,
+                sample: bool = True, force_full: bool = False):
+        B = z_t.shape[0]
+        probs, logits, tdiff = self.router(z_t, z_prev, tau=tau, hard=hard)      # (B,K)
+        if force_full:
+            # WARMUP: bypass the router, transmit ALL tokens so the encoder/refiner learn to
+            # use the channel before the router is allowed to shorten codes (else it collapses
+            # to the minimum length before the channel is ever useful).
+            mask = torch.ones(B, self.max_tokens, device=z_t.device, dtype=z_t.dtype)
+        else:
+            mask = _prefix_mask(probs, self.levels, self.max_tokens)             # (B,T) soft active-prob per token
+
+        mu_e, lv_e, s = self.encoder(z_t, sample=sample)                         # (B,T,dim)
+        mu_p, lv_p, _ = self.prior(z_hat, sample=False)                          # Wyner-Ziv prior p(s̃|z_hat)
+
+        s_masked = s * mask.unsqueeze(-1)                                        # drop non-transmitted tokens
+        st_flat  = self.channel(self._tokens_to_flat(s_masked))                 # (B, dim*T)
+        # attention padding mask for hard/eval routing (True = ignore token)
+        sig_pad = (mask < 0.5) if (hard or not self.training) else None
+        z_tilde = self.refiner._denoise_x0(None, None, z_hat, st_flat, sig_pad=sig_pad)
+
+        # per-token Wyner-Ziv rate KL(q||p), q var = enc var + channel noise
+        sig_n = 1.0 / (10.0 ** (self.snr_db / 10.0))
+        q_var = lv_e.exp() + sig_n
+        p_var = lv_p.exp().clamp(min=1e-8)
+        kl_tok = 0.5 * (p_var.log() - q_var.log() + (q_var + (mu_e - mu_p).pow(2)) / p_var - 1.0).mean(-1)  # (B,T)
+        rate   = (mask * kl_tok).sum(1)                                          # (B,) only sent tokens cost rate
+        exp_tokens = mask.sum(1)                                                 # (B,) expected code length (tokens)
+        return {"z_tilde": z_tilde, "rate": rate, "exp_tokens": exp_tokens,
+                "probs": probs, "logits": logits, "tdiff": tdiff, "mask": mask}
