@@ -570,6 +570,43 @@ class RefinementDiffusion(nn.Module):
 
         return x   # ≈ pred_x0 at the last step
 
+    @torch.no_grad()
+    def masked_sample(
+        self,
+        z_hat:   torch.Tensor,   # (B,C,H,W) prediction prior
+        s_tilde: torch.Tensor,   # (B,D_jscc) received signal
+        mask:    torch.Tensor,   # (B,1,H,W) in [0,1]; 1=regenerate (cube), 0=keep z_hat
+        noise_level: int = 500,
+        n_steps: int = 20,
+    ) -> torch.Tensor:
+        """RePaint-style masked diffusion sampling. Only the mask region is freely
+        SAMPLED (sharp) from the denoiser; the kept region is locked to z_hat (re-noised
+        to each level so the denoiser sees a consistent latent). Gives a sharp cube where
+        the mask is open and leaves the background = z_hat untouched.
+
+        Requires the denoiser to be trained as a multi-level DDPM x0-predictor of z_t
+        (twophase_masked.py). Sampling (not 1-step regression) is what avoids the L2 blur.
+        """
+        B = z_hat.shape[0]
+        t_start = min(noise_level, len(self.alphas_cumprod) - 1)
+        ab = self.alphas_cumprod.float()
+        # init: mask region starts as noised z_hat too (SDEdit); background = noised z_hat
+        eps = torch.randn_like(z_hat)
+        x = ab[t_start].sqrt() * z_hat + (1.0 - ab[t_start]).sqrt() * eps
+        step = max(1, t_start // n_steps)
+        timesteps = list(range(t_start, 0, -step))
+        for i, t_cur in enumerate(timesteps):
+            tb = torch.full((B,), t_cur, device=z_hat.device, dtype=torch.long)
+            x0 = self._denoise_x0(x, tb, z_hat, s_tilde)
+            t_next = timesteps[i + 1] if i + 1 < len(timesteps) else 0
+            a_c = ab[t_cur]
+            a_n = ab[t_next] if t_next > 0 else torch.tensor(1.0, device=x.device)
+            eps_pred = (x - a_c.sqrt() * x0) / (1.0 - a_c).sqrt().clamp(min=1e-8)
+            x_model  = a_n.sqrt() * x0 + (1.0 - a_n).sqrt() * eps_pred            # freely sampled
+            x_keep   = a_n.sqrt() * z_hat + (1.0 - a_n).sqrt() * torch.randn_like(z_hat)  # locked to z_hat
+            x = mask * x_model + (1.0 - mask) * x_keep
+        return mask * x + (1.0 - mask) * z_hat
+
 
 # ========================================================================== #
 #  3b. DISAGREEMENT-FUSION REFINER  (Wyner-Ziv residual, channel-only content) #
