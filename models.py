@@ -578,26 +578,36 @@ class RefinementDiffusion(nn.Module):
         mask:    torch.Tensor,   # (B,1,H,W) in [0,1]; 1=regenerate (cube), 0=keep z_hat
         noise_level: int = 500,
         n_steps: int = 20,
+        guidance: float = 1.0,   # classifier-free guidance weight on s~ (1=plain cond, >1 amplifies s~)
+        pure_noise_mask: bool = True,   # init the mask region from pure noise (generate fresh from s~)
     ) -> torch.Tensor:
         """RePaint-style masked diffusion sampling. Only the mask region is freely
         SAMPLED (sharp) from the denoiser; the kept region is locked to z_hat (re-noised
-        to each level so the denoiser sees a consistent latent). Gives a sharp cube where
-        the mask is open and leaves the background = z_hat untouched.
+        each step so the denoiser sees a consistent latent). Sharp cube where the mask is
+        open, background = z_hat untouched.
 
-        Requires the denoiser to be trained as a multi-level DDPM x0-predictor of z_t
-        (twophase_masked.py). Sampling (not 1-step regression) is what avoids the L2 blur.
-        """
+        guidance>1: classifier-free guidance on s~ — x0 = x0(∅) + g*(x0(s~)-x0(∅)) —
+        amplifies the channel's contribution (needs s~-dropout training). pure_noise_mask:
+        start the mask region from N(0,I) so the cube is generated from s~, not drifted
+        from the wrong prior. Requires a DDPM x0-denoiser (twophase_masked.py)."""
         B = z_hat.shape[0]
         t_start = min(noise_level, len(self.alphas_cumprod) - 1)
         ab = self.alphas_cumprod.float()
-        # init: mask region starts as noised z_hat too (SDEdit); background = noised z_hat
         eps = torch.randn_like(z_hat)
-        x = ab[t_start].sqrt() * z_hat + (1.0 - ab[t_start]).sqrt() * eps
+        x_zhat = ab[t_start].sqrt() * z_hat + (1.0 - ab[t_start]).sqrt() * eps
+        if pure_noise_mask:                                  # mask region: pure noise; background: noised z_hat
+            x = mask * torch.randn_like(z_hat) + (1.0 - mask) * x_zhat
+        else:
+            x = x_zhat
         step = max(1, t_start // n_steps)
         timesteps = list(range(t_start, 0, -step))
+        zero_s = torch.zeros_like(s_tilde)
         for i, t_cur in enumerate(timesteps):
             tb = torch.full((B,), t_cur, device=z_hat.device, dtype=torch.long)
             x0 = self._denoise_x0(x, tb, z_hat, s_tilde)
+            if guidance != 1.0:                              # classifier-free guidance on s~
+                x0_u = self._denoise_x0(x, tb, z_hat, zero_s)
+                x0 = x0_u + guidance * (x0 - x0_u)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else 0
             a_c = ab[t_cur]
             a_n = ab[t_next] if t_next > 0 else torch.tensor(1.0, device=x.device)

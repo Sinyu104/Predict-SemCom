@@ -31,7 +31,13 @@ ap.add_argument("--snr", type=float, default=20.0)
 ap.add_argument("--channel", default="awgn")
 ap.add_argument("--D_jscc", type=int, default=1024)
 ap.add_argument("--grid", type=int, default=8, help="spatial JSCC grid (n_sig = grid^2)")
-ap.add_argument("--tmax", type=int, default=600, help="max DDPM timestep sampled in training")
+ap.add_argument("--tmax", type=int, default=999, help="max DDPM timestep sampled in training")
+ap.add_argument("--hi_noise_frac", type=float, default=0.6,
+                help="fraction of the batch forced to HIGH noise [tmax/2, tmax], where x_t can't "
+                     "leak z_t so the model MUST decode s~. The rest is uniform [1, tmax].")
+ap.add_argument("--sdrop", type=float, default=0.15,
+                help="prob. of dropping s~ (set to 0) during training -> classifier-free guidance, "
+                     "so the model learns what s~ ADDS and can be guided to rely on it at sampling.")
 ap.add_argument("--dist_weight", type=float, default=15.0)
 ap.add_argument("--val_frac", type=float, default=0.1)
 a = ap.parse_args()
@@ -68,7 +74,16 @@ def run_epoch(idx, train):
         z=ZT[sel].to(DEV); h=ZH[sel].to(DEV); dm=DIST[sel].to(DEV); B=len(z)
         with torch.set_grad_enabled(train):
             _,_,s = sysm.jscc_encoder(z, sample=train); st = sysm.channel(s)
-            t = torch.randint(1, Tmax+1, (B,), device=DEV)
+            # s~ dropout for classifier-free guidance: some samples see NO channel
+            if a.sdrop > 0:
+                keep = (torch.rand(B, device=DEV) >= a.sdrop).float().view(B,1)
+                st = st * keep
+            # HIGH-noise-weighted t: force a fraction to [Tmax/2, Tmax] where x_t is ~pure noise
+            # and cannot leak z_t, so the model must decode the cube from s~.
+            t_lo = torch.randint(1, Tmax+1, (B,), device=DEV)
+            t_hi = torch.randint(Tmax//2, Tmax+1, (B,), device=DEV)
+            hi = (torch.rand(B, device=DEV) < a.hi_noise_frac)
+            t = torch.where(hi, t_hi, t_lo)
             ab = rd.alphas_cumprod[t].view(B,1,1,1).float()
             x_t = ab.sqrt()*z + (1.0-ab).sqrt()*torch.randn_like(z)      # noise the TARGET z_t (DDPM)
             pred = rd._denoise_x0(x_t, t, h, st)                          # predict x0 = z_t

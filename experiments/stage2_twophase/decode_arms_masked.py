@@ -36,8 +36,9 @@ ap.add_argument("--refine_arch", choices=["residual", "fusion"], default="residu
                 help="must match the checkpoint's Stage-2 architecture")
 ap.add_argument("--mask_thr", type=float, default=0.08,
                 help="oracle mask: latent cells with per-cell ||z_t-z_hat||^2 > thr are regenerated")
-ap.add_argument("--m_noise", type=int, default=500, help="SDEdit noise level for masked sampling")
-ap.add_argument("--m_steps", type=int, default=20, help="DDIM steps for masked sampling")
+ap.add_argument("--m_noise", type=int, default=700, help="SDEdit noise level for masked sampling")
+ap.add_argument("--m_steps", type=int, default=25, help="DDIM steps for masked sampling")
+ap.add_argument("--guidance", type=float, default=2.0, help="classifier-free guidance weight on s~")
 ap.add_argument("--demos_file", default="disturbed.hdf5")
 ap.add_argument("--history_stride", type=int, default=1)
 ap.add_argument("--ddim", type=int, default=10)
@@ -152,8 +153,10 @@ for (task, e) in by_ep:
             dev = ((z_t - zh) ** 2).mean(1, keepdim=True)                     # (1,1,H,W)
             mask = (dev > a.mask_thr).float()
             lat = {"vae": z_t, "zhat": zh,
-                   "full": rd.masked_sample(zh, st, mask, noise_level=a.m_noise, n_steps=a.m_steps),
-                   "oracle_z": rd.sdedit_refine(zh, st, noise_level=a.m_noise, n_steps=a.m_steps)}  # unmasked diffusion (shows over-correction)
+                   "full": rd.masked_sample(zh, st, mask, noise_level=a.m_noise, n_steps=a.m_steps,
+                                            guidance=a.guidance, pure_noise_mask=True),
+                   "oracle_z": rd.masked_sample(zh, st, mask, noise_level=a.m_noise, n_steps=a.m_steps,
+                                                guidance=1.0, pure_noise_mask=True)}  # no-guidance ablation
         for ar in IMG:
             IMG[ar].append(dec_uint8(lat[ar]))
         A_DEMO.append(act[t].numpy()); LAB.append(labels[(task, e, t)])
