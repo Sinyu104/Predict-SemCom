@@ -95,20 +95,32 @@ for task, e, t in picks:
 print(f"sampled: {sum(1 for v in labels.values() if v)} disturbed + "
       f"{sum(1 for v in labels.values() if not v)} calm across {len(by_ep)} episodes", flush=True)
 
-# ── models (MASKED-DIRECT: direct JSCC autoencoder + oracle mask) ─────────────── #
+# ── models (change-masked allocation: conv codec + receiver disagreement composite) ── #
 from models import JsccEncoder, FadingChannel    # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from conv_codec import ConvCodec                 # noqa: E402
 import torch.nn as nn
-class Dec(nn.Module):
+class Dec(nn.Module):   # legacy dense decoder (older ckpts)
     def __init__(s, Din):
         super().__init__()
         s.net = nn.Sequential(nn.Linear(Din,1024), nn.GELU(), nn.Linear(1024,2048), nn.GELU(),
                               nn.Linear(2048,4*28*28))
     def forward(s, x): return s.net(x).view(-1,4,28,28)
 _dk = torch.load(os.path.join(REPO, a.stage2_ckpt), map_location="cpu")
-_dc = _dk["cfg"]; D_jscc=_dc["D_jscc"]; THR=_dc["thr"]; RECV_THR=_dc.get("recv_thr", 0.0)
-enc = JsccEncoder(4,28,28,D_jscc,spatial=False).to(DEV); enc.load_state_dict(_dk["enc"]); enc.eval()
-dec = Dec(D_jscc).to(DEV); dec.load_state_dict(_dk["dec"]); dec.eval()
+_dc = _dk["cfg"]; THR=_dc["thr"]; RECV_THR=_dc.get("recv_thr", 0.0)
+ARCH = _dc.get("arch", "dense")
 chan = FadingChannel(a.snr_db, channel_type=a.channel)
+if ARCH == "conv":
+    net = ConvCodec(4, _dc["conv_w"], _dc["conv_dch"], _dc["conv_nb"]).to(DEV)
+    net.load_state_dict(_dk["net"]); net.eval()
+    def reconstruct(z_in): return net(z_in, chan)
+    print(f"[alloc] conv codec W{_dc['conv_w']}/Dch{_dc['conv_dch']}/nb{_dc['conv_nb']}", flush=True)
+else:
+    D_jscc = _dc["D_jscc"]
+    enc = JsccEncoder(4,28,28,D_jscc,spatial=False).to(DEV); enc.load_state_dict(_dk["enc"]); enc.eval()
+    dec = Dec(D_jscc).to(DEV); dec.load_state_dict(_dk["dec"]); dec.eval()
+    def reconstruct(z_in):
+        _, _, s = enc(z_in, sample=False); return dec(chan(s))
 vae = VAEWrapper(CONFIG["vae_model_name"]).to(DEV).eval()
 cw = CtrlWorldWrapper(action_dim=CONFIG["action_dim"], num_history=T_H, num_pred=1,
                       svd_path=CONFIG["svd_model_name"], freeze_unet=True,
@@ -117,7 +129,7 @@ cw = CtrlWorldWrapper(action_dim=CONFIG["action_dim"], num_history=T_H, num_pred
 ck = torch.load(os.path.join(REPO, a.stage1_ckpt), map_location="cpu")
 cw.action_encoder.load_state_dict(ck["action_encoder_state"], strict=False)
 cw.load_unet_cross_attn_state_dict(ck["unet_cross_attn_state"]); del ck; cw.eval()
-print(f"[alloc] loaded {a.stage2_ckpt}  D_jscc={D_jscc}  change-thr={THR}", flush=True)
+print(f"[alloc] loaded {a.stage2_ckpt}  arch={ARCH}  change-thr={THR} recv_thr={RECV_THR}", flush=True)
 
 def hidx(t):
     return [max(0, t - 1 - i * M) for i in range(T_H)][::-1]
@@ -145,8 +157,7 @@ for (task, e) in by_ep:
             z_t = Z[t].unsqueeze(0).to(DEV)
             z_pv = Z[t - 1].unsqueeze(0).to(DEV)                                   # z_{t-1} (transmitter, WZ-clean)
             m = (((z_t - z_pv) ** 2).mean(1, keepdim=True) > THR).float()          # transmitter change mask (cube+arm)
-            _, _, s = enc(z_t * m, sample=False); st = chan(s)                     # encode only the changed cells
-            rec = dec(st)
+            rec = reconstruct(z_t * m)                                             # encode+channel+decode the changed cells
             g = m * (((rec - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()   # receiver: keep z_hat where rec agrees (arm)
             g_or = m * (((z_t - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()# oracle uses the same receiver gate on TRUE cube
             lat = {"vae": z_t, "zhat": zh,
