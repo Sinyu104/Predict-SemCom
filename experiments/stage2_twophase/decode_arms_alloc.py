@@ -105,7 +105,7 @@ class Dec(nn.Module):
                               nn.Linear(2048,4*28*28))
     def forward(s, x): return s.net(x).view(-1,4,28,28)
 _dk = torch.load(os.path.join(REPO, a.stage2_ckpt), map_location="cpu")
-_dc = _dk["cfg"]; D_jscc=_dc["D_jscc"]; THR=_dc["thr"]
+_dc = _dk["cfg"]; D_jscc=_dc["D_jscc"]; THR=_dc["thr"]; RECV_THR=_dc.get("recv_thr", 0.0)
 enc = JsccEncoder(4,28,28,D_jscc,spatial=False).to(DEV); enc.load_state_dict(_dk["enc"]); enc.eval()
 dec = Dec(D_jscc).to(DEV); dec.load_state_dict(_dk["dec"]); dec.eval()
 chan = FadingChannel(a.snr_db, channel_type=a.channel)
@@ -144,12 +144,14 @@ for (task, e) in by_ep:
             zh = cw.predict_next_latent(H, aw, n_steps=a.ddim).float()[:, 0]      # (1,C,H,W)
             z_t = Z[t].unsqueeze(0).to(DEV)
             z_pv = Z[t - 1].unsqueeze(0).to(DEV)                                   # z_{t-1} (transmitter, WZ-clean)
-            m = (((z_t - z_pv) ** 2).mean(1, keepdim=True) > THR).float()          # change mask (cube cells)
+            m = (((z_t - z_pv) ** 2).mean(1, keepdim=True) > THR).float()          # transmitter change mask (cube+arm)
             _, _, s = enc(z_t * m, sample=False); st = chan(s)                     # encode only the changed cells
             rec = dec(st)
+            g = m * (((rec - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()   # receiver: keep z_hat where rec agrees (arm)
+            g_or = m * (((z_t - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()# oracle uses the same receiver gate on TRUE cube
             lat = {"vae": z_t, "zhat": zh,
-                   "full": m * rec + (1.0 - m) * zh,                               # CHANGE-MASKED ALLOC: cube from s~, bg from z_hat
-                   "oracle_z": m * z_t + (1.0 - m) * zh}                           # ceiling: TRUE cube composited (perfect channel)
+                   "full": g * rec + (1.0 - g) * zh,                               # cube from s~ (disagreement-gated), arm/bg from z_hat
+                   "oracle_z": g_or * z_t + (1.0 - g_or) * zh}                     # ceiling: TRUE cube composited
         for ar in IMG:
             IMG[ar].append(dec_uint8(lat[ar]))
         A_DEMO.append(act[t].numpy()); LAB.append(labels[(task, e, t)])

@@ -33,7 +33,11 @@ ap.add_argument("--bs", type=int, default=64)
 ap.add_argument("--lr", type=float, default=2e-4)
 ap.add_argument("--snr", type=float, default=20.0)
 ap.add_argument("--D_jscc", type=int, default=1024)
-ap.add_argument("--thr", type=float, default=0.05, help="per-cell ||z_t-z_{t-1}||^2 threshold for the change mask")
+ap.add_argument("--thr", type=float, default=0.15, help="transmitter change-mask threshold (per-cell ||z_t-z_{t-1}||^2)")
+ap.add_argument("--recv_thr", type=float, default=0.05,
+                help="RECEIVER disagreement threshold: within the transmitted region, only overwrite z_hat "
+                     "where ||rec - z_hat||^2 per cell > recv_thr (the cube); keep z_hat elsewhere (the arm). "
+                     "Uses z_hat at the receiver (WZ-legal) to isolate the cube the transmitter mask can't.")
 ap.add_argument("--dist_weight", type=float, default=15.0)
 a = ap.parse_args()
 DEV="cuda:0"; os.makedirs(a.out, exist_ok=True)
@@ -75,13 +79,16 @@ for e in range(1,a.epochs+1):
         m=change_mask(z,zp)
         z_in=z*m                                        # mask encoder input to the changed region
         _,_,s=enc(z_in,sample=True); st=ch(s); rec=dec(st)
-        zt=m*rec+(1-m)*h                                # composite: cube from channel, bg from z_hat
+        # RECEIVER-side disagreement composite: within the transmitted region m, only overwrite
+        # z_hat where rec disagrees with it (the cube); keep z_hat on the arm (rec ~= z_hat there).
+        g = m * (((rec - h)**2).mean(1,keepdim=True) > a.recv_thr).float()
+        zt=g*rec+(1-g)*h                                # cube from channel, arm/bg from z_hat
         ds=((zt-z)**2).mean(dim=(1,2,3)); fw=1.0+a.dist_weight*dm
         loss=(fw*ds).sum()/fw.sum()
         opt.zero_grad(); loss.backward(); opt.step()
         L+=loss.item(); nb+=1; msz+=m.mean().item()
     print(f"ep{e:>2}/{a.epochs}  loss {L/nb:.4f}  avg mask frac {msz/nb:.3f}", flush=True)
     torch.save({"enc":enc.state_dict(),"dec":dec.state_dict(),
-                "cfg":{"D_jscc":a.D_jscc,"thr":a.thr,"snr":a.snr,"spatial":False}},
+                "cfg":{"D_jscc":a.D_jscc,"thr":a.thr,"recv_thr":a.recv_thr,"snr":a.snr,"spatial":False}},
                os.path.join(a.out,"masked_alloc.pt"))
 print("DONE", flush=True)
