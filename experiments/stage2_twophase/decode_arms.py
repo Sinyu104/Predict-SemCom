@@ -34,6 +34,9 @@ ap.add_argument("--stage2_ckpt", default="outputs/stage2_gate_aligned/phase2.pt"
 ap.add_argument("--disagree_gate", action="store_true", help="ckpt has the gate_proj head")
 ap.add_argument("--refine_arch", choices=["residual", "fusion"], default="residual",
                 help="must match the checkpoint's Stage-2 architecture")
+ap.add_argument("--spatial", action="store_true", help="ckpt uses a spatial JSCC code (+ spatial prior)")
+ap.add_argument("--grid", type=int, default=8, help="spatial code grid (must match training)")
+ap.add_argument("--D_jscc", type=int, default=None, help="override D_jscc to match the checkpoint")
 ap.add_argument("--demos_file", default="disturbed.hdf5")
 ap.add_argument("--history_stride", type=int, default=1)
 ap.add_argument("--ddim", type=int, default=10)
@@ -55,6 +58,10 @@ T_H = CONFIG["num_history"]; M = a.history_stride; SPAN = (T_H - 1) * M + 1
 CONFIG["snr_db"] = a.snr_db; CONFIG["channel_type"] = a.channel
 CONFIG["refine_disagreement_gate"] = a.disagree_gate
 CONFIG["refine_arch"] = a.refine_arch
+CONFIG["jscc_spatial"] = a.spatial
+CONFIG["jscc_grid"] = a.grid
+if a.D_jscc is not None:
+    CONFIG["D_jscc"] = a.D_jscc
 COLOR = lambda t: t.split("_")[1]
 INSTR = lambda t: f"pick up the {COLOR(t)} cube and place it on the tray"
 rng = np.random.default_rng(a.seed)
