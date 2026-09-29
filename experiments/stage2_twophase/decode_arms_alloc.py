@@ -44,6 +44,10 @@ ap.add_argument("--mask_thr", type=float, default=0.08,
                      "reconstruction (cube); the rest keep z_hat (background)")
 ap.add_argument("--n_dist", type=int, default=150, help="target disturbed (flag+1) frames")
 ap.add_argument("--n_calm", type=int, default=150, help="target calm frames")
+ap.add_argument("--route_thr", type=float, default=110.0,
+                help="conv_nested: send k_dist channels if changed-cell count > route_thr, else k_calm")
+ap.add_argument("--k_calm", type=int, default=2, help="conv_nested: channels sent on calm frames")
+ap.add_argument("--k_dist", type=int, default=4, help="conv_nested: channels sent on disturbed frames")
 ap.add_argument("--seed", type=int, default=1234)
 ap.add_argument("--out", default="outputs/vla_offline_arms.npz")
 ap.add_argument("--device", default="cuda:0")
@@ -113,14 +117,30 @@ chan = FadingChannel(a.snr_db, channel_type=a.channel)
 if ARCH == "conv":
     net = ConvCodec(4, _dc["conv_w"], _dc["conv_dch"], _dc["conv_nb"]).to(DEV)
     net.load_state_dict(_dk["net"]); net.eval()
-    def reconstruct(z_in): return net(z_in, chan)
+    _K = _dc["conv_dch"]
+    def reconstruct(z_in, m): return net(z_in, chan), _K
     print(f"[alloc] conv codec W{_dc['conv_w']}/Dch{_dc['conv_dch']}/nb{_dc['conv_nb']}", flush=True)
+elif ARCH == "conv_nested":
+    # adaptive-rate: send k conv-code channels, k routed per-frame by the WZ-clean changed-cell count
+    net = ConvCodec(4, _dc["conv_w"], _dc["conv_dch"], _dc["conv_nb"]).to(DEV)
+    net.load_state_dict(_dk["net"]); net.eval()
+    DCH = _dc["conv_dch"]
+    def reconstruct(z_in, m):
+        changed = m.sum(dim=(1, 2, 3))                                   # WZ-clean cell count (transmitter)
+        k = torch.where(changed > a.route_thr, a.k_dist, a.k_calm).to(DEV)
+        code = net.enc(z_in)
+        keep = (torch.arange(DCH, device=DEV) < k.view(-1, 1)).float()
+        code = code * keep[:, :, None, None]
+        B, Dc, H, W = code.shape
+        return net.dec(chan(code.flatten(1)).view(B, Dc, H, W)), int(k[0].item())
+    print(f"[alloc] conv_nested adaptive  levels={_dc['levels']}  route: k={a.k_calm} if changed<= {a.route_thr} "
+          f"else k={a.k_dist}", flush=True)
 else:
     D_jscc = _dc["D_jscc"]
     enc = JsccEncoder(4,28,28,D_jscc,spatial=False).to(DEV); enc.load_state_dict(_dk["enc"]); enc.eval()
     dec = Dec(D_jscc).to(DEV); dec.load_state_dict(_dk["dec"]); dec.eval()
-    def reconstruct(z_in):
-        _, _, s = enc(z_in, sample=False); return dec(chan(s))
+    def reconstruct(z_in, m):
+        _, _, s = enc(z_in, sample=False); return dec(chan(s)), D_jscc
 vae = VAEWrapper(CONFIG["vae_model_name"]).to(DEV).eval()
 cw = CtrlWorldWrapper(action_dim=CONFIG["action_dim"], num_history=T_H, num_pred=1,
                       svd_path=CONFIG["svd_model_name"], freeze_unet=True,
@@ -139,7 +159,7 @@ def dec_uint8(z):
     return (im * 255).astype(np.uint8)
 
 IMG = {ar: [] for ar in ["vae", "zhat", "full", "oracle_z"]}
-A_DEMO, LAB, TASKID, INSTRS = [], [], [], []
+A_DEMO, LAB, TASKID, INSTRS, KSENT = [], [], [], [], []
 done = 0
 for (task, e) in by_ep:
     p = os.path.join(REPO, "data", task, a.demos_file)
@@ -157,7 +177,8 @@ for (task, e) in by_ep:
             z_t = Z[t].unsqueeze(0).to(DEV)
             z_pv = Z[t - 1].unsqueeze(0).to(DEV)                                   # z_{t-1} (transmitter, WZ-clean)
             m = (((z_t - z_pv) ** 2).mean(1, keepdim=True) > THR).float()          # transmitter change mask (cube+arm)
-            rec = reconstruct(z_t * m)                                             # encode+channel+decode the changed cells
+            rec, k_sent = reconstruct(z_t * m, m)                                  # encode+route+channel+decode
+            KSENT.append(k_sent)
             g = m * (((rec - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()   # receiver: keep z_hat where rec agrees (arm)
             g_or = m * (((z_t - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()# oracle uses the same receiver gate on TRUE cube
             lat = {"vae": z_t, "zhat": zh,
@@ -172,12 +193,18 @@ for (task, e) in by_ep:
             print(f"  decoded {done}/{len(picks)}", flush=True)
 
 out = {f"img_{ar}": np.stack(IMG[ar]).astype(np.uint8) for ar in IMG}
+KS = np.array(KSENT, np.float32); LA = np.array(LAB)
 out.update(a_demo=np.stack(A_DEMO).astype(np.float32),
            label=np.array(LAB, np.int64),
            task=np.array(TASKID), instruction=np.array(INSTRS),
-           snr_db=a.snr_db, channel=a.channel,
+           k_sent=KS, snr_db=a.snr_db, channel=a.channel,
            stage2=a.stage2_ckpt, disagree_gate=a.disagree_gate)
 os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
 np.savez_compressed(a.out, **out)
 print(f"saved {a.out}  frames={done}  disturbed={int(np.sum(LAB))} calm={int(len(LAB)-np.sum(LAB))}",
       flush=True)
+if ARCH == "conv_nested":
+    full16 = DCH
+    kc = KS[LA == 0].mean(); kd = KS[LA == 1].mean(); ka = KS.mean()
+    print(f"[rate] channels/frame  calm {kc:.2f}  dist {kd:.2f}  avg {ka:.2f} of {full16}  "
+          f"-> {ka/full16*100:.1f}% of the fixed full-{full16} rate", flush=True)
