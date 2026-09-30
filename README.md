@@ -11,29 +11,30 @@ A research implementation of a **Predictive Semantic Communication System** for 
 
 ## Core Idea
 
-Instead of transmitting the full robot observation at every timestep, we transmit only the **innovation** — the part the receiver could not predict — using a shared world model (Predictor) running on the edge server as Wyner-Ziv side information.
+Instead of transmitting the full robot observation at every timestep, we transmit only the **innovation** — the part the receiver could not predict — using a world model (Ctrl-World) on the edge server as Wyner-Ziv side information. A disturbed frame is only *wrong in one place* (the moved object); the arm/tray/background are predicted correctly, so the channel only carries the object.
 
-The system uses **PI0Fast** (from LeRobot) as the VLA backbone, fine-tuned on Isaac Sim tasks via LoRA. A compact VAE latent space is learned on top for semantic compression.
+The receiver reconstructs with a **convolutional Wyner-Ziv JSCC codec** and a **disagreement composite** — it keeps the prediction `ẑ_t` everywhere the reconstruction agrees with it, and swaps in the channel reconstruction only where they disagree (the object). The decoded image feeds any image-based policy (OpenVLA for the offline action metric; PI0Fast is served for closed-loop).
+
+> **No second (refinement) diffusion.** An earlier design used a second SDEdit diffusion to refine `ẑ_t` with `s̃`; it produced reconstructions the policy rejected and was removed. **Ctrl-World (the predictor) is the only diffusion.** See `CLAUDE.md` for the current architecture.
 
 ```
-Device (Robot)                              Edge Server
+Device (Robot)  — WZ-blind to ẑ_t          Edge Server
 ──────────────────────────────────          ──────────────────────────────────
-x_t ──[VAE Encoder (frozen)]──► z_t
-     ──[JSCC Encoder]──────────► s_t
-                                  │
-                    ~~Rayleigh Channel~~──► ŝ_t
-                                                │
-                                                │    (z_{t-1}, a_{t-1}) ──[Predictor]──► ẑ_t^{pred}
-                                                │               │
-                                      (ŝ_t, ẑ_t^{pred})────────
-                                      ──[JSCC Decoder]──► ẑ_t
-                                      ──[VAE Decoder]──► x̂_t
-                                      ──[PI0Fast]──► â_t (chunk of 30)
+x_t ─[VAE Encoder (frozen)]─► z_t
+m   = 1[||z_t − z_{t-1}||² > thr]            (z̃_{t-1..}, a_t) ─[Ctrl-World]─► ẑ_t   (WZ prior)
+code = ConvEnc(z_t·m)                                             │
+send first k channels (calm↓/dist↑)                              │  ẑ_t ─[Conv Prior]─► μ_p, p(s̃|ẑ_t)
+                    ~~Fading Channel~~──► s̃_t ───────────────────┤
+                                                     dropped channels ← μ_p(ẑ_t)
+                                                     rec = ConvDec(s̃_t)
+                                                     g   = m·1[||rec−ẑ_t||² > recv_thr]
+                                                     z̃_t = g·rec + (1−g)·ẑ_t
+                                                     ─[VAE Decoder]─► x̂_t ─[Policy]─► â_t
 ```
 
-The **Predictor** (action-conditioned world model) runs on the receiver side only, providing Wyner-Ziv side information. Rate is reduced because the receiver can already predict much of `z_t` from context.
+The **Ctrl-World predictor** runs on the receiver only, as Wyner-Ziv side information. Rate is reduced because the receiver already predicts most of `z_t`; the code is *nested over channels* and transmits `k` of them per frame (calm frames ≈2 channels ≈12.5% of full rate, disturbed ≈4).
 
-**Rate:** `KL( q(ŝ_t|z_t) || p(ŝ_t|ẑ_t^{pred}) )` — automatically near zero when the scene is predictable, high when it changes unexpectedly.
+**Rate loss:** `β · KL( q(s̃|z_t) || p(s̃|ẑ_t) )` — automatically near zero when the scene is predictable, high when it changes unexpectedly. Use **`β` lightly** (1e-5 … 1e-4).
 
 ---
 
@@ -50,9 +51,9 @@ The **Predictor** (action-conditioned world model) runs on the receiver side onl
 
 | Stage       | Name                | Goal                                                         |
 | ----------- | ------------------- | ------------------------------------------------------------ |
-| **Stage 0** | PI0Fast Fine-tuning | Fine-tune PI0Fast on Isaac Sim task using LoRA (via LeRobot) |
-| **Stage 1** | Predictor Training  | Train action-conditioned world model                         |
-| **Stage 2** | JSCC Training       | Train JSCC Encoder, Decoder, Side Info Encoder (Wyner-Ziv)   |
+| **Stage 0** | Policy Fine-tuning  | Fine-tune the policy (PI0Fast / OpenVLA) on Isaac Sim tasks via LoRA |
+| **Stage 1** | Ctrl-World Training | Train the action-conditioned world model (predictor / WZ prior) |
+| **Stage 2** | Conv WZ JSCC        | Train the conv JSCC encoder + conv prior + conv decoder (`distortion + β·KL`); deploy with the disagreement composite. Code + docs in `experiments/stage2_twophase/` and `CLAUDE.md` |
 
 ---
 
@@ -100,11 +101,17 @@ vla_server.py   (Python 3.12, worldmodel conda)
 │   ├── isaac_collector.py     Isaac Sim data collector (Windows)
 │   ├── vla_runner.py          VLA evaluation runner with action chunking
 │   └── test_ros2_client.py    Standalone connection test (Windows side)
-├── models.py                  VAE, JSCC Encoder/Decoder, Predictor, Rayleigh Channel
-├── trainer.py                 Stage 1/2/3 trainers with DDP
+├── experiments/stage2_twophase/   CURRENT Stage-2 path (conv Wyner-Ziv codec)
+│   ├── conv_codec.py          ConvCodec / ConvWZCodec (translation-equivariant JSCC)
+│   ├── train_masked_alloc_wz.py   Stage-2 trainer: distortion + β·KL, nested channels, prior-fill
+│   ├── decode_arms_alloc.py   offline decode → arms (router + disagreement composite)
+│   ├── decode_arms_wz_sweep.py    multi-k decode for the rate-distortion frontier
+│   └── score_arms.py          OpenVLA action-metric scoring (worldmodel env)
+├── models.py                  FadingChannel (used). Legacy: dense JsccEncoder, RefinementDiffusion, SemComSystem
+├── ctrl_world_wrapper.py      Ctrl-World (SVD) predictor wrapper
+├── trainer.py                 Stage1Trainer (used); Stage2Trainer is legacy (refinement diffusion)
 ├── dataset.py                 HDF5 episodic dataset loader
-├── inference.py               Evaluation metrics and figure generation
-├── main.py                    CLI entry point (torchrun-compatible)
+├── main.py                    CLI entry point (Stage-1 training, DDP)
 ├── config.py                  Central configuration dict
 ├── vae_wrapper.py             VAE latent space utilities
 └── policy_agent.py            Policy agent wrapper
@@ -245,28 +252,38 @@ python.bat Predict-SemCom\tasks\pick_orange_cube_to_tray\vla_runner.py ^
 ### 7. Train the Semantic Communication Model (Linux server)
 
 ```bash
-conda activate worldmodel
 cd /path/to/Worldmodel_SC
 
-# Stage 1 — Predictor (action-conditioned world model)
-python main.py --train --stage 1 \
-    --stored_data data/stage12_clean.hdf5 \
-    --epoch 50
+# Stage 1 — Ctrl-World predictor (predictor conda env)
+conda activate predictor
+python -m torch.distributed.run --nproc_per_node=4 main.py --train --stage 1 \
+    --stored_data data/stage12_clean.hdf5 --epoch 50
 
-# Stage 2 — JSCC Encoder / Decoder / Side Info Encoder (Wyner-Ziv)
-python main.py --train --stage 2 \
-    --stored_data data/stage12_clean.hdf5 \
-    --epoch 30
+# Stage 2 — conv Wyner-Ziv JSCC codec (predictor env), distortion + β·KL, no refinement diffusion
+python experiments/stage2_twophase/train_masked_alloc_wz.py \
+    --pre outputs/rollout_disturbed_clean_s2_moe --out outputs/masked_alloc_wz_b1e-4 \
+    --beta 1e-4 --thr 0.05 --recv_thr 0.10 --epochs 45
 ```
 
-### 8. Run Inference / Ablation
+### 8. Evaluate — offline VLA action metric (the metric that matters)
+
+Latent MSE misleads; judge reconstruction by the policy's action error. Decode arms (predictor env), then score with OpenVLA (worldmodel env — the two envs never share a process):
 
 ```bash
-for SNR in 0 5 10 15 20; do
-    python main.py --inference --snr_db $SNR \
-        --stored_data data/eval_disturbed.hdf5
-done
+# A) decode arms to images: vae / zhat / full / oracle_z  (or _wz_sweep for all k in one pass)
+conda activate predictor
+python experiments/stage2_twophase/decode_arms_alloc.py \
+    --stage2_ckpt outputs/masked_alloc_wz_b1e-4/masked_alloc.pt \
+    --n_dist 150 --n_calm 150 --snr_db 20 --channel awgn \
+    --route_thr 110 --k_calm 2 --k_dist 4 --out outputs/vla_arms.npz
+
+# B) score with OpenVLA: |a-demo|, |a-vae| (OOD proxy), grip err — compare `full` vs `zhat` on DISTURBED
+CUDA_VISIBLE_DEVICES=0,1 conda run --no-capture-output -n worldmodel \
+    python experiments/stage2_twophase/score_arms.py \
+    --in outputs/vla_arms.npz --lora_dir outputs/openvla_dagger_v3/checkpoint_epoch24
 ```
+
+For an SNR / β / k sweep, produce one tidy CSV row per condition and plot in MATLAB — see the **Simulation Data & MATLAB Plotting Convention** section of `CLAUDE.md`.
 
 ---
 
