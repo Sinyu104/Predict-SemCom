@@ -32,7 +32,11 @@ from server.openvla_server import OpenVLAServer            # noqa: E402
 srv = OpenVLAServer(lora_dir=os.path.join(REPO, a.lora_dir), model_dir=a.model_dir)
 
 d = np.load(a.src, allow_pickle=True)
-ARMS = ["vae", "zhat", "full", "oracle_z"]
+# auto-detect arms from img_* keys; keep vae first (it is the |a-vae| reference), then a stable order
+_found = [k[4:] for k in d.files if k.startswith("img_")]
+_pref = [ar for ar in ["vae", "zhat", "full", "oracle_z"] if ar in _found]
+ARMS = _pref + sorted(ar for ar in _found if ar not in _pref)
+assert "vae" in ARMS, "need img_vae as the |a-vae| reference"
 imgs = {ar: d[f"img_{ar}"] for ar in ARMS}
 a_demo = d["a_demo"]; label = d["label"]; instr = d["instruction"]
 N = len(a_demo)
