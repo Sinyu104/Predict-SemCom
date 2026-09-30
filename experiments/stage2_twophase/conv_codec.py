@@ -50,3 +50,50 @@ class ConvCodec(nn.Module):
         B, Dc, H, Wd = c.shape
         c = channel(c.flatten(1)).view(B, Dc, H, Wd)       # flatten only for the channel
         return self.dec(c)
+
+
+def _conv_trunk(C_in, W, Dch, nb):
+    body = [nn.Conv2d(C_in, W, 3, 1, 1), nn.GELU()] + [_Res(W) for _ in range(nb)]
+    return nn.Sequential(*body), nn.Conv2d(W, Dch, 1), nn.Conv2d(W, Dch, 1)   # trunk, mu-head, logvar-head
+
+
+class ConvWZCodec(nn.Module):
+    """Wyner-Ziv conv codec: probabilistic encoder q(s|z_t), a side-info prior
+    p(s|z_hat), and a decoder -- so the rate term KL(q||p) can be re-introduced on
+    top of the conv codec (restores L = distortion + beta*KL).
+
+      encoder (WZ-blind):  z_t*m -> (mu_e, logvar_e)   per code element (B,Dch,H,W)
+      prior   (receiver):  z_hat -> (mu_p, logvar_p)   p(s~|z_hat), WZ-legal at the receiver
+      channel:             s~ = channel(reparam(mu_e,logvar_e)),  q_var = sigma_e^2 + sigma_n^2
+      decoder:             s~ (dropped channels filled with mu_p) -> rec
+
+    KL is per element; summed per channel it gives the per-channel rate that concentrates
+    on the unpredictable cube (q!=p) and vanishes on predictable regions (q~=p). See
+    project_adaptive_rate_conv / project_jscc_codec_overfits.
+    """
+
+    def __init__(self, C_vae: int = 4, W: int = 96, Dch: int = 16, nb: int = 3):
+        super().__init__()
+        self.Dch = Dch
+        self.enc_body, self.enc_mu, self.enc_lv = _conv_trunk(C_vae, W, Dch, nb)
+        self.pri_body, self.pri_mu, self.pri_lv = _conv_trunk(C_vae, W, Dch, nb)
+        dec = [nn.Conv2d(Dch, W, 3, 1, 1), nn.GELU()] + [_Res(W) for _ in range(nb)] + [nn.Conv2d(W, C_vae, 3, 1, 1)]
+        self.dec = nn.Sequential(*dec)
+
+    def encode(self, x):
+        h = self.enc_body(x)
+        return self.enc_mu(h), self.enc_lv(h).clamp(-10.0, 2.0)     # (B,Dch,H,W) each
+
+    def prior(self, z_hat):
+        h = self.pri_body(z_hat)
+        return self.pri_mu(h), self.pri_lv(h).clamp(-10.0, 2.0)
+
+    @staticmethod
+    def kl_elem(mu_e, lv_e, mu_p, lv_p, sig_n):
+        """Per-element KL( N(mu_e, e^lv_e + sig_n) || N(mu_p, e^lv_p) )."""
+        q_var = lv_e.exp() + sig_n
+        p_var = lv_p.exp().clamp(min=1e-8)
+        return 0.5 * (p_var.log() - q_var.log() + (q_var + (mu_e - mu_p).pow(2)) / p_var - 1.0)
+
+    def decode(self, s):
+        return self.dec(s)

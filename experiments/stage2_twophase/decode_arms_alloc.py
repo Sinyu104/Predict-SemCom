@@ -102,7 +102,7 @@ print(f"sampled: {sum(1 for v in labels.values() if v)} disturbed + "
 # ── models (change-masked allocation: conv codec + receiver disagreement composite) ── #
 from models import JsccEncoder, FadingChannel    # noqa: E402
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from conv_codec import ConvCodec                 # noqa: E402
+from conv_codec import ConvCodec, ConvWZCodec    # noqa: E402
 import torch.nn as nn
 class Dec(nn.Module):   # legacy dense decoder (older ckpts)
     def __init__(s, Din):
@@ -118,14 +118,14 @@ if ARCH == "conv":
     net = ConvCodec(4, _dc["conv_w"], _dc["conv_dch"], _dc["conv_nb"]).to(DEV)
     net.load_state_dict(_dk["net"]); net.eval()
     _K = _dc["conv_dch"]
-    def reconstruct(z_in, m): return net(z_in, chan), _K
+    def reconstruct(z_in, m, zh): return net(z_in, chan), _K
     print(f"[alloc] conv codec W{_dc['conv_w']}/Dch{_dc['conv_dch']}/nb{_dc['conv_nb']}", flush=True)
 elif ARCH == "conv_nested":
     # adaptive-rate: send k conv-code channels, k routed per-frame by the WZ-clean changed-cell count
     net = ConvCodec(4, _dc["conv_w"], _dc["conv_dch"], _dc["conv_nb"]).to(DEV)
     net.load_state_dict(_dk["net"]); net.eval()
     DCH = _dc["conv_dch"]
-    def reconstruct(z_in, m):
+    def reconstruct(z_in, m, zh):
         changed = m.sum(dim=(1, 2, 3))                                   # WZ-clean cell count (transmitter)
         k = torch.where(changed > a.route_thr, a.k_dist, a.k_calm).to(DEV)
         code = net.enc(z_in)
@@ -135,11 +135,28 @@ elif ARCH == "conv_nested":
         return net.dec(chan(code.flatten(1)).view(B, Dc, H, W)), int(k[0].item())
     print(f"[alloc] conv_nested adaptive  levels={_dc['levels']}  route: k={a.k_calm} if changed<= {a.route_thr} "
           f"else k={a.k_dist}", flush=True)
+elif ARCH == "conv_wz":
+    # WZ codec: send first k channels (router), receiver fills channels>=k with the prior mean mu_p(z_hat)
+    net = ConvWZCodec(4, _dc["conv_w"], _dc["conv_dch"], _dc["conv_nb"]).to(DEV)
+    net.load_state_dict(_dk["net"]); net.eval()
+    DCH = _dc["conv_dch"]
+    def reconstruct(z_in, m, zh):
+        changed = m.sum(dim=(1, 2, 3))
+        k = torch.where(changed > a.route_thr, a.k_dist, a.k_calm).to(DEV)
+        mu_e, _ = net.encode(z_in)                                       # transmitter code mean
+        mu_p, _ = net.prior(zh)                                          # receiver prior mean (WZ-legal)
+        B, Dc, H, W = mu_e.shape
+        s_t = chan(mu_e.flatten(1)).view(B, Dc, H, W)                    # send the code through the channel
+        keep = (torch.arange(DCH, device=DEV) < k.view(-1, 1)).float()[:, :, None, None]
+        s_mix = keep * s_t + (1 - keep) * mu_p                           # dropped channels -> prior mean
+        return net.decode(s_mix), int(k[0].item())
+    print(f"[alloc] conv_wz beta={_dc.get('beta')}  levels={_dc['levels']}  route: k={a.k_calm} if changed<= "
+          f"{a.route_thr} else k={a.k_dist}", flush=True)
 else:
     D_jscc = _dc["D_jscc"]
     enc = JsccEncoder(4,28,28,D_jscc,spatial=False).to(DEV); enc.load_state_dict(_dk["enc"]); enc.eval()
     dec = Dec(D_jscc).to(DEV); dec.load_state_dict(_dk["dec"]); dec.eval()
-    def reconstruct(z_in, m):
+    def reconstruct(z_in, m, zh):
         _, _, s = enc(z_in, sample=False); return dec(chan(s)), D_jscc
 vae = VAEWrapper(CONFIG["vae_model_name"]).to(DEV).eval()
 cw = CtrlWorldWrapper(action_dim=CONFIG["action_dim"], num_history=T_H, num_pred=1,
@@ -177,7 +194,7 @@ for (task, e) in by_ep:
             z_t = Z[t].unsqueeze(0).to(DEV)
             z_pv = Z[t - 1].unsqueeze(0).to(DEV)                                   # z_{t-1} (transmitter, WZ-clean)
             m = (((z_t - z_pv) ** 2).mean(1, keepdim=True) > THR).float()          # transmitter change mask (cube+arm)
-            rec, k_sent = reconstruct(z_t * m, m)                                  # encode+route+channel+decode
+            rec, k_sent = reconstruct(z_t * m, m, zh)                             # encode+route+channel+decode
             KSENT.append(k_sent)
             g = m * (((rec - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()   # receiver: keep z_hat where rec agrees (arm)
             g_or = m * (((z_t - zh) ** 2).mean(1, keepdim=True) > RECV_THR).float()# oracle uses the same receiver gate on TRUE cube
@@ -203,7 +220,7 @@ os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
 np.savez_compressed(a.out, **out)
 print(f"saved {a.out}  frames={done}  disturbed={int(np.sum(LAB))} calm={int(len(LAB)-np.sum(LAB))}",
       flush=True)
-if ARCH == "conv_nested":
+if ARCH in ("conv_nested", "conv_wz"):
     full16 = DCH
     kc = KS[LA == 0].mean(); kd = KS[LA == 1].mean(); ka = KS.mean()
     print(f"[rate] channels/frame  calm {kc:.2f}  dist {kd:.2f}  avg {ka:.2f} of {full16}  "
