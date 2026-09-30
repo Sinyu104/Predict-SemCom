@@ -5,13 +5,19 @@ communication pipeline, with a policy in the loop.
 Same TCP/ROS front end as openvla_server.py, but the received observation is
 pushed through the SemCom pipeline before it reaches the policy:
 
-    o_t  ->  [VAE encode]      ->  z_t
-             [JSCC encode]     ->  s_t
-             [Fading channel]  ->  s~_t
-    [z~_{t-6..t-1}], a_t -> [Ctrl-World DDIM] -> z_hat_t      (side information)
-    (z_hat_t, s~_t)      -> [Refinement]      -> z~_t
-                            [VAE decode]      -> x~_t
-                            [Policy]          -> a_hat_t  -> back to the robot
+    o_t  ->  [VAE encode]                      ->  z_t
+    m = 1[||z_t - z_{t-1}||^2 > thr] ; code = ConvEnc(z_t*m) ; route k channels
+             [Fading channel over first k ch]  ->  s~_t
+    [z~_{t-6..t-1}], a_t -> [Ctrl-World DDIM]   ->  z_hat_t   (prior / side information)
+    dropped channels <- prior mean mu_p(z_hat_t) ; rec = ConvDec(s~_t)
+    g = m * 1[||rec - z_hat_t||^2 > recv_thr] ; z~_t = g*rec + (1-g)*z_hat_t
+                            [VAE decode]       ->  x~_t
+                            [Policy]           ->  a_hat_t  -> back to the robot
+
+    This is the CURRENT conv Wyner-Ziv codec (experiments/stage2_twophase/conv_codec.py,
+    ConvWZCodec) + a receiver-side disagreement composite.  There is NO refinement
+    diffusion.  A legacy SemComSystem (refinement) checkpoint is still accepted as a
+    fallback, auto-detected from the checkpoint's cfg["arch"].
 
 Three processes, because the SemCom stack and OpenVLA cannot share a conda env:
 
@@ -43,10 +49,10 @@ Modes (--mode), in increasing order of what is exercised:
     predict     z_hat decoded straight to the policy.  Stage 1 ALONE, no Stage 2
                 loaded at all.  Pair with --clean_history for the predictor's
                 ceiling with drift removed.
-    nochannel   refinement with s~_t zeroed.  NOT the raw prediction: the
-                refinement is residual (z_hat + delta), so this emits
-                z_hat + delta(0).  Use `predict` to see z_hat itself.
-    full        the complete pipeline.
+    nochannel   conv codec with k=0 channels transmitted — every code channel is
+                filled from the prior mu_p(z_hat), so the composite falls back to
+                z_hat wherever it agrees.  The control for "did the channel help?".
+    full        the complete pipeline (adaptive k routed by the change-cell count).
 
 Build up one mode at a time: each has a predictable expected result, so a
 surprise localises immediately instead of being lost in the whole stack.
@@ -91,9 +97,13 @@ from PIL import Image
 REPO = str(pathlib.Path(__file__).resolve().parents[1])
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
+# The current (conv Wyner-Ziv) codec lives in the Stage-2 experiment package.
+_S2 = os.path.join(REPO, "experiments", "stage2_twophase")
+if _S2 not in sys.path:
+    sys.path.insert(0, _S2)
 
 from config import CONFIG                      # noqa: E402
-from models import SemComSystem                # noqa: E402
+from models import SemComSystem, FadingChannel # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -112,13 +122,28 @@ class SemComPipeline:
     there is no circular dependency on the action we are about to produce.
     """
 
-    def __init__(self, config, vae, ctrl_world, system, device, mode):
+    def __init__(self, config, vae, ctrl_world, system, device, mode,
+                 codec=None, wz_channel=None, wz_params=None):
         self.cfg        = config
         self.vae        = vae
         self.ctrl_world = ctrl_world
-        self.system     = system
+        self.system     = system          # legacy SemComSystem (None when conv codec is used)
         self.device     = device
         self.mode       = mode
+
+        # -- current conv Wyner-Ziv codec (ConvWZCodec) + receiver composite ---- #
+        # When `codec` is set, the `full`/`nochannel` path uses it instead of the
+        # legacy refinement diffusion.  Routing params come from the checkpoint cfg
+        # (thr, recv_thr) and the CLI (route_thr, k_calm, k_dist).
+        self.codec      = codec
+        self.wz_channel = wz_channel
+        self.wz_thr = self.wz_recv_thr = self.route_thr = self.k_calm = self.k_dist = None
+        if wz_params is not None:
+            self.wz_thr      = wz_params["thr"]
+            self.wz_recv_thr = wz_params["recv_thr"]
+            self.route_thr   = wz_params["route_thr"]
+            self.k_calm      = wz_params["k_calm"]
+            self.k_dist      = wz_params["k_dist"]
 
         self.num_history = config["num_history"]
         self.num_pred    = config["num_pred"]
@@ -157,6 +182,7 @@ class SemComPipeline:
         self.chunk     = None     # cached (1, num_pred, C, H, W) prediction
         self.chunk_pos = 0        # which frame of the cached chunk comes next
         self.last_zhat = None     # last Ctrl-World prediction latent (for the 3-panel dump)
+        self.z_prev_true = None   # previous TRUE latent z_{t-1} (transmitter, WZ-clean) for the change mask
 
     # -- helpers ---------------------------------------------------------- #
 
@@ -217,6 +243,39 @@ class SemComPipeline:
         out = np.concatenate([hist, fut], axis=0)
         return torch.from_numpy(out).unsqueeze(0).to(self.device)
 
+    # -- current conv Wyner-Ziv reconstruction --------------------------- #
+
+    @torch.no_grad()
+    def _wz_reconstruct(self, z_t, z_hat, z_prev):
+        """Conv WZ codec + receiver disagreement composite (ConvWZCodec).
+
+        Transmitter (WZ-blind to z_hat): change mask m from z_t vs the true z_{t-1},
+        encode z_t*m, route k channels by the change-cell count, send the first k
+        through the channel.  Receiver: fill the dropped channels with the prior mean
+        mu_p(z_hat) (WZ-legal), decode, then composite z~ = g*rec + (1-g)*z_hat with
+        g = m * 1[||rec - z_hat||^2 > recv_thr].  Mirrors decode_arms_alloc.py.
+        """
+        # change mask (WZ-clean).  No true previous latent yet -> send everything.
+        if z_prev is None:
+            m = torch.ones_like(z_t[:, :1])
+        else:
+            m = (((z_t - z_prev) ** 2).mean(1, keepdim=True) > self.wz_thr).float()
+
+        if self.mode == "nochannel":
+            k = 0                                               # transmit nothing -> all from prior
+        else:
+            k = self.k_dist if m.sum().item() > self.route_thr else self.k_calm
+
+        mu_e, _ = self.codec.encode(z_t * m)                    # (1, Dch, H, W)
+        mu_p, _ = self.codec.prior(z_hat)                       # prior mean from the prediction
+        B, Dc, Hh, Ww = mu_e.shape
+        s_t  = self.wz_channel(mu_e.flatten(1)).view(B, Dc, Hh, Ww)
+        keep = (torch.arange(Dc, device=self.device) < k).float()[None, :, None, None]
+        s_mix = keep * s_t + (1.0 - keep) * mu_p               # dropped channels <- prior mean
+        rec  = self.codec.decode(s_mix)
+        g = m * (((rec - z_hat) ** 2).mean(1, keepdim=True) > self.wz_recv_thr).float()
+        return g * rec + (1.0 - g) * z_hat
+
     # -- main entry ------------------------------------------------------- #
 
     @torch.no_grad()
@@ -235,6 +294,13 @@ class SemComPipeline:
         x     = self._to_tensor(obs_rgb)
         z_t   = self.vae.encode(x)                       # (1, C, H, W)
         t["vae_enc"] = time.perf_counter() - t0
+
+        # Previous TRUE latent for the WZ-clean change mask (the transmitter holds its
+        # own past observations).  Captured before overwriting, so this frame sees
+        # z_{t-1} and the next frame will see this z_t.  Updated in EVERY mode so it is
+        # always current, even across anchor / vae / predict early returns.
+        z_prev = self.z_prev_true
+        self.z_prev_true = z_t
 
         if self.mode == "vae":
             t0 = time.perf_counter()
@@ -293,20 +359,24 @@ class SemComPipeline:
             t["vae_dec"] = time.perf_counter() - t0
             return self._to_uint8(x_tilde), t
 
-        # -- transmitter: JSCC over the channel ---------------------------- #
+        # -- transmitter + receiver -------------------------------------- #
         t0 = time.perf_counter()
-        _, _, s_t = self.system.jscc_encoder(z_t, sample=False)
-        s_tilde   = self.system.channel(s_t)
-        if self.mode == "nochannel":
-            s_tilde = torch.zeros_like(s_tilde)
-        t["jscc"] = time.perf_counter() - t0
-
-        # -- receiver: refinement ------------------------------------------ #
-        t0 = time.perf_counter()
-        z_tilde = self.system.refinement_diffusion.sdedit_refine(
-            z_hat, s_tilde, noise_level=self.t_second, n_steps=self.n_ddim,
-        )
-        t["refine"] = time.perf_counter() - t0
+        if self.codec is not None:
+            # CURRENT conv Wyner-Ziv path (mirrors decode_arms_alloc.py conv_wz).
+            z_tilde = self._wz_reconstruct(z_t, z_hat, z_prev)
+            t["wz"] = time.perf_counter() - t0
+        else:
+            # LEGACY refinement-diffusion path (SemComSystem checkpoint).
+            _, _, s_t = self.system.jscc_encoder(z_t, sample=False)
+            s_tilde   = self.system.channel(s_t)
+            if self.mode == "nochannel":
+                s_tilde = torch.zeros_like(s_tilde)
+            t["jscc"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            z_tilde = self.system.refinement_diffusion.sdedit_refine(
+                z_hat, s_tilde, noise_level=self.t_second, n_steps=self.n_ddim,
+            )
+            t["refine"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         x_tilde = self.vae.decode(z_tilde)
@@ -336,6 +406,9 @@ def build_pipeline(args, config, device):
 
     ctrl_world = None
     system     = None
+    codec      = None
+    wz_channel = None
+    wz_params  = None
 
     if args.mode in ("predict", "nochannel", "full"):
         from ctrl_world_wrapper import CtrlWorldWrapper
@@ -373,17 +446,40 @@ def build_pipeline(args, config, device):
         # `predict` renders z_hat and never touches Stage 2, so it must not require
         # a Stage-2 checkpoint — the whole point is to score Stage 1 on its own.
         if args.mode != "predict":
-            system = SemComSystem(config).to(device)
-            sk = torch.load(args.stage2_ckpt, map_location="cpu")
-            state = sk.get("system_state", sk)
-            missing, unexpected = system.load_state_dict(state, strict=False)
-            print(f"[SemCom] Stage-2 restored from {args.stage2_ckpt} "
-                  f"({len(state)} tensors, {len(missing)} missing, {len(unexpected)} unexpected)")
-            system.eval()
+            sk   = torch.load(args.stage2_ckpt, map_location="cpu")
+            cfg2 = sk.get("cfg", {})
+            arch = cfg2.get("arch", "legacy")
+            if arch == "conv_wz":
+                # CURRENT model: conv Wyner-Ziv codec (no refinement diffusion).
+                from conv_codec import ConvWZCodec
+                codec = ConvWZCodec(4, cfg2["conv_w"], cfg2["conv_dch"], cfg2["conv_nb"]).to(device)
+                codec.load_state_dict(sk["net"])
+                codec.eval()
+                wz_channel = FadingChannel(config["snr_db"],
+                                           channel_type=config.get("channel_type", "awgn"))
+                wz_params = dict(thr=cfg2["thr"], recv_thr=cfg2["recv_thr"],
+                                 route_thr=args.route_thr, k_calm=args.k_calm, k_dist=args.k_dist)
+                print(f"[SemCom] conv_wz codec from {args.stage2_ckpt}: "
+                      f"W{cfg2['conv_w']}/Dch{cfg2['conv_dch']}/nb{cfg2['conv_nb']} "
+                      f"beta={cfg2.get('beta')} thr={cfg2['thr']} recv_thr={cfg2['recv_thr']} "
+                      f"route: k={args.k_calm} if changed<= {args.route_thr} else k={args.k_dist}")
+            elif arch in ("conv", "conv_nested"):
+                raise NotImplementedError(
+                    f"stage2_ckpt arch='{arch}' is not wired into the server yet; "
+                    f"use a conv_wz checkpoint (train_masked_alloc_wz.py) or the legacy path.")
+            else:
+                # LEGACY: SemComSystem (refinement diffusion) checkpoint.
+                system = SemComSystem(config).to(device)
+                state = sk.get("system_state", sk)
+                missing, unexpected = system.load_state_dict(state, strict=False)
+                print(f"[SemCom] LEGACY Stage-2 restored from {args.stage2_ckpt} "
+                      f"({len(state)} tensors, {len(missing)} missing, {len(unexpected)} unexpected)")
+                system.eval()
         else:
             print("[SemCom] mode=predict — Stage 2 not loaded; the policy sees z_hat.")
 
-    return SemComPipeline(config, vae, ctrl_world, system, device, args.mode)
+    return SemComPipeline(config, vae, ctrl_world, system, device, args.mode,
+                          codec=codec, wz_channel=wz_channel, wz_params=wz_params)
 
 
 # ---------------------------------------------------------------------------
@@ -691,12 +787,25 @@ def parse_args():
 
     # SemCom checkpoints
     p.add_argument("--stage1_ckpt", type=str,
-                   default="outputs/stage1_5cube_cam1_K8/stage1_best.pt",
-                   help="Ctrl-World weights (action_encoder + unet_cross_attn).")
+                   default="outputs/stage1_rollout_ft/stage1_rollout_ep1.pt",
+                   help="Ctrl-World weights (action_encoder + unet_cross_attn). Default pairs with "
+                        "the conv_wz codec (both use CLEAN history at stride 1; keep --history_stride 1). "
+                        "Mismatching the predictor lineage silently breaks the reconstruction.")
     p.add_argument("--stage2_ckpt", type=str,
-                   default="outputs/stage2_twophase_full/phase2.pt",
-                   help="JSCC + SideInfo + Refinement weights.")
+                   default="outputs/masked_alloc_wz_b1e-4/masked_alloc.pt",
+                   help="Stage-2 weights. Auto-detected from cfg['arch']: 'conv_wz' -> current "
+                        "ConvWZCodec (conv enc + prior + dec, no refinement); otherwise the legacy "
+                        "SemComSystem (refinement diffusion).")
     p.add_argument("--svd_path", type=str, default=None)
+
+    # conv Wyner-Ziv adaptive-rate router (conv_wz checkpoints only; thr/recv_thr come from the ckpt)
+    p.add_argument("--route_thr", type=float, default=110.0,
+                   help="conv_wz: send k_dist code channels if the changed-cell count exceeds this, "
+                        "else k_calm. WZ-clean (uses only z_t, z_{t-1}).")
+    p.add_argument("--k_calm", type=int, default=2,
+                   help="conv_wz: code channels transmitted on calm frames (of Dch).")
+    p.add_argument("--k_dist", type=int, default=4,
+                   help="conv_wz: code channels transmitted on disturbed frames (of Dch).")
 
     # Channel / pipeline overrides
     p.add_argument("--snr_db",  type=float, default=None)
