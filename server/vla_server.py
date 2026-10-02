@@ -9,8 +9,11 @@ Message format
 Client → Server:  /vla/request  (std_msgs/String)
     JSON: {
         "seq":            <int>,        sequence number for request/reply matching
-        "jpeg_b64":       "<base64>",   JPEG-compressed RGB frame (base/front camera)
-        "jpeg_b64_wrist": "<base64>",   optional wrist camera; falls back to jpeg_b64
+        "images_b64":     {"1": "<b64>", "2": "<b64>"},  per-camera JPEGs, keys are
+                                        camera IDs as strings ascending; cam1 = lowest
+                                        id (base view), cam2 = next. Preferred protocol.
+        "jpeg_b64":       "<base64>",   legacy single view (== images_b64[min id]);
+        "jpeg_b64_wrist": "<base64>",   legacy optional 2nd cam. Used only if no images_b64.
         "instruction":    "pick up ...",
     }
 
@@ -601,16 +604,24 @@ def run_server(args):
                 seq  = data.get("seq", 0)
 
                 try:
-                    obs_rgb = np.array(
-                        Image.open(io.BytesIO(base64.b64decode(data["jpeg_b64"]))).convert("RGB"),
-                        dtype=np.uint8,
-                    )
-                    obs_rgb_wrist = None
-                    if "jpeg_b64_wrist" in data:
-                        obs_rgb_wrist = np.array(
-                            Image.open(io.BytesIO(base64.b64decode(data["jpeg_b64_wrist"]))).convert("RGB"),
+                    def _decode_b64(b64):
+                        return np.array(
+                            Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"),
                             dtype=np.uint8,
                         )
+                    # Preferred protocol: images_b64 = {"<cam_id>": b64, ...}, camera IDs
+                    # as strings in ascending order. cam1 = lowest id (base/fixed view),
+                    # cam2 = next id. jpeg_b64 (== images_b64[min id]) and jpeg_b64_wrist
+                    # are the legacy single-/dual-view fallback so old clients still work.
+                    imgs = data.get("images_b64")
+                    if imgs:
+                        cam_ids = sorted(imgs.keys(), key=lambda k: int(k))
+                        obs_rgb       = _decode_b64(imgs[cam_ids[0]])
+                        obs_rgb_wrist = _decode_b64(imgs[cam_ids[1]]) if len(cam_ids) > 1 else None
+                    else:
+                        obs_rgb       = _decode_b64(data["jpeg_b64"])
+                        obs_rgb_wrist = (_decode_b64(data["jpeg_b64_wrist"])
+                                         if "jpeg_b64_wrist" in data else None)
                 except Exception as e:
                     response = {"seq": seq, "action": [[0.0] * server.action_dim],
                                 "status": "error", "message": f"Image decode error: {e}"}
