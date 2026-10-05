@@ -123,7 +123,7 @@ class SemComPipeline:
     """
 
     def __init__(self, config, vae, ctrl_world, system, device, mode,
-                 codec=None, wz_channel=None, wz_params=None):
+                 codec=None, wz_channel=None, wz_params=None, sscc_cfg=None):
         self.cfg        = config
         self.vae        = vae
         self.ctrl_world = ctrl_world
@@ -135,6 +135,15 @@ class SemComPipeline:
         # When `codec` is set, the `full`/`nochannel` path uses it instead of the
         # legacy refinement diffusion.  Routing params come from the checkpoint cfg
         # (thr, recv_thr) and the CLI (route_thr, k_calm, k_dist).
+        self.sscc_cfg   = sscc_cfg     # traditional streaming SSCC baseline (H.264/H.265 + LDPC + QAM)
+        self.sscc_link  = None
+        self.sscc_stats = {"frames": 0, "symbols": 0, "lost": 0}
+        if sscc_cfg is not None:
+            from baselines.traditional.link import AdaptiveLink
+            self.sscc_link = AdaptiveLink(sscc_cfg["channel"], sscc_cfg["snr_db"], mcs=sscc_cfg["mcs"],
+                                          bler_target=sscc_cfg["bler"], cdl_model=sscc_cfg["cdl_model"])
+            print(f"[SemCom] SSCC link: {sscc_cfg['channel']} @ {sscc_cfg['snr_db']} dB, MCS "
+                  f"{sscc_cfg['mcs'] or self.sscc_link.mcs}", flush=True)
         self.codec      = codec
         self.wz_channel = wz_channel
         self.wz_thr = self.wz_recv_thr = self.route_thr = self.k_calm = self.k_dist = None
@@ -182,7 +191,17 @@ class SemComPipeline:
         self.chunk     = None     # cached (1, num_pred, C, H, W) prediction
         self.chunk_pos = 0        # which frame of the cached chunk comes next
         self.last_zhat = None     # last Ctrl-World prediction latent (for the 3-panel dump)
+        self._sscc_reset()
         self.z_prev_true = None   # previous TRUE latent z_{t-1} (transmitter, WZ-clean) for the change mask
+
+    def _sscc_reset(self):
+        """New episode -> fresh streaming encoder/decoder (first frame is a keyframe)."""
+        c = getattr(self, "sscc_cfg", None)
+        if c is None:
+            return
+        from baselines.traditional.stream_codec import StreamEncoder, StreamDecoder
+        self.sscc_enc = StreamEncoder(c["codec"], c["qp"], c["gop"])
+        self.sscc_dec = StreamDecoder(c["codec"], conceal=c["conceal"])
 
     # -- helpers ---------------------------------------------------------- #
 
@@ -284,6 +303,17 @@ class SemComPipeline:
         if self.mode == "bypass":
             return obs_rgb, t
 
+        if self.mode == "sscc":
+            t0 = time.perf_counter()
+            pkt = self.sscc_enc.encode(obs_rgb)
+            rx, info = self.sscc_link.transmit(pkt)
+            x_tilde = self.sscc_dec.decode(rx)
+            self.sscc_stats["frames"] += 1
+            self.sscc_stats["symbols"] += info["n_symbols"]
+            self.sscc_stats["lost"] += int(not info["ok"])
+            t["sscc"] = time.perf_counter() - t0
+            return x_tilde, t
+
         self.a_hist.append(
             np.asarray(prev_action, dtype=np.float32)
             if prev_action is not None
@@ -301,6 +331,16 @@ class SemComPipeline:
         # always current, even across anchor / vae / predict early returns.
         z_prev = self.z_prev_true
         self.z_prev_true = z_t
+
+        if self.mode == "vae_channel":
+            # Baseline: send the RAW VAE latent (4*28*28 reals, no prediction / no WZ) over the channel.
+            t0 = time.perf_counter()
+            B, C, H, W = z_t.shape
+            z_rx = self.wz_channel(z_t.flatten(1)).view(B, C, H, W)
+            x_tilde = self.vae.decode(z_rx)
+            t["vae_dec"] = time.perf_counter() - t0
+            self.z_hist.append(z_t[0])
+            return self._to_uint8(x_tilde), t
 
         if self.mode == "vae":
             t0 = time.perf_counter()
@@ -400,6 +440,16 @@ def build_pipeline(args, config, device):
         print("[SemCom] mode=bypass — no SemCom models loaded (policy only).")
         return SemComPipeline(config, None, None, None, device, "bypass")
 
+    if args.mode == "sscc":
+        mcs = tuple(float(v) for v in args.sscc_mcs.split(",")) if args.sscc_mcs else None
+        if mcs: mcs = (int(mcs[0]), mcs[1])
+        cfg = dict(codec=args.sscc_codec, qp=args.sscc_qp, gop=args.sscc_gop, conceal=args.sscc_conceal,
+                   channel=config.get("channel_type", "awgn"), snr_db=config["snr_db"], mcs=mcs,
+                   bler=args.sscc_bler, cdl_model=args.cdl_model)
+        print(f"[SemCom] mode=sscc: {cfg['codec']} QP{cfg['qp']} GOP{cfg['gop']} + LDPC/QAM "
+              f"(link adaptation={'off' if mcs else 'on'}, conceal={cfg['conceal']})")
+        return SemComPipeline(config, None, None, None, device, "sscc", sscc_cfg=cfg)
+
     from vae_wrapper import VAEWrapper
     print(f"[SemCom] VAE: {config.get('vae_model_name')}")
     vae = VAEWrapper(config.get("vae_model_name", "stabilityai/sd-vae-ft-mse")).to(device)
@@ -409,6 +459,13 @@ def build_pipeline(args, config, device):
     codec      = None
     wz_channel = None
     wz_params  = None
+    cdl_kw = {"model": args.cdl_model, "delay_spread": args.cdl_delay_spread,
+              "carrier_frequency": args.cdl_carrier_freq, "max_speed": args.cdl_max_speed}
+    if args.mode == "vae_channel":
+        wz_channel = FadingChannel(config["snr_db"], channel_type=config.get("channel_type", "awgn"),
+                                   cdl_kwargs=cdl_kw)
+        print(f"[SemCom] vae_channel: raw VAE latent over {config.get('channel_type','awgn')} "
+              f"@ {config['snr_db']} dB" + (f" (CDL-{args.cdl_model})" if config.get('channel_type') == 'cdl' else ""))
 
     if args.mode in ("predict", "nochannel", "full"):
         from ctrl_world_wrapper import CtrlWorldWrapper
@@ -456,7 +513,8 @@ def build_pipeline(args, config, device):
                 codec.load_state_dict(sk["net"])
                 codec.eval()
                 wz_channel = FadingChannel(config["snr_db"],
-                                           channel_type=config.get("channel_type", "awgn"))
+                                           channel_type=config.get("channel_type", "awgn"),
+                                           cdl_kwargs=cdl_kw)
                 wz_params = dict(thr=cfg2["thr"], recv_thr=cfg2["recv_thr"],
                                  route_thr=args.route_thr, k_calm=args.k_calm, k_dist=args.k_dist)
                 print(f"[SemCom] conv_wz codec from {args.stage2_ckpt}: "
@@ -477,6 +535,13 @@ def build_pipeline(args, config, device):
                 system.eval()
         else:
             print("[SemCom] mode=predict — Stage 2 not loaded; the policy sees z_hat.")
+
+    # Warm the channel up NOW: the CDL channel builds its Sionna model on the first call (~8 s),
+    # which would otherwise land inside request 1 and time the client out.
+    if wz_channel is not None:
+        t0 = time.perf_counter()
+        wz_channel(torch.randn(1, 4 * 28 * 28, device=device))
+        print(f"[SemCom] channel warm-up {time.perf_counter() - t0:.1f}s", flush=True)
 
     return SemComPipeline(config, vae, ctrl_world, system, device, args.mode,
                           codec=codec, wz_channel=wz_channel, wz_params=wz_params)
@@ -738,6 +803,11 @@ def run_server(args):
                 _send(conn, {"seq": seq, "action": action,
                              "exec_horizon": 1, "status": "ok"})
 
+                if args.mode == "sscc" and n_reqs % 20 == 0:
+                    st = pipeline.sscc_stats
+                    print(f"[SemCom] SSCC: {st['symbols'] / max(st['frames'], 1):.0f} channel uses/frame, "
+                          f"{100 * st['lost'] / max(st['frames'], 1):.1f}% frames lost", flush=True)
+
                 if n_reqs % 20 == 0:
                     parts = "  ".join(f"{k}={v / n_reqs:.0f}"
                                       for k, v in sorted(stage_ms.items()))
@@ -758,7 +828,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Online closed-loop SemCom + policy inference server")
     p.add_argument("--mode",
-                   choices=["bypass", "vae", "predict", "nochannel", "full"],
+                   choices=["bypass", "vae", "vae_channel", "sscc", "predict", "nochannel", "full"],
                    default="bypass",
                    help="How much of the pipeline to exercise. Start with bypass "
                         "and confirm it reproduces the policy-only success rate. "
@@ -812,6 +882,17 @@ def parse_args():
     p.add_argument("--channel", type=str, default=None,
                    choices=["awgn", "rayleigh", "cdl"])
     p.add_argument("--D_jscc",  type=int, default=None)
+    p.add_argument("--sscc_codec", default="h264", choices=["h264", "h265"])
+    p.add_argument("--sscc_qp", type=int, default=28, help="fixed QP; bandwidth is whatever that needs")
+    p.add_argument("--sscc_gop", type=int, default=10)
+    p.add_argument("--sscc_bler", type=float, default=1e-2, help="link-adaptation BLER target")
+    p.add_argument("--sscc_mcs", default=None, help='fix the MCS as "bits_per_symbol,rate" (disables link adaptation)')
+    p.add_argument("--sscc_conceal", default="freeze", choices=["freeze", "drift"])
+    p.add_argument("--cdl_model", type=str, default="C", choices=list("ABCDE"),
+                   help="3GPP TR-38.901 CDL profile (only when --channel cdl; needs Sionna)")
+    p.add_argument("--cdl_delay_spread", type=float, default=100e-9)
+    p.add_argument("--cdl_carrier_freq", type=float, default=3.5e9)
+    p.add_argument("--cdl_max_speed", type=float, default=3.0)
     p.add_argument("--disagree_gate", action="store_true",
                    help="Load a refiner trained with disagreement-gated fusion "
                         "(z_tilde = z_hat + g*delta). Must match how the Stage-2 checkpoint "
