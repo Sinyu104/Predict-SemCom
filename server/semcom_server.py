@@ -900,6 +900,13 @@ def parse_args():
     p.add_argument("--channel", type=str, default=None,
                    choices=["awgn", "rayleigh", "cdl"])
     p.add_argument("--D_jscc",  type=int, default=None)
+    p.add_argument("--cdl_model", type=str, default="C", choices=list("ABCDE"),
+                   help="3GPP TR-38.901 CDL profile (only when --channel cdl; needs Sionna)")
+    p.add_argument("--cdl_delay_spread", type=float, default=100e-9)
+    p.add_argument("--cdl_carrier_freq", type=float, default=3.5e9)
+    p.add_argument("--cdl_max_speed", type=float, default=3.0)
+    p.add_argument("--disagree_gate", action="store_true",
+                   help="Legacy refiner checkpoints only: gate_proj head (z_tilde = z_hat + g*delta).")
     p.add_argument("--sscc_codec", default="h264", choices=["h264", "h265"])
     p.add_argument("--sscc_kbps", type=float, default=100.0, help="CBR video bitrate (typical low-res streaming)")
     p.add_argument("--sscc_fps", type=int, default=10, help="control / frame rate")
