@@ -49,9 +49,13 @@ def _crc_ok(d: bytes):
 
 class NRLink:
     def __init__(self, channel="awgn", snr_db=10.0, tb_bytes=1250, re_budget=8000, max_tx=4,
-                 bler_target=0.1, cdl_model="C", table_path=None, device=None, seed=None, num_iter=20):
+                 bler_target=0.1, cdl_model="C", table_path=None, device=None, seed=None, num_iter=20,
+                 fixed_mcs=None):
+        """fixed_mcs=<NR MCS index 3..28>: no link adaptation.  The MCS and the video bitrate are fixed, so the resource
+        elements per frame are the SAME at every SNR (re_budget=None => exactly one transmission's worth) and SNR only
+        changes whether the frame decodes (the cliff).  fixed_mcs=None: SNR -> MCS by the 10 % BLER rule."""
         self.channel, self.snr_db = channel, float(snr_db)
-        self.tb_bytes, self.re_budget, self.max_tx = int(tb_bytes), int(re_budget), int(max_tx)
+        self.tb_bytes, self.re_budget, self.max_tx = int(tb_bytes), (int(re_budget) if re_budget is not None else None), int(max_tx)
         self.num_iter = num_iter
         self.device = device or str(getattr(_sn_config, "device", "cpu"))
         if seed is not None:
@@ -63,7 +67,14 @@ class NRLink:
         self._enc, self._dec, self._map, self._dem = {}, {}, {}, {}
         self.table = nr_mcs_table()
         self.table_path = table_path or os.path.join(os.path.dirname(__file__), f"nr_bler_tb{self.tb_bytes}.json")
-        self.mcs = self.select_mcs(bler_target)
+        if fixed_mcs is not None:
+            self.mcs = next(m for m in self.table if m[0] == int(fixed_mcs))
+            if re_budget is None:
+                _, qm, r = self.mcs
+                sizes, ns = self._blocks((self.tb_bytes + 4) * 8, qm, r)
+                self.re_budget = sum(n // qm for n in ns)
+        else:
+            self.mcs = self.select_mcs(bler_target)
         self.stats = dict(frames=0, lost=0, outage=0, symbols=0, tx=0)
 
     # -- plumbing ----------------------------------------------------------- #

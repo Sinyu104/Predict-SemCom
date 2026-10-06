@@ -143,10 +143,12 @@ class SemComPipeline:
             tb = int(round(sscc_cfg["kbps"] * 1000 / sscc_cfg["fps"] / 8))
             self.sscc_link = NRLink(sscc_cfg["channel"], sscc_cfg["snr_db"], tb_bytes=tb,
                                     re_budget=sscc_cfg["re_budget"], max_tx=sscc_cfg["max_tx"],
-                                    bler_target=sscc_cfg["bler"], cdl_model=sscc_cfg["cdl_model"])
+                                    bler_target=sscc_cfg["bler"], cdl_model=sscc_cfg["cdl_model"],
+                                    fixed_mcs=sscc_cfg["mcs"])
             print(f"[SemCom] SSCC NR link: {sscc_cfg['channel']} @ {sscc_cfg['snr_db']} dB -> MCS {self.sscc_link.mcs[0]} "
                   f"(Qm={self.sscc_link.mcs[1]}, R={self.sscc_link.mcs[2]:.2f}); TB {tb} B, budget "
-                  f"{sscc_cfg['re_budget']} RE/frame, HARQ<= {sscc_cfg['max_tx']} tx", flush=True)
+                  f"{self.sscc_link.re_budget} RE/frame, HARQ<= {sscc_cfg['max_tx']} tx"
+                  f"{' (fixed MCS: same REs at every SNR)' if sscc_cfg['mcs'] is not None else ''}", flush=True)
         self.codec      = codec
         self.wz_channel = wz_channel
         self.wz_thr = self.wz_recv_thr = self.route_thr = self.k_calm = self.k_dist = None
@@ -448,7 +450,8 @@ def build_pipeline(args, config, device):
     if args.mode == "sscc":
         cfg = dict(codec=args.sscc_codec, gop=args.sscc_gop, fps=args.sscc_fps, kbps=args.sscc_kbps,
                    channel=config.get("channel_type", "awgn"), snr_db=config["snr_db"],
-                   re_budget=args.sscc_re_budget, max_tx=args.sscc_max_tx, bler=args.sscc_bler,
+                   re_budget=(args.sscc_re_budget or None) if args.sscc_mcs >= 0 else args.sscc_re_budget,
+                   max_tx=args.sscc_max_tx, bler=args.sscc_bler, mcs=(args.sscc_mcs if args.sscc_mcs >= 0 else None),
                    cdl_model=args.cdl_model)
         print(f"[SemCom] mode=sscc: {cfg['codec']} CBR {cfg['kbps']} kbps @ {cfg['fps']} fps, GOP {cfg['gop']}, NR link")
         return SemComPipeline(config, None, None, None, device, "sscc", sscc_cfg=cfg)
@@ -901,8 +904,11 @@ def parse_args():
     p.add_argument("--sscc_kbps", type=float, default=100.0, help="CBR video bitrate (typical low-res streaming)")
     p.add_argument("--sscc_fps", type=int, default=10, help="control / frame rate")
     p.add_argument("--sscc_gop", type=int, default=10, help="keyframe interval in frames")
-    p.add_argument("--sscc_re_budget", type=int, default=8000, help="NR resource elements allocated per frame period")
-    p.add_argument("--sscc_max_tx", type=int, default=4, help="HARQ: max transmissions per frame (within the budget)")
+    p.add_argument("--sscc_mcs", type=int, default=16,
+                   help="FIXED NR MCS index 3-28 (default 16): no link adaptation, same REs/frame at every SNR; -1 = adapt by SNR")
+    p.add_argument("--sscc_re_budget", type=int, default=0,
+                   help="REs per frame; 0 = exactly one transmission (fixed MCS). With --sscc_mcs -1 use e.g. 8000")
+    p.add_argument("--sscc_max_tx", type=int, default=1, help="HARQ max transmissions (1 = none; extra tx cost extra REs)")
     p.add_argument("--sscc_bler", type=float, default=0.1, help="TS 38.214 CQI rule: BLER target for MCS selection")
     p.add_argument("--num_history", type=int, default=None)
     p.add_argument("--history_stride", type=int, default=1,
