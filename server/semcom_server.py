@@ -908,7 +908,7 @@ def parse_args():
     p.add_argument("--disagree_gate", action="store_true",
                    help="Legacy refiner checkpoints only: gate_proj head (z_tilde = z_hat + g*delta).")
     p.add_argument("--sscc_codec", default="h264", choices=["h264", "h265"])
-    p.add_argument("--sscc_kbps", type=float, default=100.0, help="CBR video bitrate (typical low-res streaming)")
+    p.add_argument("--sscc_kbps", type=float, default=300.0, help="CBR video bitrate (typical low-res streaming)")
     p.add_argument("--sscc_fps", type=int, default=10, help="control / frame rate")
     p.add_argument("--sscc_gop", type=int, default=10, help="keyframe interval in frames")
     p.add_argument("--sscc_mcs", type=int, default=16,
