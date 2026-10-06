@@ -137,13 +137,16 @@ class SemComPipeline:
         # (thr, recv_thr) and the CLI (route_thr, k_calm, k_dist).
         self.sscc_cfg   = sscc_cfg     # traditional streaming SSCC baseline (H.264/H.265 + LDPC + QAM)
         self.sscc_link  = None
-        self.sscc_stats = {"frames": 0, "symbols": 0, "lost": 0}
+        self.sscc_stats = {"frames": 0, "symbols": 0, "lost": 0, "outage": 0, "tx": 0}
         if sscc_cfg is not None:
-            from baselines.traditional.link import AdaptiveLink
-            self.sscc_link = AdaptiveLink(sscc_cfg["channel"], sscc_cfg["snr_db"], mcs=sscc_cfg["mcs"],
-                                          bler_target=sscc_cfg["bler"], cdl_model=sscc_cfg["cdl_model"])
-            print(f"[SemCom] SSCC link: {sscc_cfg['channel']} @ {sscc_cfg['snr_db']} dB, MCS "
-                  f"{sscc_cfg['mcs'] or self.sscc_link.mcs}", flush=True)
+            from baselines.traditional.nr_link import NRLink
+            tb = int(round(sscc_cfg["kbps"] * 1000 / sscc_cfg["fps"] / 8))
+            self.sscc_link = NRLink(sscc_cfg["channel"], sscc_cfg["snr_db"], tb_bytes=tb,
+                                    re_budget=sscc_cfg["re_budget"], max_tx=sscc_cfg["max_tx"],
+                                    bler_target=sscc_cfg["bler"], cdl_model=sscc_cfg["cdl_model"])
+            print(f"[SemCom] SSCC NR link: {sscc_cfg['channel']} @ {sscc_cfg['snr_db']} dB -> MCS {self.sscc_link.mcs[0]} "
+                  f"(Qm={self.sscc_link.mcs[1]}, R={self.sscc_link.mcs[2]:.2f}); TB {tb} B, budget "
+                  f"{sscc_cfg['re_budget']} RE/frame, HARQ<= {sscc_cfg['max_tx']} tx", flush=True)
         self.codec      = codec
         self.wz_channel = wz_channel
         self.wz_thr = self.wz_recv_thr = self.route_thr = self.k_calm = self.k_dist = None
@@ -200,8 +203,8 @@ class SemComPipeline:
         if c is None:
             return
         from baselines.traditional.stream_codec import StreamEncoder, StreamDecoder
-        self.sscc_enc = StreamEncoder(c["codec"], c["qp"], c["gop"])
-        self.sscc_dec = StreamDecoder(c["codec"], conceal=c["conceal"])
+        self.sscc_enc = StreamEncoder(c["codec"], gop=c["gop"], fps=c["fps"], kbps=c["kbps"])
+        self.sscc_dec = StreamDecoder(c["codec"], conceal="drift")
 
     # -- helpers ---------------------------------------------------------- #
 
@@ -307,12 +310,14 @@ class SemComPipeline:
             t0 = time.perf_counter()
             pkt = self.sscc_enc.encode(obs_rgb)
             rx, info = self.sscc_link.transmit(pkt)
-            x_tilde = self.sscc_dec.decode(rx)
-            self.sscc_stats["frames"] += 1
-            self.sscc_stats["symbols"] += info["n_symbols"]
-            self.sscc_stats["lost"] += int(not info["ok"])
+            st = self.sscc_stats
+            st["frames"] += 1; st["symbols"] += info["n_symbols"]; st["tx"] += info["n_tx"]
+            st["lost"] += int(not info["ok"]); st["outage"] += int(info["outage"])
             t["sscc"] = time.perf_counter() - t0
-            return x_tilde, t
+            if rx is None:                       # frame lost: the edge has NO image, so no action can be computed
+                self.sscc_dec.decode(None)       # keep decoder state consistent (references now stale)
+                return None, t
+            return self.sscc_dec.decode(rx), t
 
         self.a_hist.append(
             np.asarray(prev_action, dtype=np.float32)
@@ -441,13 +446,11 @@ def build_pipeline(args, config, device):
         return SemComPipeline(config, None, None, None, device, "bypass")
 
     if args.mode == "sscc":
-        mcs = tuple(float(v) for v in args.sscc_mcs.split(",")) if args.sscc_mcs else None
-        if mcs: mcs = (int(mcs[0]), mcs[1])
-        cfg = dict(codec=args.sscc_codec, qp=args.sscc_qp, gop=args.sscc_gop, conceal=args.sscc_conceal,
-                   channel=config.get("channel_type", "awgn"), snr_db=config["snr_db"], mcs=mcs,
-                   bler=args.sscc_bler, cdl_model=args.cdl_model)
-        print(f"[SemCom] mode=sscc: {cfg['codec']} QP{cfg['qp']} GOP{cfg['gop']} + LDPC/QAM "
-              f"(link adaptation={'off' if mcs else 'on'}, conceal={cfg['conceal']})")
+        cfg = dict(codec=args.sscc_codec, gop=args.sscc_gop, fps=args.sscc_fps, kbps=args.sscc_kbps,
+                   channel=config.get("channel_type", "awgn"), snr_db=config["snr_db"],
+                   re_budget=args.sscc_re_budget, max_tx=args.sscc_max_tx, bler=args.sscc_bler,
+                   cdl_model=args.cdl_model)
+        print(f"[SemCom] mode=sscc: {cfg['codec']} CBR {cfg['kbps']} kbps @ {cfg['fps']} fps, GOP {cfg['gop']}, NR link")
         return SemComPipeline(config, None, None, None, device, "sscc", sscc_cfg=cfg)
 
     from vae_wrapper import VAEWrapper
@@ -747,6 +750,16 @@ def run_server(args):
 
                 t0 = time.perf_counter()
                 x_tilde, timings = pipeline.step(obs_rgb, prev_act)
+                if x_tilde is None:              # SSCC frame lost -> reply with an error; the client applies zero action
+                    _send(conn, {"seq": seq, "action": [0.0] * 7, "status": "error", "message": "frame lost on the channel"})
+                    prev_act = None; n_reqs += 1
+                    if n_reqs % 20 == 0:
+                        st = pipeline.sscc_stats
+                        print(f"[SemCom] SSCC: {st['symbols'] / max(st['frames'], 1):.0f} REs/frame, "
+                              f"{100 * st['lost'] / max(st['frames'], 1):.1f}% lost "
+                              f"({100 * st['outage'] / max(st['frames'], 1):.1f}% outage), "
+                              f"{st['tx'] / max(st['frames'] - st['outage'], 1):.2f} tx/frame", flush=True)
+                    continue
                 # In bypass the frame is untouched, so forward the client's own
                 # bytes and keep the control bit-exact with the 2-process path.
                 action = policy.predict(
@@ -805,8 +818,10 @@ def run_server(args):
 
                 if args.mode == "sscc" and n_reqs % 20 == 0:
                     st = pipeline.sscc_stats
-                    print(f"[SemCom] SSCC: {st['symbols'] / max(st['frames'], 1):.0f} channel uses/frame, "
-                          f"{100 * st['lost'] / max(st['frames'], 1):.1f}% frames lost", flush=True)
+                    print(f"[SemCom] SSCC: {st['symbols'] / max(st['frames'], 1):.0f} REs/frame, "
+                          f"{100 * st['lost'] / max(st['frames'], 1):.1f}% lost "
+                          f"({100 * st['outage'] / max(st['frames'], 1):.1f}% outage), "
+                          f"{st['tx'] / max(st['frames'] - st['outage'], 1):.2f} tx/frame", flush=True)
 
                 if n_reqs % 20 == 0:
                     parts = "  ".join(f"{k}={v / n_reqs:.0f}"
@@ -883,20 +898,12 @@ def parse_args():
                    choices=["awgn", "rayleigh", "cdl"])
     p.add_argument("--D_jscc",  type=int, default=None)
     p.add_argument("--sscc_codec", default="h264", choices=["h264", "h265"])
-    p.add_argument("--sscc_qp", type=int, default=28, help="fixed QP; bandwidth is whatever that needs")
-    p.add_argument("--sscc_gop", type=int, default=10)
-    p.add_argument("--sscc_bler", type=float, default=1e-2, help="link-adaptation BLER target")
-    p.add_argument("--sscc_mcs", default=None, help='fix the MCS as "bits_per_symbol,rate" (disables link adaptation)')
-    p.add_argument("--sscc_conceal", default="freeze", choices=["freeze", "drift"])
-    p.add_argument("--cdl_model", type=str, default="C", choices=list("ABCDE"),
-                   help="3GPP TR-38.901 CDL profile (only when --channel cdl; needs Sionna)")
-    p.add_argument("--cdl_delay_spread", type=float, default=100e-9)
-    p.add_argument("--cdl_carrier_freq", type=float, default=3.5e9)
-    p.add_argument("--cdl_max_speed", type=float, default=3.0)
-    p.add_argument("--disagree_gate", action="store_true",
-                   help="Load a refiner trained with disagreement-gated fusion "
-                        "(z_tilde = z_hat + g*delta). Must match how the Stage-2 checkpoint "
-                        "was trained, or the gate_proj weights will be missing.")
+    p.add_argument("--sscc_kbps", type=float, default=100.0, help="CBR video bitrate (typical low-res streaming)")
+    p.add_argument("--sscc_fps", type=int, default=10, help="control / frame rate")
+    p.add_argument("--sscc_gop", type=int, default=10, help="keyframe interval in frames")
+    p.add_argument("--sscc_re_budget", type=int, default=8000, help="NR resource elements allocated per frame period")
+    p.add_argument("--sscc_max_tx", type=int, default=4, help="HARQ: max transmissions per frame (within the budget)")
+    p.add_argument("--sscc_bler", type=float, default=0.1, help="TS 38.214 CQI rule: BLER target for MCS selection")
     p.add_argument("--num_history", type=int, default=None)
     p.add_argument("--history_stride", type=int, default=1,
                    help="m: spacing between history slots. Offline, stride 8 cut closed-loop "

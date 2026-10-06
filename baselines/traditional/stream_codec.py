@@ -56,7 +56,11 @@ def _is_keyframe(codec: str, data: bytes) -> bool:
 
 class StreamEncoder:
     def __init__(self, codec: str = "h264", qp: int = 28, gop: int = 10,
-                 width: int = 224, height: int = 224, fps: int = 10):
+                 width: int = 224, height: int = 224, fps: int = 10,
+                 kbps: float | None = None, vbv_frames: float = 1.0):
+        """kbps given => constant-bitrate rate control (typical for streaming); the encoder picks QP per frame.
+        vbv_frames = rate-buffer size in frame periods (1.0 => every frame, keyframes included, is ~kbps/fps).
+        kbps None => fixed QP."""
         self.codec = codec.lower()
         self.width, self.height = width, height
         enc = _ENC[self.codec]
@@ -67,7 +71,18 @@ class StreamEncoder:
         ctx.time_base = __import__("fractions").Fraction(1, fps)
         ctx.gop_size = int(gop)
         ctx.max_b_frames = 0
-        if enc == "libx264":
+        if kbps is not None:
+            br = int(kbps * 1000); buf = int(br / fps * vbv_frames)
+            if enc == "libx264":
+                ctx.options = {"b": str(br), "maxrate": str(br), "bufsize": str(buf), "tune": "zerolatency",
+                               "bf": "0", "nal-hrd": "cbr", "sc_threshold": "0",
+                               "g": str(int(gop)), "keyint_min": str(int(gop))}
+            else:
+                ctx.options = {"x265-params":
+                               f"bitrate={int(kbps)}:vbv-maxrate={int(kbps)}:vbv-bufsize={max(buf // 1000, 1)}:"
+                               f"bframes=0:rc-lookahead=0:frame-threads=1:keyint={int(gop)}:min-keyint={int(gop)}:"
+                               f"scenecut=0:repeat-headers=1:log-level=none"}
+        elif enc == "libx264":
             ctx.options = {"qp": str(int(qp)), "tune": "zerolatency", "bf": "0",
                            "sc_threshold": "0", "g": str(int(gop)), "keyint_min": str(int(gop))}
         else:
@@ -90,7 +105,7 @@ class StreamEncoder:
 
 class StreamDecoder:
     def __init__(self, codec: str = "h264", width: int = 224, height: int = 224,
-                 conceal: str = "freeze"):
+                 conceal: str = "drift"):
         self.codec = codec.lower()
         self.width, self.height = width, height
         self.conceal = conceal
