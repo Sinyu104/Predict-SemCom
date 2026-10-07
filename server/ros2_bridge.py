@@ -32,6 +32,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="ROS2 ↔ TCP bridge for PI0Fast server")
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=5555)
+    p.add_argument("--topic_prefix", type=str, default="",
+                   help="Prefix for the ROS topics, e.g. /B -> /B/vla/request, /B/vla/response. Lets several clients/stacks share ONE "
+                        "discovery server (ROS_DOMAIN_ID does not separate them in discovery-server mode).")
     return p.parse_args()
 
 
@@ -62,7 +65,7 @@ def main():
 
     rclpy.init()
     node = rclpy.create_node("vla_bridge")
-    pub  = node.create_publisher(String, "/vla/response", 10)
+    pub  = node.create_publisher(String, f"{args.topic_prefix}/vla/response", 10)
 
     def on_request(msg: String):
         try:
@@ -92,11 +95,11 @@ def main():
             f"chunk_len={len(response.get('action', []))}"
         )
 
-    node.create_subscription(String, "/vla/request", on_request, 10)
+    node.create_subscription(String, f"{args.topic_prefix}/vla/request", on_request, 10)
 
     print(f"[Bridge] ROS2 node started.")
-    print(f"[Bridge] Subscribed to  /vla/request")
-    print(f"[Bridge] Publishing to  /vla/response")
+    print(f"[Bridge] Subscribed to  {args.topic_prefix}/vla/request")
+    print(f"[Bridge] Publishing to  {args.topic_prefix}/vla/response")
 
     try:
         rclpy.spin(node)

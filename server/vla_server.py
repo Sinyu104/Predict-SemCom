@@ -126,11 +126,13 @@ class Pi0FastServer:
         action_dim: int = 7,
         device:     str = "cuda:0",
     ):
-        if (lora_path is None) == (full_weights is None):
-            raise ValueError(
-                "Pass exactly one of lora_path / full_weights "
-                f"(got lora_path={lora_path!r}, full_weights={full_weights!r})."
-            )
+        if lora_path is None and full_weights is None:
+            raise ValueError("Pass lora_path and/or full_weights (got neither).")
+        # full_weights alone : plain full fine-tune checkpoint.
+        # lora_path alone    : LoRA on top of the pretrained `model_dir`.
+        # BOTH               : (1) load full_weights into the plain, unmodified policy,
+        #                      (2) inject LoRALinear wrappers (they keep the loaded base weight/bias),
+        #                      (3) load only the lora_A/lora_B tensors from lora_path.
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
@@ -204,8 +206,10 @@ class Pi0FastServer:
                       f"returning RAW model output. Correct ONLY for a checkpoint trained "
                       f"WITHOUT action normalisation; a normalised checkpoint MUST ship one.",
                       flush=True)
-        else:
+        if lora_path is not None:
             # ── Apply LoRA structure — must exactly match pi0fast_server.py ── #
+            # Runs AFTER the full-weights load above when both are given, so the LoRALinear
+            # wrappers adopt the already-loaded base weight/bias (they reuse linear.weight).
             # Create lora_A/B on the same device as the model weights to avoid
             # mixed CPU/GPU tensors which cause slow dtype conversion later.
             class LoRALinear(nn.Module):
@@ -226,7 +230,17 @@ class Pi0FastServer:
                     return out
 
             t1 = _time.time()
+            # Read the adapter rank from the file itself (lora_A is (rank, in_features)) so the
+            # wrappers always match the checkpoint; alpha = 2*rank, as in pi0fast_server.py.
+            lora_sd = torch.load(lora_path, map_location="cpu")
+            _a = next((v for k, v in lora_sd.items() if k.endswith("lora_A")), None)
+            if _a is not None and int(_a.shape[0]) != lora_rank:
+                print(f"[Pi0FastServer] NOTE: --lora_rank={lora_rank} but the checkpoint has rank "
+                      f"{int(_a.shape[0])}; using the checkpoint's rank.", flush=True)
+                lora_rank = int(_a.shape[0])
             lora_alpha = lora_rank * 2
+            print(f"[Pi0FastServer] LoRA rank {lora_rank}, alpha {lora_alpha} (Q/K/V/O in every LM layer + lm_head)",
+                  flush=True)
             pali = policy.model.paligemma_with_expert.paligemma
 
             for layer in pali.model.language_model.layers:
@@ -241,7 +255,7 @@ class Pi0FastServer:
             # ── Load fine-tuned LoRA weights ──────────────────────────────── #
             t2 = _time.time()
             print(f"[Pi0FastServer] Loading LoRA weights from '{lora_path}' …", flush=True)
-            lora_sd = torch.load(lora_path, map_location=self.device)
+            # (lora_sd was read above to get the rank.)  Copy ONLY into the lora_A / lora_B parameters.
             lora_params = {n: p for n, p in policy.named_parameters() if "lora_" in n}
             loaded, missing = 0, []
             for k, v in lora_sd.items():
@@ -250,9 +264,16 @@ class Pi0FastServer:
                     loaded += 1
                 else:
                     missing.append(k)
-            print(f"[Pi0FastServer] LoRA tensors loaded: {loaded}/{len(lora_sd)} in {_time.time()-t2:.1f}s", flush=True)
+            untouched = [n for n in lora_params if n not in lora_sd]
+            print(f"[Pi0FastServer] LoRA tensors loaded: {loaded}/{len(lora_sd)} "
+                  f"(model has {len(lora_params)} LoRA params) in {_time.time()-t2:.1f}s", flush=True)
             if missing:
-                print(f"[Pi0FastServer] WARNING: missing LoRA keys: {missing[:5]}")
+                print(f"[Pi0FastServer] WARNING: checkpoint LoRA keys with no matching module: {missing[:5]}", flush=True)
+            if untouched:
+                print(f"[Pi0FastServer] WARNING: {len(untouched)} model LoRA params NOT in the checkpoint "
+                      f"(left at init): {untouched[:5]}", flush=True)
+            if full_weights is not None:
+                print(f"[Pi0FastServer] Base = full weights '{full_weights}', + LoRA '{lora_path}'.", flush=True)
 
         t3 = _time.time()
         policy = policy.float()
@@ -544,12 +565,15 @@ def run_server(args):
             return candidate
         raise FileNotFoundError(f"{filename} not found at '{path}'.")
 
-    # Full weights take precedence; the two sources are mutually exclusive.
+    # Either or both: full_weights = base checkpoint, lora_path = adapters applied on top of it
+    # (if only lora_path is given, the adapters go on top of the pretrained --model_dir).
     lora_path = full_weights = None
     if args.full_weights is not None:
         full_weights = _resolve(args.full_weights, "full_weights.pt")
-    else:
+    if args.lora_path is not None:
         lora_path = _resolve(args.lora_path, "lora_weights.pt")
+    elif args.full_weights is None:                       # neither given: legacy LoRA-only default
+        lora_path = _resolve("outputs/pi0fast_finetuned/lora_weights.pt", "lora_weights.pt")
 
     server = Pi0FastServer(
         model_dir    = args.model_dir,
@@ -671,14 +695,15 @@ def parse_args():
     p.add_argument("--model_dir",   type=str,
                    default="physical-intelligence/pi0-fast",
                    help="HuggingFace model ID or local path to base PI0Fast weights")
-    p.add_argument("--lora_path",   type=str,
-                   default="outputs/pi0fast_finetuned/lora_weights.pt",
+    p.add_argument("--lora_path",   type=str, default=None,
                    help="Path to lora_weights.pt (or checkpoint directory containing it). "
-                        "Used only when --full_weights is not given.")
+                        "Alone: adapters on top of --model_dir.  With --full_weights: adapters on top "
+                        "of that full-weights base.  If neither option is given, falls back to "
+                        "outputs/pi0fast_finetuned/lora_weights.pt.")
     p.add_argument("--full_weights", type=str, default=None,
                    help="Path to full_weights.pt from a --full_finetune run (or a checkpoint "
-                        "directory containing it). Loads a full state_dict with NO LoRA "
-                        "adapters; takes precedence over --lora_path.")
+                        "directory containing it). Loaded into the plain policy as the base; add "
+                        "--lora_path to put LoRA adapters on top of it.")
     p.add_argument("--cam1_key",    type=str,
                    default="observation.images.base_0_rgb")
     p.add_argument("--cam2_key",    type=str,
