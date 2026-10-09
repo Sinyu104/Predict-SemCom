@@ -218,6 +218,9 @@ class SemComPipeline:
         st = self.sscc_stats
         st["frames"] += 1; st["symbols"] += info["n_symbols"]; st["tx"] += info["n_tx"]
         st["lost"] += int(not info["ok"]); st["outage"] += int(info["outage"])
+        if not info["ok"] and c.get("kf_on_loss", True):
+            enc.request_keyframe()           # receiver asks for a keyframe on THIS stream after the loss
+            st["kf_req"] = st.get("kf_req", 0) + 1
         return dec.decode(rx), info        # decode(None) keeps the decoder state consistent when the frame was lost
 
     # -- helpers ---------------------------------------------------------- #
@@ -467,7 +470,7 @@ def build_pipeline(args, config, device):
         cfg = dict(codec=args.sscc_codec, gop=args.sscc_gop, fps=args.sscc_fps, kbps=args.sscc_kbps, chroma=args.sscc_chroma,
                    channel=config.get("channel_type", "awgn"), snr_db=config["snr_db"],
                    re_budget=(args.sscc_re_budget or None) if args.sscc_mcs >= 0 else args.sscc_re_budget,
-                   max_tx=args.sscc_max_tx, bler=args.sscc_bler, mcs=(args.sscc_mcs if args.sscc_mcs >= 0 else None),
+                   max_tx=args.sscc_max_tx, bler=args.sscc_bler, kf_on_loss=bool(args.sscc_kf_on_loss), mcs=(args.sscc_mcs if args.sscc_mcs >= 0 else None),
                    cdl_model=args.cdl_model)
         print(f"[SemCom] mode=sscc: {cfg['codec']} CBR {cfg['kbps']} kbps @ {cfg['fps']} fps, GOP {cfg['gop']}, NR link")
         return SemComPipeline(config, None, None, None, device, "sscc", sscc_cfg=cfg)
@@ -973,6 +976,9 @@ def parse_args():
                    help="FIXED NR MCS index 3-28 (default 16): no link adaptation, same REs/frame at every SNR; -1 = adapt by SNR")
     p.add_argument("--sscc_re_budget", type=int, default=0,
                    help="REs per frame; 0 = exactly one transmission (fixed MCS). With --sscc_mcs -1 use e.g. 8000")
+    p.add_argument("--sscc_kf_on_loss", type=int, default=1, choices=[0, 1],
+                   help="1 = after a lost camera frame the next frame of that stream is a keyframe (receiver keyframe "
+                        "request, RTCP PLI/FIR); 0 = no feedback (damage persists until the next scheduled keyframe)")
     p.add_argument("--sscc_max_tx", type=int, default=1, help="HARQ max transmissions (1 = none; extra tx cost extra REs)")
     p.add_argument("--sscc_bler", type=float, default=0.1, help="TS 38.214 CQI rule: BLER target for MCS selection")
     p.add_argument("--num_history", type=int, default=None)
