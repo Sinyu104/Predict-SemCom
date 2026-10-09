@@ -137,7 +137,7 @@ class SemComPipeline:
         # (thr, recv_thr) and the CLI (route_thr, k_calm, k_dist).
         self.sscc_cfg   = sscc_cfg     # traditional streaming SSCC baseline (H.264/H.265 + LDPC + QAM)
         self.sscc_link  = None
-        self.sscc_stats = {"frames": 0, "symbols": 0, "lost": 0, "outage": 0, "tx": 0}
+        self.sscc_stats = {"frames": 0, "symbols": 0, "lost": 0, "outage": 0, "tx": 0, "req": 0, "req_lost": 0}
         if sscc_cfg is not None:
             from baselines.traditional.nr_link import NRLink
             tb = int(round(sscc_cfg["kbps"] * 1000 / sscc_cfg["fps"] / 8))
@@ -204,9 +204,21 @@ class SemComPipeline:
         c = getattr(self, "sscc_cfg", None)
         if c is None:
             return
+        self.sscc_streams = {}          # camera id -> (StreamEncoder, StreamDecoder); created on first use
+
+    def _sscc_frame(self, cam, img):
+        """One camera's frame through its own video stream + the NR link.  Returns (decoded | None, info)."""
         from baselines.traditional.stream_codec import StreamEncoder, StreamDecoder
-        self.sscc_enc = StreamEncoder(c["codec"], gop=c["gop"], fps=c["fps"], kbps=c["kbps"])
-        self.sscc_dec = StreamDecoder(c["codec"], conceal="drift")
+        c = self.sscc_cfg
+        if cam not in self.sscc_streams:
+            self.sscc_streams[cam] = (StreamEncoder(c["codec"], gop=c["gop"], fps=c["fps"], kbps=c["kbps"], chroma=c["chroma"]),
+                                      StreamDecoder(c["codec"], conceal="drift"))
+        enc, dec = self.sscc_streams[cam]
+        rx, info = self.sscc_link.transmit(enc.encode(img))
+        st = self.sscc_stats
+        st["frames"] += 1; st["symbols"] += info["n_symbols"]; st["tx"] += info["n_tx"]
+        st["lost"] += int(not info["ok"]); st["outage"] += int(info["outage"])
+        return dec.decode(rx), info        # decode(None) keeps the decoder state consistent when the frame was lost
 
     # -- helpers ---------------------------------------------------------- #
 
@@ -309,17 +321,21 @@ class SemComPipeline:
             return obs_rgb, t
 
         if self.mode == "sscc":
+            # obs_rgb is one image, or a dict {camera id: image} for a multi-camera policy (e.g. PI0Fast uses 2).
+            # Every camera is its own video stream over the same link; the edge can act only if ALL arrive.
             t0 = time.perf_counter()
-            pkt = self.sscc_enc.encode(obs_rgb)
-            rx, info = self.sscc_link.transmit(pkt)
-            st = self.sscc_stats
-            st["frames"] += 1; st["symbols"] += info["n_symbols"]; st["tx"] += info["n_tx"]
-            st["lost"] += int(not info["ok"]); st["outage"] += int(info["outage"])
+            multi = isinstance(obs_rgb, dict)
+            imgs = obs_rgb if multi else {0: obs_rgb}
+            outs, lost = {}, False
+            for cam, img in imgs.items():
+                y, info = self._sscc_frame(cam, img)
+                outs[cam] = y
+                lost = lost or (not info["ok"])
+            self.sscc_stats["req"] += 1; self.sscc_stats["req_lost"] += int(lost)
             t["sscc"] = time.perf_counter() - t0
-            if rx is None:                       # frame lost: the edge has NO image, so no action can be computed
-                self.sscc_dec.decode(None)       # keep decoder state consistent (references now stale)
+            if lost:                             # a camera frame is missing: the edge has NO complete input, so no action
                 return None, t
-            return self.sscc_dec.decode(rx), t
+            return (outs if multi else outs[0]), t
 
         self.a_hist.append(
             np.asarray(prev_action, dtype=np.float32)
@@ -448,7 +464,7 @@ def build_pipeline(args, config, device):
         return SemComPipeline(config, None, None, None, device, "bypass")
 
     if args.mode == "sscc":
-        cfg = dict(codec=args.sscc_codec, gop=args.sscc_gop, fps=args.sscc_fps, kbps=args.sscc_kbps,
+        cfg = dict(codec=args.sscc_codec, gop=args.sscc_gop, fps=args.sscc_fps, kbps=args.sscc_kbps, chroma=args.sscc_chroma,
                    channel=config.get("channel_type", "awgn"), snr_db=config["snr_db"],
                    re_budget=(args.sscc_re_budget or None) if args.sscc_mcs >= 0 else args.sscc_re_budget,
                    max_tx=args.sscc_max_tx, bler=args.sscc_bler, mcs=(args.sscc_mcs if args.sscc_mcs >= 0 else None),
@@ -623,6 +639,29 @@ class PolicyClient:
             return [0.0] * 7
         return reply["action"]
 
+    def predict_multi(self, imgs: dict, instruction: str, passthrough: dict | None = None):
+        """Multi-camera request ({camera id: image}) for a policy such as PI0Fast.  The policy server reads
+        `images_b64` (cam1 = lowest id).  passthrough = the client's original per-camera JPEGs, forwarded
+        byte-for-byte (bypass mode)."""
+        if passthrough is not None:
+            images_b64 = passthrough
+        else:
+            images_b64 = {}
+            for cam, img in imgs.items():
+                buf = io.BytesIO()
+                Image.fromarray(img).save(buf, format="JPEG", quality=self.jpeg_quality)
+                images_b64[str(cam)] = base64.b64encode(buf.getvalue()).decode("utf-8")
+        self._seq += 1
+        payload = json.dumps({"seq": self._seq, "images_b64": images_b64,
+                              "instruction": instruction, "unnorm_key": "franka_isaac"}).encode()
+        self.sock.sendall(len(payload).to_bytes(4, "big") + payload)
+        n = int.from_bytes(_recv_all(self.sock, 4), "big")
+        reply = json.loads(_recv_all(self.sock, n))
+        if reply.get("status") != "ok":
+            print(f"[SemCom] policy error: {reply.get('message')}", flush=True)
+            return [0.0] * 7
+        return reply["action"]
+
 
 def run_server(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -740,10 +779,19 @@ def run_server(args):
                     print(f"[SemCom] disturbance @ ep{ep} seq{seq}", flush=True)
 
                 try:
-                    obs_rgb = np.array(
-                        Image.open(io.BytesIO(base64.b64decode(data["jpeg_b64"]))).convert("RGB"),
-                        dtype=np.uint8,
-                    )
+                    def _dec(b64):
+                        return np.array(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"), dtype=np.uint8)
+                    imgs_b64 = data.get("images_b64") or {}
+                    obs_multi = None
+                    if len(imgs_b64) > 1 and args.mode in ("sscc", "bypass"):
+                        # multi-camera client (e.g. PI0Fast: cameras "1" and "2")
+                        ids = sorted(imgs_b64, key=lambda k: int(k))
+                        obs_multi = {k: _dec(imgs_b64[k]) for k in ids}
+                        obs_rgb = obs_multi[ids[0]]
+                    elif "jpeg_b64" in data:
+                        obs_rgb = _dec(data["jpeg_b64"])
+                    else:                                     # single camera sent only as images_b64
+                        obs_rgb = _dec(next(iter(imgs_b64.values())))
                 except Exception as e:
                     _send(conn, {"seq": seq, "action": [0.0] * 7,
                                  "status": "error", "message": str(e)})
@@ -752,23 +800,29 @@ def run_server(args):
                 instr = data.get("instruction", args.instruction)
 
                 t0 = time.perf_counter()
-                x_tilde, timings = pipeline.step(obs_rgb, prev_act)
+                x_tilde, timings = pipeline.step(obs_multi if obs_multi else obs_rgb, prev_act)
                 if x_tilde is None:              # SSCC frame lost -> reply with an error; the client applies zero action
                     _send(conn, {"seq": seq, "action": [0.0] * 7, "status": "error", "message": "frame lost on the channel"})
                     prev_act = None; n_reqs += 1
                     if n_reqs % 20 == 0:
                         st = pipeline.sscc_stats
                         print(f"[SemCom] SSCC: {st['symbols'] / max(st['frames'], 1):.0f} REs/frame, "
-                              f"{100 * st['lost'] / max(st['frames'], 1):.1f}% lost "
+                              f"{100 * st['lost'] / max(st['frames'], 1):.1f}% frames lost, {100 * st['req_lost'] / max(st['req'], 1):.1f}% requests lost "
                               f"({100 * st['outage'] / max(st['frames'], 1):.1f}% outage), "
                               f"{st['tx'] / max(st['frames'] - st['outage'], 1):.2f} tx/frame", flush=True)
                     continue
                 # In bypass the frame is untouched, so forward the client's own
                 # bytes and keep the control bit-exact with the 2-process path.
-                action = policy.predict(
-                    x_tilde, instr,
-                    passthrough_b64=data["jpeg_b64"] if args.mode == "bypass" else None,
-                )
+                if obs_multi:
+                    action = policy.predict_multi(
+                        x_tilde, instr,
+                        passthrough=imgs_b64 if args.mode == "bypass" else None)
+                    x_tilde = x_tilde[next(iter(x_tilde))]   # first camera, for the dump / debug lines below
+                else:
+                    action = policy.predict(
+                        x_tilde, instr,
+                        passthrough_b64=data["jpeg_b64"] if args.mode == "bypass" else None,
+                    )
                 prev_act = action
                 ms = (time.perf_counter() - t0) * 1000
 
@@ -810,19 +864,21 @@ def run_server(args):
                           f"-> x~ mean={np.asarray(x_tilde).mean():.1f}", flush=True)
                     print(f"[DEBUG] instruction: {instr!r}", flush=True)
                 if n_reqs < 3:
-                    print(f"[DEBUG] action = [{', '.join(f'{v:+.4f}' for v in action)}]",
-                          flush=True)
+                    a0 = action[0] if (len(action) and isinstance(action[0], (list, tuple))) else action   # chunk -> first step
+                    print(f"[DEBUG] action{' (chunk of %d, first step)' % len(action) if a0 is not action else ''} = "
+                          f"[{', '.join(f'{v:+.4f}' for v in a0)}]", flush=True)
 
                 n_reqs   += 1
                 total_ms += ms
 
                 _send(conn, {"seq": seq, "action": action,
-                             "exec_horizon": 1, "status": "ok"})
+                             "exec_horizon": (len(action) if (len(action) and isinstance(action[0], (list, tuple))) else 1),
+                             "status": "ok"})
 
                 if args.mode == "sscc" and n_reqs % 20 == 0:
                     st = pipeline.sscc_stats
                     print(f"[SemCom] SSCC: {st['symbols'] / max(st['frames'], 1):.0f} REs/frame, "
-                          f"{100 * st['lost'] / max(st['frames'], 1):.1f}% lost "
+                          f"{100 * st['lost'] / max(st['frames'], 1):.1f}% frames lost, {100 * st['req_lost'] / max(st['req'], 1):.1f}% requests lost "
                           f"({100 * st['outage'] / max(st['frames'], 1):.1f}% outage), "
                           f"{st['tx'] / max(st['frames'] - st['outage'], 1):.2f} tx/frame", flush=True)
 
@@ -908,7 +964,9 @@ def parse_args():
     p.add_argument("--disagree_gate", action="store_true",
                    help="Legacy refiner checkpoints only: gate_proj head (z_tilde = z_hat + g*delta).")
     p.add_argument("--sscc_codec", default="h264", choices=["h264", "h265"])
-    p.add_argument("--sscc_kbps", type=float, default=300.0, help="CBR video bitrate (typical low-res streaming)")
+    p.add_argument("--sscc_chroma", default="444", choices=["444", "420"],
+                   help="chroma format; 4:2:0 smears small coloured objects (the cube), 4:4:4 keeps colour")
+    p.add_argument("--sscc_kbps", type=float, default=800.0, help="CBR video bitrate (typical low-res streaming)")
     p.add_argument("--sscc_fps", type=int, default=10, help="control / frame rate")
     p.add_argument("--sscc_gop", type=int, default=10, help="keyframe interval in frames")
     p.add_argument("--sscc_mcs", type=int, default=16,
