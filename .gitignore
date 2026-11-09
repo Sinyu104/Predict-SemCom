@@ -19,6 +19,7 @@ outputs/
 data
 data/*.hdf5
 data/*.h5
+results/
 
 # Logs
 runs/
@@ -41,3 +42,11 @@ Thumbs.db
 
 .claude
 CLAUDE.md
+
+# Local-only: docs, figures, diagnostic scripts
+docs/
+figures/
+experiments/val_*.py
+experiments/probe_*.py
+experiments/diag_*.py
+experiments/viz_*.py

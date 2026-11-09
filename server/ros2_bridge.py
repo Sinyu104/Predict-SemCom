@@ -75,6 +75,7 @@ def main():
             return
 
         seq     = data.get("seq", 0)
+        node.get_logger().info(f"seq={seq}  received ({len(msg.data) // 1024} KiB)")
         payload = json.dumps(data).encode()
 
         try:
@@ -87,6 +88,8 @@ def main():
             response = {"seq": seq, "action": [[0.0] * 7],
                         "status": "error", "message": str(e)}
 
+        if data.get("type") == "between":         # in-between frame of the running chunk: stored by the server, no reply to the client
+            return
         reply      = String()
         reply.data = json.dumps(response)
         pub.publish(reply)

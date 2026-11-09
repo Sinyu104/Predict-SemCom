@@ -155,6 +155,7 @@ class CtrlWorldWrapper(nn.Module):
         freeze_unet:         bool  = True,
         finetune_cross_attn: bool  = False,
         full_finetune:       bool  = False,
+        extra_unfreeze:      tuple = (),
         dtype:               torch.dtype = torch.float16,
     ):
         super().__init__()
@@ -166,6 +167,7 @@ class CtrlWorldWrapper(nn.Module):
         self.motion_bucket = motion_bucket
         self._dtype        = dtype
         self.full_finetune = full_finetune
+        self.extra_unfreeze = tuple(extra_unfreeze)
 
         # For full fine-tuning we store the UNet master weights in fp32 (so
         # GradScaler.unscale_ and AdamW updates are stable); autocast still casts
@@ -224,6 +226,13 @@ class CtrlWorldWrapper(nn.Module):
         if finetune_cross_attn:
             n = self._unfreeze_cross_attn()
             print(f"[CtrlWorldWrapper] UNet cross-attn (attn2) unfrozen: {n/1e6:.2f}M extra trainable params.")
+
+        # ── Optionally unfreeze more of the UNet (regex on parameter names, attn2 excluded) ─
+        self._extra_names = []
+        if self.extra_unfreeze and not full_finetune:
+            n = self._unfreeze_extra(self.extra_unfreeze)
+            print(f"[CtrlWorldWrapper] extra UNet params unfrozen {self.extra_unfreeze}: {n/1e6:.2f}M "
+                  f"in {len(self._extra_names)} tensors.")
 
         # ── Load CTRL-WORLD checkpoint (Action_encoder2 weights) ──────────
         if ctrl_ckpt is not None:
@@ -303,9 +312,19 @@ class CtrlWorldWrapper(nn.Module):
         z_history: torch.Tensor,
         action:    torch.Tensor,
         n_steps:   int = 10,
+        init_scale: bool = False,
+        guidance:  float = 1.0,
     ) -> torch.Tensor:
         """
         Predict future latent frames from history + action.
+
+        init_scale : multiply the starting noise by scheduler.init_noise_sigma, as the SVD /
+                     CTRL-WORLD pipelines do.  Default False keeps the historical behaviour
+                     (unit-variance start), which makes the sample nearly independent of the
+                     seed (the net sees ~no noise at the first step).
+        guidance   : classifier-free guidance on the action conditioning (training drops the
+                     action 5% of the time, as zeros).  1.0 = off; >1 pushes the sample to
+                     follow the actions more strongly (costs a second UNet pass per step).
 
         Matches CtrlWorldDiffusionPipeline from the CTRL-WORLD paper:
         - Future frames start from pure Gaussian noise
@@ -326,6 +345,9 @@ class CtrlWorldWrapper(nn.Module):
 
         # Pure Gaussian noise for future frames (B, T_p, 4, H, W)
         x_future = torch.randn(B, T_p, C, H, W, device=device, dtype=dtype)
+        if init_scale:
+            self.scheduler.set_timesteps(n_steps, device=device)
+            x_future = x_future * self.scheduler.init_noise_sigma
 
         # Condition latent: last history frame (clean, no noise at inference)
         # repeated across all T_tot frames, scaled by 1/vae_scale
@@ -352,6 +374,11 @@ class CtrlWorldWrapper(nn.Module):
             with torch.autocast(device_type="cuda", dtype=dtype):
                 model_out = self._unet_forward(input_lats, t, action_hidden, B)
 
+            if guidance != 1.0:
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    model_unc = self._unet_forward(input_lats, t, torch.zeros_like(action_hidden), B)
+                model_out = model_unc + guidance * (model_out - model_unc)
+
             # Discard history output, keep only future predictions
             noise_pred = model_out[:, T_h:].to(dtype)  # (B, T_p, 4, H, W)
 
@@ -368,6 +395,7 @@ class CtrlWorldWrapper(nn.Module):
         self,
         z_clip: torch.Tensor,
         a_clip: torch.Tensor,
+        future_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         EDM training objective matching CTRL-WORLD CrtlWorld.forward().
@@ -438,8 +466,11 @@ class CtrlWorldWrapper(nn.Module):
         # ── x0 prediction and weighted loss on future frames only ─────────
         predict_x0 = c_out * model_pred + c_skip * noisy_latents    # (B, T_tot, 4, H, W)
         z_future   = latents[:, T_h:]                               # (B, T_p, 4, H, W)
-        loss = ((predict_x0[:, T_h:] - z_future) ** 2 * loss_weight).mean()
-        return loss
+        err = (predict_x0[:, T_h:] - z_future) ** 2 * loss_weight
+        if future_weights is not None:      # (num_pred,) per-future-frame weights
+            w = future_weights.to(err.device).view(1, -1, 1, 1, 1)
+            return (err * w).sum() / (w.sum() * B * C * H * W)
+        return err.mean()
 
     # ------------------------------------------------------------------ #
     #  Convenience                                                         #
@@ -460,6 +491,34 @@ class CtrlWorldWrapper(nn.Module):
                     p.requires_grad_(True)
                     n += p.numel()
         return n
+
+    def _unfreeze_extra(self, patterns) -> int:
+        """Unfreeze every UNet parameter whose name matches one of the regexes (fp32 master copy)."""
+        import re
+        rx = [re.compile(q) for q in patterns]
+        n = 0
+        for name, p in self.unet.named_parameters():
+            if ".attn2." in name or p.requires_grad:
+                continue
+            if any(r.search(name) for r in rx):
+                p.data = p.data.float(); p.requires_grad_(True)
+                self._extra_names.append(name); n += p.numel()
+        return n
+
+    def extra_parameters(self):
+        d = dict(self.unet.named_parameters())
+        for name in self._extra_names:
+            yield d[name]
+
+    def unet_extra_state_dict(self) -> dict:
+        d = dict(self.unet.named_parameters())
+        return {n: d[n].detach().cpu() for n in self._extra_names}
+
+    def load_unet_extra_state_dict(self, state: dict):
+        d = dict(self.unet.named_parameters())
+        for n, v in state.items():
+            if n in d and d[n].requires_grad:
+                d[n].data.copy_(v.to(d[n].device, dtype=d[n].dtype))
 
     def cross_attn_parameters(self):
         """Yield deduplicated parameters of UNet attn2 (cross-attention) layers."""
@@ -508,6 +567,7 @@ class CtrlWorldWrapper(nn.Module):
             yield from self.unet.parameters()
         elif self.finetune_cross_attn:
             yield from self.cross_attn_parameters()
+        yield from self.extra_parameters()
 
     def num_trainable_params(self) -> int:
         return sum(p.numel() for p in self.trainable_parameters())

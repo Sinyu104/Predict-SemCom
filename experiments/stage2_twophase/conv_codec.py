@@ -72,12 +72,13 @@ class ConvWZCodec(nn.Module):
     project_adaptive_rate_conv / project_jscc_codec_overfits.
     """
 
-    def __init__(self, C_vae: int = 4, W: int = 96, Dch: int = 16, nb: int = 3):
+    def __init__(self, C_vae: int = 4, W: int = 96, Dch: int = 16, nb: int = 3, residual: bool = False, mask_cond: bool = False, snr_cond: bool = False):
         super().__init__()
-        self.Dch = Dch
+        self.Dch = Dch; self.residual = residual; self.mask_cond = mask_cond; self.snr_cond = snr_cond
         self.enc_body, self.enc_mu, self.enc_lv = _conv_trunk(C_vae, W, Dch, nb)
         self.pri_body, self.pri_mu, self.pri_lv = _conv_trunk(C_vae, W, Dch, nb)
-        dec = [nn.Conv2d(Dch, W, 3, 1, 1), nn.GELU()] + [_Res(W) for _ in range(nb)] + [nn.Conv2d(W, C_vae, 3, 1, 1)]
+        # residual=True: the decoder also sees z_hat and predicts a correction, rec = z_hat + dec([s~, z_hat])  (receiver-side, WZ-legal)
+        dec = [nn.Conv2d(Dch + (C_vae if residual else 0) + (1 if mask_cond else 0) + (1 if snr_cond else 0), W, 3, 1, 1), nn.GELU()] + [_Res(W) for _ in range(nb)] + [nn.Conv2d(W, C_vae, 3, 1, 1)]
         self.dec = nn.Sequential(*dec)
 
     def encode(self, x):
@@ -95,5 +96,22 @@ class ConvWZCodec(nn.Module):
         p_var = lv_p.exp().clamp(min=1e-8)
         return 0.5 * (p_var.log() - q_var.log() + (q_var + (mu_e - mu_p).pow(2)) / p_var - 1.0)
 
-    def decode(self, s):
-        return self.dec(s)
+    def decode(self, s, z_hat=None, m=None, snr_db=None):
+        """mask_cond: the decoder also sees the change mask m (known at the receiver as side info), so the code need not carry WHERE the active cells are.
+        snr_cond: the decoder also sees the channel SNR (receiver CSI) as a constant map snr_db/20, so it can learn how far to trust s~ vs z_hat."""
+        x = [s] + ([z_hat] if self.residual else []) + ([m] if self.mask_cond else []) + ([torch.full_like(s[:, :1], snr_db / 20.0)] if self.snr_cond else [])
+        x = torch.cat(x, 1) if len(x) > 1 else s
+        return z_hat + self.dec(x) if self.residual else self.dec(x)
+
+
+
+class MaskNet(nn.Module):
+    """Transmitter-side mask predictor: z_t -> p(cell is one z_hat gets wrong).  Trained against o = 1[|z_t - z_hat|^2 > thr] (z_hat only at
+    training time); at inference m_hat = 1[p > tau] needs only z_t."""
+
+    def __init__(self, C_vae: int = 4, W: int = 64, nb: int = 3):
+        super().__init__()
+        self.f = nn.Sequential(nn.Conv2d(C_vae, W, 3, 1, 1), nn.GELU(), *[_Res(W) for _ in range(nb)], nn.Conv2d(W, 1, 1))
+
+    def forward(self, z):
+        return self.f(z)                                   # logits (B,1,H,W)

@@ -148,6 +148,13 @@ class Pi0FastServer:
         # to a full-finetune checkpoint. None → the model was trained on raw
         # actions and predict() returns them as-is.
         self.action_low = self.action_high = None
+        # Per-dim state normalisation stats + 256-bin discretiser, from the same
+        # norm_stats.json. uses_state True → the checkpoint conditions on the real
+        # joint state and predict() discretises it into the prompt; None/False →
+        # fall back to the constant midpoint bin 128 (the zero-state training path).
+        self.state_low = self.state_high = None
+        self.uses_state = False
+        self._warned_missing_state = False
 
         import time as _time
         print(f"[Pi0FastServer] Loading base model from '{model_dir}' …", flush=True)
@@ -199,6 +206,13 @@ class Pi0FastServer:
                     st = json.load(sf)
                 self.action_low  = np.asarray(st["action_low"],  dtype=np.float32)
                 self.action_high = np.asarray(st["action_high"], dtype=np.float32)
+                if st.get("uses_state") and "state_low" in st and "state_high" in st:
+                    self.state_low  = np.asarray(st["state_low"],  dtype=np.float32)
+                    self.state_high = np.asarray(st["state_high"], dtype=np.float32)
+                    self.uses_state = True
+                    print(f"[Pi0FastServer] state conditioning ENABLED ({len(self.state_low)} dims) "
+                          f"— real joint state (degrees) will be discretised into 256 bins per the "
+                          f"checkpoint stats. The client MUST send a 'state' field.", flush=True)
                 print(f"[Pi0FastServer] norm_stats.json loaded ({len(self.action_low)} dims) — "
                       f"actions will be denormalised from [-1,1].", flush=True)
             else:
@@ -298,9 +312,37 @@ class Pi0FastServer:
               f"(config/detok dim={cfg_dim}). Model ready.\n")
         self._debug_first_call = True
 
-    def _build_language_tokens(self, instruction: str):
+    def _discretize_state(self, state):
+        """Real joint degrees → 256-bin indices, EXACTLY matching the Narval
+        training code (pi0fast_server.py discretize_state, --use_state):
+
+            n   = clip(2*(s - lo)/(hi - lo) - 1, -1, 1)
+            bin = digitize(n, linspace(-1, 1, 257)[:-1]) - 1
+
+        Clipping on the normalised value == clipping raw s to [lo, hi]; a live
+        state outside the training range saturates to bin 0 or 255. Uses the
+        checkpoint's state_low/high verbatim — never recomputed. The digitize
+        form (not round(n*255)) is used deliberately: the two differ by up to
+        one bin, and this matches lerobot's / the training discretiser exactly.
+        """
+        s     = np.asarray(state, dtype=np.float32)
+        n     = np.clip(2.0 * (s - self.state_low) / (self.state_high - self.state_low) - 1.0,
+                        -1.0, 1.0)
+        edges = np.linspace(-1.0, 1.0, 256 + 1)[:-1]
+        return (np.digitize(n, bins=edges) - 1).astype(int)
+
+    def _build_language_tokens(self, instruction: str, state=None):
         import torch
-        disc      = np.full(self.state_dim, 128, dtype=int)
+        if self.uses_state and state is not None and len(state) == self.state_dim:
+            disc = self._discretize_state(state)
+        else:
+            if self.uses_state and not self._warned_missing_state:
+                self._warned_missing_state = True
+                print("[Pi0FastServer] WARNING: checkpoint is state-conditioned but the request "
+                      "carried no usable 'state' — falling back to constant bin 128. Actions will "
+                      "be DEGRADED until the client sends a 6-dim 'state' (joint degrees).",
+                      flush=True)
+            disc = np.full(self.state_dim, 128, dtype=int)
         state_str = " ".join(map(str, disc))
         cleaned   = instruction.strip().replace("_", " ").replace("\n", " ")
         prompt    = f"Task: {cleaned}, State: {state_str};\n"
@@ -316,6 +358,7 @@ class Pi0FastServer:
         obs_rgb:       np.ndarray,
         instruction:   str,
         obs_rgb_wrist: np.ndarray | None = None,
+        state:         list | None = None,
     ) -> list:
         """
         Run PI0Fast inference and return a full action chunk.
@@ -341,7 +384,7 @@ class Pi0FastServer:
 
         cam1_t = to_tensor(obs_rgb)
         cam2_t = to_tensor(obs_rgb_wrist if obs_rgb_wrist is not None else obs_rgb)
-        lang_ids, lang_mask = self._build_language_tokens(instruction)
+        lang_ids, lang_mask = self._build_language_tokens(instruction, state)
 
         batch = {
             self.cam1_key:                         cam1_t,
@@ -654,9 +697,27 @@ def run_server(args):
                     continue
 
                 instruction = data.get("instruction", args.instruction)
+                # Real joint state (degrees) for state-conditioned checkpoints.
+                # Accept a few field names so the client wording can vary; None
+                # → predict() falls back to the constant midpoint bin 128.
+                state = (data.get("state")
+                         or data.get("observation.state")
+                         or data.get("qpos")
+                         or data.get("joint_positions"))
+
+                # Per-request diagnostic: does the client send state, and are the
+                # camera frames actually changing? Identical means across many
+                # requests ⇒ a static/cached frame; state=None ⇒ bin-128 fallback.
+                try:
+                    _sm = [round(float(v), 2) for v in state] if state is not None else None
+                    _m1 = round(float(obs_rgb.mean()), 3)
+                    _m2 = round(float(obs_rgb_wrist.mean()), 3) if obs_rgb_wrist is not None else None
+                    print(f"[DIAG-req] seq={seq} state={_sm} cam1_mean={_m1} cam2_mean={_m2}", flush=True)
+                except Exception as _e:
+                    print(f"[DIAG-req] seq={seq} diag-failed: {_e}", flush=True)
 
                 t0           = time.perf_counter()
-                action_chunk = server.predict(obs_rgb, instruction, obs_rgb_wrist)
+                action_chunk = server.predict(obs_rgb, instruction, obs_rgb_wrist, state)
                 ms           = (time.perf_counter() - t0) * 1000
 
                 n_requests += 1
@@ -673,10 +734,27 @@ def run_server(args):
                     )
 
     try:
-        # Accept connections in a loop — reconnects if bridge restarts
+        # Accept connections in a loop — reconnects if a client restarts.
         while True:
             conn, addr = sock.accept()
-            handle_connection(conn, addr)
+            try:
+                handle_connection(conn, addr)
+            except (ConnectionResetError, ConnectionAbortedError,
+                    BrokenPipeError, OSError) as e:
+                # A client that resets/aborts mid-request (Ctrl-C, end of an
+                # episode run) sends a TCP reset rather than a clean close.
+                # That must NOT take down the server — log and keep accepting
+                # so the next run can connect without a restart.
+                print(f"[Pi0FastServer] Connection from {addr} dropped "
+                      f"({type(e).__name__}: {e}); ready for the next client.",
+                      flush=True)
+            except Exception as e:
+                # Any other per-connection failure is contained the same way:
+                # one bad request can never kill the long-lived server.
+                import traceback
+                print(f"[Pi0FastServer] Unexpected error on connection {addr}: {e}",
+                      flush=True)
+                traceback.print_exc()
 
     except KeyboardInterrupt:
         print(f"\n[Pi0FastServer] Shutting down after {n_requests} requests.")

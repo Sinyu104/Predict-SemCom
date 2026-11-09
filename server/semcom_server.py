@@ -53,6 +53,20 @@ Modes (--mode), in increasing order of what is exercised:
                 filled from the prior mu_p(z_hat), so the composite falls back to
                 z_hat wherever it agrees.  The control for "did the channel help?".
     full        the complete pipeline (adaptive k routed by the change-cell count).
+    wz2cam      TWO-CAMERA chunk-30 pipeline for PI0Fast (one request per 30-step action chunk):
+                2-cam Ctrl-World (base|wrist latents concatenated along width, 4x28x56) predicts the
+                6 frames of the next chunk from the previous chunk's output slots and the actions the
+                policy just returned; one joint conv WZ codec sends the first --k_fixed channels of
+                z_t*m over the channel (change mask vs the previous true latent), the receiver fills
+                the rest with the prior mean and composites; both views go to the policy.  The first
+                request of an episode is an uncoded anchor.  Needs --stage1_ckpt (2-cam) and a joint
+                --stage2_ckpt (train_masked_alloc_wz.py --cam 0).
+
+    dvst        BASELINE: DVST (baselines/dvst, Wang et al. JSAC 2023) on the same two-camera latents.  No
+                Ctrl-World: the side information is the previous reconstructed frame.  Tx keeps a noise-free
+                simulation of the receiver (its context), Rx keeps the actually-received reconstruction; the
+                entropy model sets the per-cell channel use.  First request of an episode is intra-coded.
+                Needs only --dvst_ckpt (train baselines/dvst/train.py on a 2-cam chunk-30 cache for PI0Fast).
 
 Build up one mode at a time: each has a predictable expected result, so a
 surprise localises immediately instead of being lost in the whole stack.
@@ -123,7 +137,7 @@ class SemComPipeline:
     """
 
     def __init__(self, config, vae, ctrl_world, system, device, mode,
-                 codec=None, wz_channel=None, wz_params=None, sscc_cfg=None):
+                 codec=None, wz_channel=None, wz_params=None, sscc_cfg=None, dvst=None):
         self.cfg        = config
         self.vae        = vae
         self.ctrl_world = ctrl_world
@@ -150,14 +164,27 @@ class SemComPipeline:
                   f"{self.sscc_link.re_budget} RE/frame, HARQ<= {sscc_cfg['max_tx']} tx"
                   f"{' (fixed MCS: same REs at every SNR)' if sscc_cfg['mcs'] is not None else ''}", flush=True)
         self.codec      = codec
+        self.dvst       = dvst        # baselines.dvst.model.DVST (mode dvst)
+        self.dvst_gop   = 0           # >0: every dvst_gop-th request of an episode is intra-coded (GOP); 1 = all intra
         self.wz_channel = wz_channel
         self.wz_thr = self.wz_recv_thr = self.route_thr = self.k_calm = self.k_dist = None
+        self.k_fixed = 2
         if wz_params is not None:
             self.wz_thr      = wz_params["thr"]
             self.wz_recv_thr = wz_params["recv_thr"]
             self.route_thr   = wz_params["route_thr"]
             self.k_calm      = wz_params["k_calm"]
             self.k_dist      = wz_params["k_dist"]
+            self.k_fixed     = wz_params.get("k_fixed", 2)
+        # learned transmitter-side change mask (MaskNet on z_t only) when the codec was trained with --mask_mode net
+        self.mask_net = self.mask_tau = None
+        # --mask_mode none + residual codec: encode the full z_t, z~ = z_hat + dec([s~, z_hat]) (no mask, no gate)
+        self.wz_nomask = wz_params is not None and wz_params.get("mask_mode") == "none"
+        if wz_params is not None and wz_params.get("mask_mode") == "net":
+            from conv_codec import MaskNet
+            _mk = torch.load(wz_params["mask_ckpt"], map_location=device)
+            self.mask_net = MaskNet().to(device).eval(); self.mask_net.load_state_dict(_mk["net"]); self.mask_tau = _mk["tau"]
+            print(f"[SemCom] learned change mask {wz_params['mask_ckpt']} tau={self.mask_tau:.4f} (replaces |z_t - z_prev|^2 > thr)", flush=True)
 
         self.num_history = config["num_history"]
         self.num_pred    = config["num_pred"]
@@ -179,6 +206,7 @@ class SemComPipeline:
         # Frames the strided window reaches back over.
         self.span = (self.num_history - 1) * self.stride + 1
 
+        self.pose_meta = None     # set (dict: mean, std, scale) when the Stage-1 checkpoint is the pose-only predictor
         self.episode = None
         self.reset()
 
@@ -198,6 +226,21 @@ class SemComPipeline:
         self.last_zhat = None     # last Ctrl-World prediction latent (for the 3-panel dump)
         self._sscc_reset()
         self.z_prev_true = None   # previous TRUE latent z_{t-1} (transmitter, WZ-clean) for the change mask
+        # wz2cam (chunk-30, two-camera) state
+        self.w_n = 0              # requests handled this episode (0 = next one is the anchor)
+        self.w_H = None           # (6,4,28,56) output slots of the previous chunk = history of the next prediction
+        self.w_astream = []       # every executed action, one per control step (the policy's returned chunks)
+        self.last_actions = np.zeros((0, 7), dtype=np.float32)
+        self.w_pstream = []       # pose-conditioned predictor: robot pose (ee xyz + 9 joints) at every control step index, index 0 = anchor frame
+        self.w_pose_in = None     # the 'pose' rows of the request being handled (set by the main loop)
+        self.w_between_store = {}  # step -> {cam: frame}, streamed by the client during chunk 0
+        self.w_between = None     # in-between frames of the chunk just executed (request 1 only), see main loop
+        self.w_zprev = None       # previous request's TRUE latent (transmitter side)
+        # dvst state: (latent, decoded semantic map) of the previous frame, one pair per side
+        self.d_tx = None          # transmitter's noise-free simulation of the receiver
+        self.d_rx = None          # receiver's actual (channel-corrupted) reconstruction
+        self.d_stats = {}
+        self.d_n = 0              # requests handled this episode (GOP counter)
 
     def _sscc_reset(self):
         """New episode -> fresh streaming encoder/decoder (first frame is a keyframe)."""
@@ -315,6 +358,196 @@ class SemComPipeline:
         g = m * (((rec - z_hat) ** 2).mean(1, keepdim=True) > self.wz_recv_thr).float()
         return g * rec + (1.0 - g) * z_hat
 
+    # -- two-camera chunk-30 pipeline (PI0Fast) --------------------------- #
+
+    WZ_CHUNK, WZ_PS, WZ_K = 30, 5, 6      # chunk length, spacing of the generated slots, slots per chunk
+
+    @torch.no_grad()
+    def _step_wz2cam(self, obs, prev_action):
+        """One request = one 30-step chunk boundary.  `obs` = {camera id: image}; returns {camera id: image}.
+
+        Mirrors experiments/decode_arms_wz_chunk30_2cam.py, but closed loop: the history is the previous
+        chunk's output slots (5 predicted frames + the reconstructed boundary frame), not true latents.
+        """
+        t = {}
+        if not isinstance(obs, dict) or len(obs) != 2:
+            raise ValueError("mode wz2cam needs two cameras (images_b64 with 2 entries)")
+        ids = sorted(obs, key=lambda k: int(k))
+        C, PS, K = self.WZ_CHUNK, self.WZ_PS, self.WZ_K
+
+        # actions the policy returned for the chunk just executed (one per control step)
+        if prev_action is not None:
+            pa = np.array(prev_action, dtype=np.float32)            # copy
+            pa = pa if pa.ndim == 2 else pa[None]
+            pa[:, 3:6] = 0.0                                          # client zeroes the rotation dims (vla_runner.py:275)
+            pa[:, 6] = np.where(pa[:, 6] > 0, 1.0, -1.0)              # client treats the gripper as a sign test; demos are +-1
+            self.last_actions = pa.copy()
+            self.w_astream.extend(pa)
+
+        if self.pose_meta is not None:
+            rows = self.w_pose_in
+            if rows is None or rows.ndim != 2 or rows.shape[1] != 12:
+                raise RuntimeError("pose-conditioned predictor: the request needs 'pose' = rows of 12 floats [ee_xyz, 9 joints] "
+                                   f"(got {None if rows is None else rows.shape})")
+            if self.w_n == 0:
+                self.w_pstream = [rows[-1]]                                     # anchor: pose at step index 0
+            else:
+                if len(rows) < C:
+                    raise RuntimeError(f"pose rows for a chunk request must cover the {C} executed steps, got {len(rows)}")
+                self.w_pstream.extend(rows[-C:])                                # indices C*(n-1)+1 .. C*n; the last row belongs to this image
+            z = (rows - self.pose_meta["mean"]) / self.pose_meta["std"]
+            if np.abs(z).max() > 6.0:
+                print(f"[SemCom] WARNING: pose outside 6 sigma of the training range (max |z|={np.abs(z).max():.1f}); units / frame / joint order?", flush=True)
+        t0 = time.perf_counter()
+        zt = torch.cat([self.vae.encode(self._to_tensor(obs[k])) for k in ids], dim=-1)    # (1,4,28,56)
+        t["vae_enc"] = time.perf_counter() - t0
+        n = self.w_n
+
+        def render(z):
+            return {ids[0]: self._to_uint8(self.vae.decode(z[..., :28])),
+                    ids[1]: self._to_uint8(self.vae.decode(z[..., 28:]))}
+
+        if n == 0:                                   # anchor: sent uncoded, seeds the history
+            self.w_H = zt[0].unsqueeze(0).repeat(K, 1, 1, 1)
+            self.w_zprev = zt; self.w_n = 1; self.last_zhat = None
+            self.wz_dbg = {"zt": zt[0].half().cpu().numpy()}
+            t["anchor"] = True
+            return render(zt), t
+
+        if n == 1 and getattr(self, "w_between", None):
+            # request 1 with the in-between frames of chunk 0: history = TRUE frames at steps 5,10,..,25,30 (stride 5, ending at
+            # the boundary frame).  This request is uncoded (like the anchor); the first prediction is request 2, from clean history.
+            bt = self.w_between
+            if len(bt) == 2 and all(len(bt[k]) == PS for k in ids):
+                zb = [torch.cat([self.vae.encode(self._to_tensor(bt[k][i])) for k in ids], dim=-1) for i in range(PS)]
+                self.w_H = torch.cat(zb + [zt], dim=0)                 # (6,4,28,56): steps 5,10,15,20,25,30
+                self.w_zprev = zt; self.w_n = 2; self.last_zhat = None
+                self.wz_dbg = {"zt": zt[0].half().cpu().numpy()}
+                t["warm_start"] = True
+                return render(zt), t
+            print(f"[SemCom] WARNING: between_b64 needs 5 frames per camera ({ {k: len(v) for k, v in bt.items()} }); falling back to the repeated-anchor history", flush=True)
+
+        if getattr(self, "oracle_history", False) and n >= 2:
+            # history = true frames at steps 30(n-2)+5..+25 (streamed in-between frames) + the true boundary frame of request n-1
+            steps = [C * (n - 2) + PS * i for i in range(1, K)]
+            st = self.w_between_store
+            if all(q in st for q in steps):
+                zb = [torch.cat([self.vae.encode(self._to_tensor(st[q][k])) for k in ids], dim=-1) for q in steps]
+                self.w_H = torch.cat(zb + [self.w_zprev], dim=0)
+                t["oracle_hist"] = True
+            else:
+                print(f"[SemCom] WARNING: oracle history missing steps {[q for q in steps if q not in st]} at request {n}; using the loop history", flush=True)
+
+        # -- side information: predict this boundary frame from the previous chunk --------- #
+        t0 = time.perf_counter()
+        A = self.w_astream
+        base = C * (n - 1)                           # frame index of the last history slot (= t-1)
+        if self.pose_meta is None and len(A) < base + 1:
+            raise RuntimeError(f"action stream too short ({len(A)} < {base + 1}); did the robot execute the whole chunk?")
+        if self.pose_meta is not None:
+            # same indexing as experiments/precompute_pose_rollout.py: history = frames base-5i (i=0..5, oldest first), future slots = base+5j (j=1..6, last = this frame)
+            P = np.stack(self.w_pstream)
+            if len(P) < base + C + 1:
+                raise RuntimeError(f"pose stream too short ({len(P)} < {base + C + 1})")
+            idx = [max(0, base - PS * i) for i in range(self.num_history)][::-1] + [base + PS * j for j in range(1, K + 1)]
+            pe = np.concatenate([(P[idx] - self.pose_meta["mean"]) / self.pose_meta["std"] * self.pose_meta["scale"], np.ones((len(idx), 1), np.float32)], 1)
+            ac = torch.from_numpy(pe.astype(np.float32)).unsqueeze(0).to(self.device)
+            F = self.ctrl_world.predict_next_latent(self.w_H.unsqueeze(0), ac, n_steps=self.n_ddim, init_scale=True).float()[0]
+        else:
+            a_hist = np.stack([A[max(0, base - PS * i)] for i in range(self.num_history)][::-1])
+            tt = base + 1
+            fut = np.stack([np.mean(A[tt + PS * (j - 1): min(tt + PS * j, len(A))], axis=0) for j in range(1, K + 1)])
+            ac = torch.from_numpy(np.concatenate([a_hist, fut], 0)).unsqueeze(0).to(self.device)
+            F = self.ctrl_world.predict_next_latent(self.w_H.unsqueeze(0), ac, n_steps=self.n_ddim).float()[0]   # (K,4,28,56)
+        zh = F[-1:].clone()                                                                                   # prediction of this frame
+        self.last_zhat = zh[..., :28]
+        t["ctrl_world"] = time.perf_counter() - t0
+
+        # -- transmitter (WZ-blind) + channel + receiver ----------------------------------- #
+        t0 = time.perf_counter()
+        if self.wz_nomask:
+            m = torch.ones_like(zt[:, :1])
+        elif self.mask_net is not None:
+            m = (torch.sigmoid(self.mask_net(zt)) > self.mask_tau).float()
+        else:
+            m = (((zt - self.w_zprev) ** 2).mean(1, keepdim=True) > self.wz_thr).float()
+        k = 0 if self.k_fixed < 0 else self.k_fixed
+        mu_e, _ = self.codec.encode(zt * m)
+        mu_p, _ = self.codec.prior(zh)
+        if k > 0:
+            s_t = self.wz_channel(mu_e[:, :k].flatten(1)).view(1, k, *mu_e.shape[2:])   # only the k sent channels use the channel
+            s_mix = torch.cat([s_t, mu_p[:, k:]], dim=1)
+        else:
+            s_mix = mu_p
+        rec = self.codec.decode(s_mix, zh if self.codec.residual else None, None, self.wz_channel.snr_db)
+        if self.wz_nomask:
+            g = torch.ones_like(m)
+        else:
+            g = m * (((rec - zh) ** 2).mean(1, keepdim=True) > self.wz_recv_thr).float()
+        z_tilde = g * rec + (1.0 - g) * zh
+        t["wz"] = time.perf_counter() - t0
+        self.wz_stats = {"k": k, "mask_cells": int(m.sum().item()), "gate_cells": int(g.sum().item())}
+        if getattr(self.wz_channel, "last", None):
+            self.wz_stats.update(self.wz_channel.last)
+        self.wz_dbg = {"zt": zt[0].half().cpu().numpy(), "zh": zh[0].half().cpu().numpy(),
+                       "ztilde": z_tilde[0].half().cpu().numpy(), "rec": rec[0].half().cpu().numpy(), "mask": m[0, 0].cpu().numpy().astype(np.uint8),
+                       "gate": g[0, 0].cpu().numpy().astype(np.uint8)}
+
+        # history of the next prediction = this chunk's output slots, last one replaced by the reconstruction
+        F[-1] = z_tilde[0]
+        self.w_H = F
+        self.w_zprev = zt
+        self.w_n += 1
+        t0 = time.perf_counter()
+        out = render(z_tilde)
+        t["vae_dec"] = time.perf_counter() - t0
+        return out, t
+
+    # -- DVST baseline (two cameras) --------------------------------------- #
+
+    @torch.no_grad()
+    def _step_dvst(self, obs, prev_action):
+        """One request = one frame pair.  Mirrors Fig. 2 of the DVST paper: the transmitter encodes z_t given
+        ITS reference (noise-free simulated receiver output, Eq. 2); the receiver decodes given ITS reference
+        (what it actually reconstructed).  The first frame of an episode is intra-coded (no contexts)."""
+        t = {}
+        if not isinstance(obs, dict) or len(obs) != 2:
+            raise ValueError("mode dvst needs two cameras (images_b64 with 2 entries)")
+        ids = sorted(obs, key=lambda k: int(k))
+        net = self.dvst
+        t0 = time.perf_counter()
+        zt = torch.cat([self.vae.encode(self._to_tensor(obs[k])) for k in ids], dim=-1)    # (1,4,28,56)
+        t["vae_enc"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        snr = self.wz_channel.snr_db
+        if self.dvst_gop > 0 and self.d_n % self.dvst_gop == 0:
+            self.d_tx = self.d_rx = None                 # new GOP: intra frame (no reference), resets drift
+        self.d_n += 1
+        c_tx, d_tx = net.contexts(*self.d_tx) if self.d_tx is not None else (None, None)
+        c_rx, d_rx = net.contexts(*self.d_rx) if self.d_rx is not None else (None, None)
+        e = net.encode(zt, c_tx, d_tx, snr)
+        s_tx = e["s"] * e["keep"]
+        y_sim, z_sim = net.decode(s_tx, e["idx"], c_tx, d_tx)                 # transmitter's noise-free simulation
+        s_hat = self.wz_channel(s_tx, e["keep"])                              # the link
+        y_hat, z_hat = net.decode(s_hat, e["idx"], c_rx, d_rx)                # what the receiver reconstructs
+        self.d_tx = (z_sim, y_sim)
+        self.d_rx = (z_hat, y_hat)
+        t["dvst"] = time.perf_counter() - t0
+
+        H, W = zt.shape[2:]
+        sent = float(e["k_q"].sum().item())
+        self.d_stats = {"sent_reals": sent, "frac16": sent / (16 * H * W), "k_mean": sent / (H * W),
+                        "mse": float(((z_hat - zt) ** 2).mean().item()), "intra": c_tx is None}
+        self.wz_stats = dict(self.d_stats)
+        self.wz_dbg = {"zt": zt[0].half().cpu().numpy(), "ztilde": z_hat[0].half().cpu().numpy(),
+                       "k": e["k_q"][0, 0].cpu().numpy().astype(np.uint8)}
+        t0 = time.perf_counter()
+        out = {ids[0]: self._to_uint8(self.vae.decode(z_hat[..., :28])),
+               ids[1]: self._to_uint8(self.vae.decode(z_hat[..., 28:]))}
+        t["vae_dec"] = time.perf_counter() - t0
+        return out, t
+
     # -- main entry ------------------------------------------------------- #
 
     @torch.no_grad()
@@ -322,6 +555,12 @@ class SemComPipeline:
         t = {}
         if self.mode == "bypass":
             return obs_rgb, t
+
+        if self.mode == "wz2cam":
+            return self._step_wz2cam(obs_rgb, prev_action)
+
+        if self.mode == "dvst":
+            return self._step_dvst(obs_rgb, prev_action)
 
         if self.mode == "sscc":
             # obs_rgb is one image, or a dict {camera id: image} for a multi-camera policy (e.g. PI0Fast uses 2).
@@ -492,24 +731,45 @@ def build_pipeline(args, config, device):
         print(f"[SemCom] vae_channel: raw VAE latent over {config.get('channel_type','awgn')} "
               f"@ {config['snr_db']} dB" + (f" (CDL-{args.cdl_model})" if config.get('channel_type') == 'cdl' else ""))
 
-    if args.mode in ("predict", "nochannel", "full"):
+    dvst = None
+    if args.mode == "dvst":
+        if not args.dvst_ckpt:
+            raise SystemExit("--mode dvst needs --dvst_ckpt")
+        sys.path.insert(0, os.path.join(REPO, "baselines", "dvst"))
+        from model import DVST, MaskedChannel               # baselines/dvst/model.py
+        dk = torch.load(args.dvst_ckpt, map_location="cpu"); dc = dk["cfg"]
+        dvst = DVST(dc["C_vae"], dc["cy"], dc["cs"], dc["w"], dc["nb"], eta_prime=dc["eta_prime"]).to(device)
+        dvst.load_state_dict(dk["net"]); dvst.eval(); dvst.alloc_snr = args.dvst_alloc_snr; dvst.eta_prime *= args.dvst_eta_scale
+        wz_channel = MaskedChannel(config["snr_db"], config.get("channel_type", "awgn"), cdl_kw).to(device)
+        print(f"[SemCom] DVST baseline from {args.dvst_ckpt}: lam={dc['lam']} trained on {dc['channel']} "
+              f"snr={dc.get('snr_range') if dc.get('snr_range', [None])[0] is not None else dc['snr']}; "
+              f"serving over {config.get('channel_type', 'awgn')} @ {config['snr_db']} dB", flush=True)
+
+    if args.mode in ("predict", "nochannel", "full", "wz2cam"):
         from ctrl_world_wrapper import CtrlWorldWrapper
         svd_path = args.svd_path or config.get("svd_model_name")
         print(f"[SemCom] Ctrl-World: SVD={svd_path}  num_pred={config['num_pred']}")
+        ck = torch.load(args.stage1_ckpt, map_location="cpu")
+        s1meta = ck.get("meta", {}) or {}
+        pose_meta = None
+        if s1meta.get("pose_only"):       # pose-conditioned predictor (stage1_rollout_finetune --pose): conditioning = robot pose, not actions
+            pose_meta = {"mean": np.asarray(s1meta["pose_mean"], np.float32), "std": np.asarray(s1meta["pose_std"], np.float32),
+                         "scale": float(s1meta.get("pose_scale", 1.0))}
+            print(f"[SemCom] POSE-conditioned predictor (pose_dim={s1meta['pose_dim']}, unfreeze={s1meta.get('unfreeze')}): the client must send 'pose' rows", flush=True)
         ctrl_world = CtrlWorldWrapper(
-            action_dim          = config["action_dim"],
+            action_dim          = s1meta["pose_dim"] if pose_meta else config["action_dim"],
             num_history         = config["num_history"],
             num_pred            = config["num_pred"],
             svd_path            = svd_path,
             ctrl_ckpt           = None,
             freeze_unet         = True,
-            finetune_cross_attn = config.get("finetune_unet_cross_attn", False),
+            finetune_cross_attn = True if pose_meta else config.get("finetune_unet_cross_attn", False),
+            extra_unfreeze      = tuple(s1meta.get("unfreeze", [])) if pose_meta else (),
             dtype               = torch.float16,
         ).to(device)
 
         # Stage-1 weights.  BOTH parts matter: loading only action_encoder_state
         # silently discards ~100M trained cross-attention parameters.
-        ck = torch.load(args.stage1_ckpt, map_location="cpu")
         if "action_encoder_state" in ck:
             ctrl_world.action_encoder.load_state_dict(
                 ck["action_encoder_state"], strict=False)
@@ -523,6 +783,9 @@ def build_pipeline(args, config, device):
                   f"({len(ck['unet_cross_attn_state'])} tensors)")
         else:
             print("[SemCom] WARNING: no unet_cross_attn_state — the UNet is stock SVD.")
+        if pose_meta is not None:
+            ctrl_world.load_unet_extra_state_dict(ck["unet_extra_state"])
+            print(f"[SemCom] Stage-1 unet_extra restored ({len(ck['unet_extra_state'])} tensors)", flush=True)
         ctrl_world.eval()
 
         # `predict` renders z_hat and never touches Stage 2, so it must not require
@@ -534,14 +797,21 @@ def build_pipeline(args, config, device):
             if arch == "conv_wz":
                 # CURRENT model: conv Wyner-Ziv codec (no refinement diffusion).
                 from conv_codec import ConvWZCodec
-                codec = ConvWZCodec(4, cfg2["conv_w"], cfg2["conv_dch"], cfg2["conv_nb"]).to(device)
+                codec = ConvWZCodec(4, cfg2["conv_w"], cfg2["conv_dch"], cfg2["conv_nb"], residual=bool(cfg2.get("residual", False)), snr_cond=bool(cfg2.get("snr_cond", False))).to(device)
                 codec.load_state_dict(sk["net"])
                 codec.eval()
                 wz_channel = FadingChannel(config["snr_db"],
                                            channel_type=config.get("channel_type", "awgn"),
                                            cdl_kwargs=cdl_kw)
+                if args.digital_bits > 0:      # uncoded digital link: quantize -> Gray bits -> QAM -> channel -> hard demap (no FEC, nothing dropped)
+                    from digital_channel import DigitalQAMChannel
+                    wz_channel = DigitalQAMChannel(config["snr_db"], bits=args.digital_bits, nbps=args.digital_nbps,
+                                                   channel_type=config.get("channel_type", "awgn"), cdl_kwargs=cdl_kw,
+                                                   group=28 * 56, device=str(device))
+                    print(f"[SemCom] wz2cam DIGITAL link: {args.digital_bits} bit/real, {2 ** args.digital_nbps}-QAM, no channel coding", flush=True)
                 wz_params = dict(thr=cfg2["thr"], recv_thr=cfg2["recv_thr"],
-                                 route_thr=args.route_thr, k_calm=args.k_calm, k_dist=args.k_dist)
+                                 route_thr=args.route_thr, k_calm=args.k_calm, k_dist=args.k_dist,
+                                 k_fixed=args.k_fixed, mask_mode=cfg2.get("mask_mode", "prev"), mask_ckpt=cfg2.get("mask_ckpt"))
                 print(f"[SemCom] conv_wz codec from {args.stage2_ckpt}: "
                       f"W{cfg2['conv_w']}/Dch{cfg2['conv_dch']}/nb{cfg2['conv_nb']} "
                       f"beta={cfg2.get('beta')} thr={cfg2['thr']} recv_thr={cfg2['recv_thr']} "
@@ -563,13 +833,20 @@ def build_pipeline(args, config, device):
 
     # Warm the channel up NOW: the CDL channel builds its Sionna model on the first call (~8 s),
     # which would otherwise land inside request 1 and time the client out.
-    if wz_channel is not None:
+    if args.mode == "dvst":
         t0 = time.perf_counter()
-        wz_channel(torch.randn(1, 4 * 28 * 28, device=device))
+        wz_channel(torch.randn(1, 16, 28, 56, device=device), torch.ones(1, 16, 28, 56, device=device))
+        print(f"[SemCom] channel warm-up {time.perf_counter() - t0:.1f}s", flush=True)
+    elif wz_channel is not None:
+        t0 = time.perf_counter()
+        wz_channel(torch.randn(1, (max(args.k_fixed, 1) * 28 * 56) if args.mode == "wz2cam" else 4 * 28 * 28, device=device))
         print(f"[SemCom] channel warm-up {time.perf_counter() - t0:.1f}s", flush=True)
 
-    return SemComPipeline(config, vae, ctrl_world, system, device, args.mode,
-                          codec=codec, wz_channel=wz_channel, wz_params=wz_params)
+    pipe = SemComPipeline(config, vae, ctrl_world, system, device, args.mode,
+                          codec=codec, wz_channel=wz_channel, wz_params=wz_params, dvst=dvst)
+    pipe.dvst_gop = args.dvst_gop
+    pipe.pose_meta = pose_meta if args.mode in ("predict", "nochannel", "full", "wz2cam") else None
+    return pipe
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +959,9 @@ def run_server(args):
     # rollouts read those actions from the recorded demo, which deployment cannot.
     # K=1 is therefore the deployable default; K>1 is allowed for comparison
     # against the offline numbers, with the future slots repeating the last action.
+    if args.mode == "wz2cam":                 # the 2-cam chunk-30 predictor: 6 history slots, 6 future slots, stride 5
+        args.num_pred, args.history_stride = 6, 5
+        CONFIG["num_history"] = 6
     CONFIG["num_pred"]       = args.num_pred
     CONFIG["clip_length"]    = CONFIG["num_history"] + CONFIG["num_pred"]
     CONFIG["history_stride"] = args.history_stride
@@ -710,6 +990,11 @@ def run_server(args):
 
     t_start  = time.perf_counter()
     pipeline = build_pipeline(args, CONFIG, device)
+    pipeline.oracle_history = bool(getattr(args, 'oracle_history', False))
+    if args.mode == "wz2cam" and (args.wz_thr is not None or args.wz_recv_thr is not None):
+        if args.wz_thr is not None:      pipeline.wz_thr = args.wz_thr            # 0 = send every cell
+        if args.wz_recv_thr is not None: pipeline.wz_recv_thr = args.wz_recv_thr  # 0 = z~ = decoded code wherever sent
+        print(f"[SemCom] wz2cam thresholds overridden: thr={pipeline.wz_thr} recv_thr={pipeline.wz_recv_thr}", flush=True)
 
     policy = PolicyClient(args.policy_host, args.policy_port)
     print(f"[SemCom] Ready in {time.perf_counter() - t_start:.1f}s")
@@ -722,6 +1007,7 @@ def run_server(args):
 
     n_reqs, total_ms = 0, 0.0
     stage_ms  = {}
+    dvst_acc  = []
     prev_act  = None
     warned_no_episode = False
 
@@ -771,6 +1057,20 @@ def run_server(args):
                     prev_act = None
                     print(f"[SemCom] --- episode {ep}: history reset ---", flush=True)
 
+                # -- in-between frame (wz2cam warm start) ------------------ #
+                # {"type": "between", "episode": e, "step": k, "images_b64": {"1": .., "2": ..}}: the observation after k executed
+                # steps (k = 5,10,15,20,25 of chunk 0).  Stored for request 1; nothing is predicted and the bridge sends no reply.
+                if data.get("type") == "between":
+                    try:
+                        fr = {kk: np.array(Image.open(io.BytesIO(base64.b64decode(vv))).convert("RGB"), dtype=np.uint8)
+                              for kk, vv in (data.get("images_b64") or {}).items()}
+                        pipeline.w_between_store[int(data.get("step", -1))] = fr
+                        msg = "stored"
+                    except Exception as e:
+                        msg = f"between frame rejected: {e}"; print(f"[SemCom] {msg}", flush=True)
+                    _send(conn, {"seq": seq, "action": [[0.0] * 7], "status": "ok", "message": msg})
+                    continue
+
                 # -- disturbance marker ------------------------------------ #
                 # Windows tags the frames where it injected a pose/action
                 # disturbance. Read it exactly like seq/episode. It changes no
@@ -785,8 +1085,27 @@ def run_server(args):
                     def _dec(b64):
                         return np.array(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"), dtype=np.uint8)
                     imgs_b64 = data.get("images_b64") or {}
+                    # optional (wz2cam): the 5 in-between frames (steps 5,10,..,25 of the chunk just executed), oldest first,
+                    # {"1": [b64 x5], "2": [b64 x5]}.  Sent with request 1 so the predictor starts from a REAL strided history.
+                    between_b64 = data.get("between_b64") or {}
+                    pipeline.w_between = ({k: [_dec(b) for b in v] for k, v in between_b64.items()}
+                                          if (between_b64 and args.mode == "wz2cam") else None)
+                    if args.mode == "wz2cam" and pipeline.w_between is None and pipeline.w_n == 1:
+                        st = pipeline.w_between_store                   # frames the client streamed during chunk 0
+                        want = [5, 10, 15, 20, 25]
+                        if all(k in st for k in want):
+                            cams = sorted(st[want[0]], key=lambda q: int(q))
+                            pipeline.w_between = {c: [st[k][c] for k in want] for c in cams}
+                        elif st:
+                            print(f"[SemCom] WARNING: got in-between steps {sorted(st)} (need {want}); repeated-anchor start", flush=True)
+                    _pr = data.get("pose")
+                    pipeline.w_pose_in = np.asarray(_pr, dtype=np.float32).reshape(-1, 12) if _pr else None
+                    if pipeline.pose_meta is not None and pipeline.w_pose_in is not None and len(pipeline.w_pose_in) == 1 and pipeline.w_n != 0:
+                        # an anchor request (1 pose row) can only start an episode: the client was restarted (its episode counter began again at 1, so no 'episode' change was seen)
+                        print("[SemCom] anchor request (1 pose row) while mid-episode: new client run detected, history reset", flush=True)
+                        pipeline.reset(); prev_act = None
                     obs_multi = None
-                    if len(imgs_b64) > 1 and args.mode in ("sscc", "bypass"):
+                    if len(imgs_b64) > 1 and args.mode in ("sscc", "bypass", "wz2cam", "dvst"):
                         # multi-camera client (e.g. PI0Fast: cameras "1" and "2")
                         ids = sorted(imgs_b64, key=lambda k: int(k))
                         obs_multi = {k: _dec(imgs_b64[k]) for k in ids}
@@ -803,7 +1122,13 @@ def run_server(args):
                 instr = data.get("instruction", args.instruction)
 
                 t0 = time.perf_counter()
-                x_tilde, timings = pipeline.step(obs_multi if obs_multi else obs_rgb, prev_act)
+                try:
+                    x_tilde, timings = pipeline.step(obs_multi if obs_multi else obs_rgb, prev_act)
+                except Exception as e:           # a bad request must not kill the server: log it and answer with an error (the client holds position)
+                    import traceback; traceback.print_exc()
+                    print(f"[SemCom] step failed on request seq={seq}: {e}", flush=True)
+                    _send(conn, {"seq": seq, "action": [0.0] * 7, "status": "error", "message": f"step failed: {e}"})
+                    continue
                 if x_tilde is None:              # SSCC frame lost -> reply with an error; the client applies zero action
                     _send(conn, {"seq": seq, "action": [0.0] * 7, "status": "error", "message": "frame lost on the channel"})
                     prev_act = None; n_reqs += 1
@@ -818,8 +1143,9 @@ def run_server(args):
                 # bytes and keep the control bit-exact with the 2-process path.
                 if obs_multi:
                     action = policy.predict_multi(
-                        x_tilde, instr,
+                        obs_multi if args.shadow_bypass else x_tilde, instr,
                         passthrough=imgs_b64 if args.mode == "bypass" else None)
+                    x_multi = x_tilde
                     x_tilde = x_tilde[next(iter(x_tilde))]   # first camera, for the dump / debug lines below
                 else:
                     action = policy.predict(
@@ -849,6 +1175,11 @@ def run_server(args):
                                     panels.append(pred)
                         panels.append(rec)
                         pair = np.concatenate(panels, axis=1)
+                        if obs_multi and len(obs_multi) > 1:      # second camera: [received | output], saved as *_w.png
+                            ids2 = sorted(obs_multi, key=lambda q: int(q))
+                            w_in, w_out = np.asarray(obs_multi[ids2[1]]), np.asarray(x_multi[ids2[1]])
+                            Image.fromarray(np.concatenate([w_in, w_out], axis=1).astype(np.uint8)).save(
+                                os.path.join(args.dump_dir, f"{str(ep) if ep is not None else 'noep'}_{n_reqs:05d}_w.png"))
                         # "_D" marks a disturbed frame, so the frames that stress
                         # the channel are findable with a glob after the run.
                         tag = "_D" if disturbed else ""
@@ -858,6 +1189,20 @@ def run_server(args):
                                          f"_{n_reqs:05d}{tag}.png"))
                     except Exception as e:                        # never kill the loop
                         print(f"[SemCom] dump failed: {e}", flush=True)
+
+                if args.log_dir and args.mode in ("wz2cam", "dvst") and obs_multi:
+                    try:
+                        os.makedirs(args.log_dir, exist_ok=True)
+                        ids2 = sorted(obs_multi, key=lambda q: int(q))
+                        rec = {f"obs{q}": np.asarray(obs_multi[q]) for q in ids2}
+                        rec.update({f"out{q}": np.asarray(x_multi[q]) for q in ids2})
+                        rec["action_chunk"] = np.asarray(action, dtype=np.float32)                       # what the policy returned now
+                        rec["actions_fed"] = np.asarray(getattr(pipeline, "last_actions", np.zeros((0, 7))), dtype=np.float32)  # sanitised chunk fed to the predictor this request
+                        rec.update({f"lat_{kk}": vv for kk, vv in getattr(pipeline, "wz_dbg", {}).items()})
+                        np.savez_compressed(os.path.join(args.log_dir, f"{str(ep) if ep is not None else 'noep'}_{n_reqs:05d}.npz"),
+                                            seq=seq, **rec)
+                    except Exception as e:
+                        print(f"[SemCom] log failed: {e}", flush=True)
 
                 for k, v in timings.items():
                     stage_ms[k] = stage_ms.get(k, 0.0) + v * 1000
@@ -885,6 +1230,11 @@ def run_server(args):
                           f"({100 * st['outage'] / max(st['frames'], 1):.1f}% outage), "
                           f"{st['tx'] / max(st['frames'] - st['outage'], 1):.2f} tx/frame", flush=True)
 
+                if args.mode == "dvst" and pipeline.d_stats:
+                    ds = pipeline.d_stats; dvst_acc.append(ds["frac16"])
+                    print(f"[SemCom] DVST req {n_reqs}: k/cell {ds['k_mean']:.2f}  frac16 {ds['frac16']:.3f} "
+                          f"(mean {sum(dvst_acc) / len(dvst_acc):.3f})  latent mse {ds['mse']:.4f}{'  [intra]' if ds['intra'] else ''}", flush=True)
+
                 if n_reqs % 20 == 0:
                     parts = "  ".join(f"{k}={v / n_reqs:.0f}"
                                       for k, v in sorted(stage_ms.items()))
@@ -905,7 +1255,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Online closed-loop SemCom + policy inference server")
     p.add_argument("--mode",
-                   choices=["bypass", "vae", "vae_channel", "sscc", "predict", "nochannel", "full"],
+                   choices=["bypass", "vae", "vae_channel", "sscc", "predict", "nochannel", "full", "wz2cam", "dvst"],
                    default="bypass",
                    help="How much of the pipeline to exercise. Start with bypass "
                         "and confirm it reproduces the policy-only success rate. "
@@ -929,6 +1279,9 @@ def parse_args():
                    help="Save observation|reconstruction pairs here as PNGs. The policy "
                         "acts on the RIGHT half; if the cube is the wrong colour or absent "
                         "there, the policy never had the information. Off by default.")
+    p.add_argument("--log_dir", type=str, default=None,
+                   help="wz2cam: save one npz per request (raw frames of every camera, outputs, the policy's action chunk, "
+                        "the sanitised actions fed to the predictor, and the latents zt / zhat / z~ / mask / gate).")
     p.add_argument("--dump_every", type=int, default=10,
                    help="Save one pair every N frames when --dump_dir is set.")
 
@@ -949,6 +1302,22 @@ def parse_args():
     p.add_argument("--route_thr", type=float, default=110.0,
                    help="conv_wz: send k_dist code channels if the changed-cell count exceeds this, "
                         "else k_calm. WZ-clean (uses only z_t, z_{t-1}).")
+    p.add_argument("--shadow_bypass", action="store_true",
+                   help="wz2cam DIAGNOSTIC: the policy gets the TRUE frames (a normal bypass run) while the predictor/codec run in the "
+                        "background and log their error.  Measures the predictor on states a healthy policy visits.")
+    p.add_argument("--oracle_history", action="store_true",
+                   help="wz2cam DIAGNOSTIC: predict every chunk from TRUE strided history (needs the client to stream the in-between "
+                        "frames at steps 5,10,..,25 of EVERY chunk as {'type':'between'} messages); falls back to the loop history if missing.")
+    p.add_argument("--dvst_alloc_snr", type=float, default=None, help="dvst: allocate with this SNR's capacity (fixed rate across channel SNR; default: live SNR, rate shrinks as SNR rises)")
+    p.add_argument("--dvst_eta_scale", type=float, default=1.0, help="dvst: multiply the rate-allocation factor eta' (rate-matching knob; 0.86 ~ frac16 0.25 for the lam0.01_w4 ckpt)")
+    p.add_argument("--dvst_gop", type=int, default=0, help="dvst: GOP size; every N-th request of an episode is intra-coded (1 = every request intra, 0 = only the first)")
+    p.add_argument("--dvst_ckpt", type=str, default=None, help="dvst: checkpoint from baselines/dvst/train.py")
+    p.add_argument("--k_fixed", type=int, default=2,
+                   help="wz2cam: code channels sent per chunk (joint 28x56 grid, so k*1568 reals; 0 = prior only)")
+    p.add_argument("--wz_thr", type=float, default=None,
+                   help="wz2cam DIAGNOSTIC: override the change-mask threshold from the checkpoint (negative = every cell is sent).")
+    p.add_argument("--wz_recv_thr", type=float, default=None,
+                   help="wz2cam DIAGNOSTIC: override the receiver gate threshold (negative = z~ is the decoded code on every sent cell).")
     p.add_argument("--k_calm", type=int, default=2,
                    help="conv_wz: code channels transmitted on calm frames (of Dch).")
     p.add_argument("--k_dist", type=int, default=4,
@@ -959,6 +1328,9 @@ def parse_args():
     p.add_argument("--channel", type=str, default=None,
                    choices=["awgn", "rayleigh", "cdl"])
     p.add_argument("--D_jscc",  type=int, default=None)
+    p.add_argument("--digital_bits", type=int, default=0,
+                   help="wz2cam: >0 = digital link, quantize each code real to this many bits (Gray) and send over QAM with NO channel coding")
+    p.add_argument("--digital_nbps", type=int, default=4, help="bits per QAM symbol for --digital_bits (2=QPSK, 4=16-QAM, 6=64-QAM)")
     p.add_argument("--cdl_model", type=str, default="C", choices=list("ABCDE"),
                    help="3GPP TR-38.901 CDL profile (only when --channel cdl; needs Sionna)")
     p.add_argument("--cdl_delay_spread", type=float, default=100e-9)
