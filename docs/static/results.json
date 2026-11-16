@@ -1,0 +1,77 @@
+{
+ "ours": [
+  {
+   "snr": 0.0,
+   "succ": 11,
+   "n": 30,
+   "run": "20261026T130526_pi0fast_wz2cam_pick_blue_cube_to_tray"
+  },
+  {
+   "snr": 4.0,
+   "succ": 11,
+   "n": 30,
+   "run": "20261026T110104_pi0fast_wz2cam_pick_blue_cube_to_tray"
+  },
+  {
+   "snr": 8.0,
+   "succ": 17,
+   "n": 30,
+   "run": "20261026T020323_pi0fast_wz2cam_pick_blue_cube_to_tray"
+  },
+  {
+   "snr": 12.0,
+   "succ": 23,
+   "n": 30,
+   "run": "20261026T033211_pi0fast_wz2cam_pick_blue_cube_to_tray"
+  },
+  {
+   "snr": 16.0,
+   "succ": 22,
+   "n": 30,
+   "run": "20261026T152434_pi0fast_wz2cam_pick_blue_cube_to_tray"
+  },
+  {
+   "snr": 20.0,
+   "succ": 23,
+   "n": 30,
+   "run": "20261025T231830_pi0fast_wz2cam_pick_blue_cube_to_tray"
+  }
+ ],
+ "dvst": [
+  {
+   "snr": 8.0,
+   "succ": 0,
+   "n": 30,
+   "run": "20261025T000230_pi0fast_dvst_pick_blue_cube_to_tray",
+   "rate_matched": true
+  },
+  {
+   "snr": 12.0,
+   "succ": 17,
+   "n": 30,
+   "run": "20261022T221511_pi0fast_dvst_pick_blue_cube_to_tray",
+   "rate_matched": true
+  },
+  {
+   "snr": 16.0,
+   "succ": 20,
+   "n": 30,
+   "run": "20261022T154316_pi0fast_dvst_pick_blue_cube_to_tray",
+   "rate_matched": false
+  },
+  {
+   "snr": 20.0,
+   "succ": 22,
+   "n": 30,
+   "run": "20261022T143713_pi0fast_dvst_pick_blue_cube_to_tray",
+   "rate_matched": false
+  }
+ ],
+ "predictor_only": {
+  "snr": null,
+  "succ": 56,
+  "n": 100,
+  "run": "20261024T220424_pi0fast_wz2cam_pick_blue_cube_to_tray"
+ },
+ "source": "results/exp1_main_closed_loop/data/closed_loop.csv"
+}

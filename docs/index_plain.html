@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Predict-SemCom</title>
+<meta name="description" content="Wyner-Ziv semantic communication with a world-model prior for remote robot manipulation.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;500&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<style>
+  :root { --fg:#222; --muted:#666; --line:#e4e4e4; --bg:#fff; --soft:#f6f7f9; --accent:#2f6fde; --ours:#d9480f; --dvst:#1c7ed6; --pred:#868e96; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:'Noto Sans',sans-serif; line-height:1.6; }
+  .wrap { max-width:960px; margin:0 auto; padding:0 16px; }
+  header { text-align:center; padding:56px 0 24px; }
+  h1 { font-family:'Google Sans',sans-serif; font-size:2.3rem; line-height:1.25; margin:0 0 18px; font-weight:700; }
+  .authors { font-size:1.1rem; } .authors a { color:var(--accent); text-decoration:none; }
+  .affil { color:var(--muted); margin-top:4px; }
+  .venue { margin-top:6px; font-weight:500; }
+  .buttons { margin-top:18px; display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  .btn { background:#363636; color:#fff; border-radius:999px; padding:7px 18px; text-decoration:none; font-family:'Google Sans',sans-serif; font-size:.95rem; }
+  .btn.disabled { opacity:.45; pointer-events:none; }
+  section { padding:28px 0; }
+  h2 { font-family:'Google Sans',sans-serif; text-align:center; font-size:1.7rem; margin:0 0 18px; }
+  h3 { font-family:'Google Sans',sans-serif; font-size:1.15rem; margin:18px 0 6px; }
+  p { margin:0 0 12px; text-align:justify; }
+  video, img.fig { width:100%; display:block; border-radius:8px; background:#000; }
+  .caption { color:var(--muted); font-size:.92rem; text-align:center; margin-top:8px; }
+  .abstract { background:var(--soft); border-radius:10px; padding:20px 24px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:22px; }
+  @media (max-width:720px) { .grid2 { grid-template-columns:1fr; } h1 { font-size:1.7rem; } }
+  .card h3 { margin-top:0; } .tag { display:inline-block; font-size:.78rem; border-radius:999px; padding:1px 10px; margin-left:6px; vertical-align:2px; }
+  .ok { background:#e6f4ea; color:#1e7b34; } .bad { background:#fdecea; color:#b3261e; }
+  svg text { font-family:'Noto Sans',sans-serif; }
+  table { border-collapse:collapse; width:100%; font-size:.95rem; margin-top:10px; }
+  th, td { border-bottom:1px solid var(--line); padding:7px 8px; text-align:center; }
+  th { font-family:'Google Sans',sans-serif; font-weight:500; }
+  td.best { font-weight:700; }
+  pre { background:var(--soft); padding:16px; border-radius:8px; overflow-x:auto; font-family:'JetBrains Mono',monospace; font-size:.85rem; }
+  footer { color:var(--muted); font-size:.85rem; text-align:center; padding:30px 0 50px; }
+  .diagram { width:100%; height:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <!-- EDIT: title, authors, affiliations, venue, links -->
+  <h1>Predict, Then Correct: Wyner-Ziv Semantic Communication<br>with a World-Model Prior for Remote Robot Control</h1>
+  <div class="authors"><a href="#">Author One</a>, <a href="#">Author Two</a>, <a href="#">Author Three</a></div>
+  <div class="affil">University of British Columbia</div>
+  <div class="venue">Under review</div>
+  <div class="buttons">
+    <a class="btn disabled" href="#">Paper</a>
+    <a class="btn disabled" href="#">arXiv</a>
+    <a class="btn" href="https://github.com/Sinyu104/Predict-SemCom">Code</a>
+  </div>
+</header>
+
+<section>
+  <video autoplay muted loop playsinline poster="static/images/teaser_8dB.jpg"><source src="static/videos/teaser_8dB.mp4" type="video/mp4"></video>
+  <div class="caption">Closed loop over a 3GPP CDL-C channel at 8 dB with the same channel rate. Each frame is what the policy (PI0Fast) receives at the start of a 30-step action chunk, for both cameras.
+    The DVST baseline delivers a ghosted arm and washed-out cubes and completes <b>0/30</b> episodes; our receiver completes <b>17/30</b>.</div>
+</section>
+
+<section>
+  <h2>Abstract</h2>
+  <!-- EDIT: replace with the paper abstract -->
+  <div class="abstract"><p>
+    A robot that offloads its policy to an edge server must stream camera images over a wireless link, and at low SNR or low rate the received
+    images degrade until the policy fails. We observe that most of a manipulation scene is predictable: given the past frames and the robot's own
+    pose, a video world model can forecast the arm, the table and the background, and only the parts it cannot foresee need the channel. We build
+    a Wyner-Ziv semantic communication system around this idea. The receiver runs a pose-conditioned world model (Ctrl-World) that predicts the
+    next camera latent; the transmitter, blind to this prediction, sends a few channels of a convolutional joint source-channel code of the true
+    latent; and a residual decoder merges the two, using the prediction as decoder side information. The decoded image feeds an unmodified
+    vision-language-action policy. In closed-loop simulation with PI0Fast over a CDL-C channel, at the same channel rate our system keeps
+    73&ndash;77% task success from 20 dB down to 12 dB and 57% at 8 dB, where the DVST video-transmission baseline fails completely.
+  </p></div>
+</section>
+
+<section>
+  <h2>Method</h2>
+  <svg class="diagram" viewBox="0 0 960 330" role="img" aria-label="System diagram">
+    <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+    <style>.b{fill:#fff;stroke:#555;stroke-width:1.4;rx:8} .t{font-size:13px;text-anchor:middle;fill:#222} .s{font-size:11px;text-anchor:middle;fill:#666} .l{stroke:#555;stroke-width:1.4;fill:none;marker-end:url(#ar)} .zone{fill:#f6f7f9;stroke:none}</style>
+    <rect class="zone" x="5" y="20" width="270" height="300" rx="12"/><text class="t" x="140" y="42" style="font-weight:700">Robot (transmitter)</text>
+    <rect class="zone" x="385" y="20" width="570" height="300" rx="12"/><text class="t" x="670" y="42" style="font-weight:700">Edge server (receiver)</text>
+    <rect class="b" x="25" y="70" width="230" height="44"/><text class="t" x="140" y="90">2 cameras &#8594; VAE encoder</text><text class="s" x="140" y="106">z<tspan baseline-shift="sub" font-size="8">t</tspan> : 4&#215;28&#215;56 latent</text>
+    <rect class="b" x="25" y="150" width="230" height="44"/><text class="t" x="140" y="170">Conv JSCC encoder</text><text class="s" x="140" y="186">no access to the prediction</text>
+    <rect class="b" x="25" y="230" width="230" height="44"/><text class="t" x="140" y="250">send first k of 16 code channels</text><text class="s" x="140" y="266">k = 4 &#8594; rate 0.25</text>
+    <path class="l" d="M140,114 V150"/><path class="l" d="M140,194 V230"/>
+    <rect class="b" x="290" y="232" width="80" height="40" style="fill:#fff4e6"/><text class="t" x="330" y="250">CDL-C</text><text class="s" x="330" y="265">fading</text>
+    <path class="l" d="M255,252 H290"/>
+    <rect class="b" x="405" y="70" width="250" height="44"/><text class="t" x="530" y="90">Ctrl-World (pose-conditioned)</text><text class="s" x="530" y="106">history + robot pose &#8594; prediction &#7825;<tspan baseline-shift="sub" font-size="8">t</tspan></text>
+    <rect class="b" x="405" y="150" width="250" height="44"/><text class="t" x="530" y="170">Conv prior p(s | &#7825;<tspan baseline-shift="sub" font-size="8">t</tspan>)</text><text class="s" x="530" y="186">fills the channels not sent</text>
+    <rect class="b" x="690" y="190" width="250" height="60" style="fill:#fff0e8;stroke:#d9480f"/><text class="t" x="815" y="212">Residual decoder</text><text class="s" x="815" y="230">z&#771;<tspan baseline-shift="sub" font-size="8">t</tspan> = &#7825;<tspan baseline-shift="sub" font-size="8">t</tspan> + Dec([s&#771;, &#7825;<tspan baseline-shift="sub" font-size="8">t</tspan>, SNR])</text>
+    <rect class="b" x="690" y="270" width="250" height="40"/><text class="t" x="815" y="294">VAE decoder &#8594; policy (PI0Fast)</text>
+    <path class="l" d="M370,252 H690"/><text class="s" x="530" y="246">received s&#771;</text>
+    <path class="l" d="M530,114 V150"/><path class="l" d="M655,92 H815 V190"/><path class="l" d="M655,172 H740 V190"/>
+    <path class="l" d="M815,250 V270"/>
+    <path class="l" d="M690,300 H420 V122" style="stroke-dasharray:5 4"/><text class="s" x="550" y="292">z&#771;<tspan baseline-shift="sub" font-size="8">t</tspan> joins the predictor's history</text>
+  </svg>
+  <p style="margin-top:14px">
+    <b>Prediction as side information.</b> Ctrl-World predicts the next frame of both cameras from its own history and the robot's pose. The arm,
+    table and background are predicted well; what it cannot foresee (where a cube really is after a grasp, whether the grasp held) must come over the channel.
+  </p>
+  <p>
+    <b>Wyner-Ziv codec.</b> The transmitter encodes the full latent with a fully-convolutional encoder that never sees the prediction, and sends the
+    first k of 16 nested code channels as analog symbols. The receiver fills the unsent channels from a prior conditioned on the prediction and decodes
+    a <i>correction</i> to it, given the received code, the prediction and the channel SNR. No masks or thresholds: the decoder learns how far to trust each source.
+  </p>
+  <p>
+    <b>Training.</b> The codec minimises a distortion that up-weights cells the predictor gets wrong, plus a light Wyner-Ziv rate term
+    KL(q(s|z<sub>t</sub>) &#8214; p(s|&#7825;<sub>t</sub>)), with the SNR drawn from 0&ndash;20 dB and nested channel dropout so any prefix of channels decodes.
+  </p>
+</section>
+
+<section>
+  <h2>Closed-loop results</h2>
+  <svg id="curve" class="diagram" viewBox="0 0 960 400" role="img" aria-label="Task success versus SNR"></svg>
+  <div class="caption">Task success of PI0Fast (pick the blue cube and place it on the tray, 30 episodes per point, seed 42) versus channel SNR, CDL-C 50 ns.
+    Bars are 95% Wilson intervals. Hollow DVST markers used a higher rate (&#8776;0.29) than ours (0.25). The dashed line is the world-model prediction alone (no channel).</div>
+  <table id="tbl"></table>
+</section>
+
+<section>
+  <h2>What the policy sees</h2>
+  <p style="text-align:center">Each video: true camera frames, the world-model prediction alone, and the image our receiver gives the policy. One frame per 30-step action chunk.</p>
+  <div class="grid2">
+    <div class="card"><h3>20 dB <span class="tag ok">success</span></h3><video controls muted loop playsinline poster="static/images/ours_20dB.jpg"><source src="static/videos/ours_20dB.mp4" type="video/mp4"></video></div>
+    <div class="card"><h3>12 dB <span class="tag ok">success</span></h3><video controls muted loop playsinline poster="static/images/ours_12dB.jpg"><source src="static/videos/ours_12dB.mp4" type="video/mp4"></video></div>
+    <div class="card"><h3>8 dB <span class="tag ok">success</span></h3><video controls muted loop playsinline poster="static/images/ours_8dB.jpg"><source src="static/videos/ours_8dB.mp4" type="video/mp4"></video></div>
+    <div class="card"><h3>4 dB <span class="tag bad">failure</span></h3><video controls muted loop playsinline poster="static/images/ours_4dB_fail.jpg"><source src="static/videos/ours_4dB_fail.mp4" type="video/mp4"></video>
+      <div class="caption" style="text-align:left">Limitation: after a missed grasp the prediction erases the cube that is still on the table, and at 4 dB the received code is too noisy to override it, so the policy keeps re-grasping.</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>BibTeX</h2>
+  <!-- EDIT -->
+  <pre>@inproceedings{predictsemcom2026,
+  title     = {Predict, Then Correct: Wyner-Ziv Semantic Communication with a World-Model Prior for Remote Robot Control},
+  author    = {Author One and Author Two and Author Three},
+  booktitle = {Under review},
+  year      = {2026}
+}</pre>
+</section>
+
+<footer>Page layout inspired by <a href="https://ctrl-world.github.io/">Ctrl-World</a> and <a href="https://nerfies.github.io/">Nerfies</a>. Results are generated from the run logs by <code>docs/build_media.py</code>.</footer>
+</div>
+
+<script>
+// Draws the SNR curve + table from static/results.json (written by docs/build_media.py from the results CSV; no numbers here).
+function wilson(k, n) { const z = 1.96, p = k / n, d = 1 + z * z / n, c = (p + z * z / (2 * n)) / d, h = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d; return [Math.max(0, c - h), Math.min(1, c + h)]; }
+fetch("static/results.json").then(r => r.json()).then(D => {
+  const S = document.getElementById("curve"), NS = "http://www.w3.org/2000/svg";
+  const W = 960, H = 400, L = 70, R = 190, T = 20, B = 50, x = s => L + (s / 20) * (W - L - R), y = v => T + (1 - v) * (H - T - B);
+  const el = (tag, a, txt) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; S.appendChild(e); return e; };
+  for (let v = 0; v <= 1.001; v += 0.2) { el("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: "#eee"}); el("text", {x: L - 10, y: y(v) + 4, "text-anchor": "end", "font-size": 12, fill: "#666"}, Math.round(v * 100) + "%"); }
+  for (let s = 0; s <= 20; s += 4) el("text", {x: x(s), y: H - B + 20, "text-anchor": "middle", "font-size": 12, fill: "#666"}, s);
+  el("text", {x: (L + W - R) / 2, y: H - 8, "text-anchor": "middle", "font-size": 13, fill: "#333"}, "SNR (dB)");
+  el("text", {x: 18, y: (T + H - B) / 2, "text-anchor": "middle", "font-size": 13, fill: "#333", transform: `rotate(-90 18 ${(T + H - B) / 2})`}, "Task success");
+  if (D.predictor_only) { const v = D.predictor_only.succ / D.predictor_only.n; el("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: "#868e96", "stroke-dasharray": "6 5", "stroke-width": 1.6});
+    el("text", {x: W - R + 8, y: y(v) + 4, "font-size": 12, fill: "#868e96"}, `prediction only ${Math.round(v * 100)}%`); }
+  const series = (P, col, name) => {
+    el("polyline", {points: P.map(p => `${x(p.snr)},${y(p.succ / p.n)}`).join(" "), fill: "none", stroke: col, "stroke-width": 2.4});
+    P.forEach(p => { const [lo, hi] = wilson(p.succ, p.n); el("line", {x1: x(p.snr), x2: x(p.snr), y1: y(lo), y2: y(hi), stroke: col, "stroke-width": 1.3, opacity: .6});
+      el("circle", {cx: x(p.snr), cy: y(p.succ / p.n), r: 5.5, fill: p.rate_matched === false ? "#fff" : col, stroke: col, "stroke-width": 2}); });
+    const last = P[P.length - 1]; el("text", {x: W - R + 8, y: y(last.succ / last.n) + (name === "DVST" ? 16 : -6), "font-size": 13, fill: col, "font-weight": 700}, name);
+  };
+  series(D.dvst, "#1c7ed6", "DVST"); series(D.ours, "#d9480f", "Ours");
+  const snrs = [...new Set(D.ours.map(p => p.snr).concat(D.dvst.map(p => p.snr)))].sort((a, b) => b - a);
+  const f = (P, s) => { const p = P.find(q => q.snr === s); return p ? `${p.succ}/${p.n}` + (p.rate_matched === false ? "&nbsp;&dagger;" : "") : "&ndash;"; };
+  document.getElementById("tbl").innerHTML = "<tr><th>SNR (dB)</th>" + snrs.map(s => `<th>${s}</th>`).join("") + "</tr>" +
+    "<tr><td>Ours (rate 0.25)</td>" + snrs.map(s => `<td class="best">${f(D.ours, s)}</td>`).join("") + "</tr>" +
+    "<tr><td>DVST</td>" + snrs.map(s => `<td>${f(D.dvst, s)}</td>`).join("") + "</tr>" +
+    `<tr><td colspan="${snrs.length + 1}" style="color:#666;font-size:.85rem;border:0">&dagger; DVST at rate &#8776;0.29 (more channel uses than ours). Prediction only: ${D.predictor_only ? D.predictor_only.succ + "/" + D.predictor_only.n : "&ndash;"}.</td></tr>`;
+}).catch(() => { document.getElementById("curve").outerHTML = '<p class="caption">Serve this folder over HTTP to load results.json (e.g. <code>python -m http.server</code> in docs/).</p>'; });
+</script>
+</body>
+</html>

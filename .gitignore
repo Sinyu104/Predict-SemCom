@@ -44,7 +44,6 @@ Thumbs.db
 CLAUDE.md
 
 # Local-only: docs, figures, diagnostic scripts
-docs/
 figures/
 experiments/val_*.py
 experiments/probe_*.py

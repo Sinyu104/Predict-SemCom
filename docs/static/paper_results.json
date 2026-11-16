@@ -1,0 +1,16 @@
+{
+ "_source": "Values of the conference-paper figures (figures/matlab/fig_*_manual.m). null = not reported (outage / not run).",
+ "names": {"wz": "WZ-SC (ours)", "dvst": "DVST", "h264": "H.264 + LDPC", "ub": "Upper bound (original images)"},
+ "snr": {
+  "x": [0, 4, 8, 12, 16, 20],
+  "bandwidth_ratio": {"wz": 0.010, "dvst": 0.010, "h264": 0.042},
+  "success": {"ub": 80, "wz": [30, 50, 56, 61, 70, 75], "dvst": [0, 0, 30, 56, 67, 73], "h264": [0, 0, 26.7, 26.7, 26.7, 26.7]},
+  "action_error": {"wz": [0.048, 0.025, 0.019, 0.007, 0.007, 0.007], "dvst": [0.060, 0.056, 0.040, 0.008, 0.007, 0.008], "h264": [null, null, 0.0234, 0.0234, 0.0234, 0.0234]}
+ },
+ "rate": {
+  "snr_db": 8,
+  "x": [0.0052, 0.0104, 0.0208, 0.0417, 0.0625, 0.0833],
+  "success": {"ub": 80, "wz": [30, 56, 73, 80, null, null], "dvst": [0, 30, 38, 56, null, null], "h264": [null, null, 0, 26.7, 50, 76.7]},
+  "action_error": {"wz": [0.032, 0.008, 0.007, 0.007, null, null], "dvst": [0.126, 0.013, 0.013, 0.010, null, null], "h264": [null, null, null, 0.0234, 0.0104, 0.0076]}
+ }
+}
