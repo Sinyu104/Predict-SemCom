@@ -167,21 +167,20 @@ class _FrankaBase(BaseScene):
         self._camera_ids = list(camera_ids)
         self._annots = {}
         self._render_products = {}
-        for cam_id in camera_ids:
+        # Attach render products ONE AT A TIME, waiting for each to deliver a
+        # live frame before adding the next. Creating several render products
+        # at once leaves every one of them permanently black (verified: cam1
+        # and cam2 alone render fine, together-at-once both read all zeros,
+        # added sequentially both render fine).
+        print("[Isaac Sim] Warming up annotators...")
+        self._obs_checked = False
+        for i, cam_id in enumerate(camera_ids):
             annot = rep.AnnotatorRegistry.get_annotator("rgb")
             rp    = rep.create.render_product(self._cam_path_for(cam_id), (OBS_W, OBS_H))
             annot.attach([rp])
             self._annots[cam_id]          = annot
             self._render_products[cam_id] = rp
-
-        print("[Isaac Sim] Warming up annotators...")
-        for _ in range(100):
-            rep.orchestrator.step(rt_subframes=1, pause_timeline=True)
-        # Force GPU→CPU pipeline initialisation for every annotator.
-        # Without this first read, subsequent get_data() calls may return black frames.
-        for annot in self._annots.values():
-            _ = np.asarray(annot.get_data())
-        self._obs_checked = False
+            self._wait_for_live_cameras(min_steps=100 if i == 0 else 30)
 
         self.controller = RMPFlowController(
             name="rmpflow", robot_articulation=self.franka
@@ -195,29 +194,60 @@ class _FrankaBase(BaseScene):
 
     # ── Observation ───────────────────────────────────────────────────── #
 
+    def _read_frame(self, cam_id: int):
+        """
+        Low-level single-annotator read. Returns an (H, W, 3) array (any
+        dtype) or None if the annotator has nothing usable yet. Does not
+        print or fall back to zeros — callers decide what "no frame yet"
+        means (silently retry during warm-up, or report black at runtime).
+        """
+        raw  = self._annots[cam_id].get_data()
+        data = raw.get("data", None) if isinstance(raw, dict) else raw
+        if data is None or (hasattr(data, "size") and data.size == 0):
+            return None
+        arr = np.asarray(data)
+        if arr.ndim == 1:
+            if arr.size == OBS_H * OBS_W * 4:
+                arr = arr.reshape(OBS_H, OBS_W, 4)
+            elif arr.size == OBS_H * OBS_W * 3:
+                arr = arr.reshape(OBS_H, OBS_W, 3)
+            else:
+                return None
+        return arr[:, :, :3] if arr.shape[-1] == 4 else arr
+
+    def _wait_for_live_cameras(self, min_steps: int = 50, max_steps: int = 600,
+                                check_every: int = 10):
+        """
+        Step the renderer until every active camera has produced a real
+        (non-black) frame, instead of trusting a fixed step count.
+
+        A fixed step budget does not guarantee the RTX GPU->CPU readback has
+        landed, so poll the real annotator output instead.
+        """
+        steps = 0
+        while True:
+            rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
+            steps += 1
+            if steps < min_steps or steps % check_every:
+                continue
+            frames = {cam_id: self._read_frame(cam_id) for cam_id in self._annots}
+            if all(f is not None and f.max() > 0 for f in frames.values()):
+                return
+            if steps >= max_steps:
+                print(f"[Isaac Sim] Warning: camera(s) still black after "
+                      f"{steps} warm-up steps; proceeding anyway.")
+                return
+
     def get_obs(self) -> dict:
         """Return {cam_id: (H, W, 3) uint8} for every active camera."""
         result = {}
-        for cam_id, annot in self._annots.items():
-            raw = annot.get_data()
+        for cam_id in self._annots:
             if not self._obs_checked:
                 self._obs_checked = True
-            data = raw.get("data", None) if isinstance(raw, dict) else raw
-            if data is None or (hasattr(data, "size") and data.size == 0):
+            rgb = self._read_frame(cam_id)
+            if rgb is None:
                 result[cam_id] = np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
                 continue
-            arr = np.asarray(data)
-            if arr.ndim == 1:
-                if arr.size == OBS_H * OBS_W * 4:
-                    arr = arr.reshape(OBS_H, OBS_W, 4)
-                elif arr.size == OBS_H * OBS_W * 3:
-                    arr = arr.reshape(OBS_H, OBS_W, 3)
-                    result[cam_id] = arr if arr.dtype == np.uint8 else _float_to_uint8(arr)
-                    continue
-                else:
-                    result[cam_id] = np.zeros((OBS_H, OBS_W, 3), dtype=np.uint8)
-                    continue
-            rgb = arr[:, :, :3] if arr.shape[-1] == 4 else arr
             if rgb.max() == 0:
                 print(f"[Camera {cam_id}] Warning: black frame.")
             result[cam_id] = rgb if rgb.dtype == np.uint8 else _float_to_uint8(rgb)
@@ -235,8 +265,10 @@ class _FrankaBase(BaseScene):
         self.art_ctrl.apply_action(ctrl)
         self._set_gripper(open_gripper=float(action[6]) > 0.0)
 
-    def step(self):
-        rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
+    def step(self, rt_subframes: int = 4):
+        # More subframes re-render the same instant several times, which lets the RTX
+        # temporal accumulation converge (used after a cube teleport to avoid ghosting).
+        rep.orchestrator.step(rt_subframes=rt_subframes, pause_timeline=True)
 
     def _set_gripper(self, open_gripper: bool):
         finger = np.float32(0.04 if open_gripper else 0.0)
@@ -495,9 +527,7 @@ class PickAndPlaceScene(_FrankaBase):
                 cube.set_linear_velocity(np.zeros(3))
                 cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(50):
-            rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
-        self.get_obs()  # flush stale frame
+        self._wait_for_live_cameras()
 
     def is_success(self) -> bool:
         if self._target_cube is None:
@@ -602,9 +632,7 @@ class StackScene(_FrankaBase):
                 cube.set_linear_velocity(np.zeros(3))
                 cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(50):
-            rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
-        self.get_obs()
+        self._wait_for_live_cameras()
 
     def is_success(self) -> bool:
         target_pos, _ = self.cubes[self.target_color].get_world_pose()
@@ -701,9 +729,7 @@ class SortScene(_FrankaBase):
                 cube.set_linear_velocity(np.zeros(3))
                 cube.set_angular_velocity(np.zeros(3))
 
-        for _ in range(50):
-            rep.orchestrator.step(rt_subframes=4, pause_timeline=True)
-        self.get_obs()
+        self._wait_for_live_cameras()
 
     def is_success(self) -> bool:
         def _on_tray(cube, tray_pos: np.ndarray) -> bool:

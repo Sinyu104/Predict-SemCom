@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import random
+import re
 import threading
 import time
 
@@ -42,6 +43,9 @@ class VLAClient:
     unnorm_key   : action un-normalisation key expected by the server
     timeout_s    : seconds to wait before raising TimeoutError
     jpeg_quality : JPEG compression quality (lower → less bandwidth)
+    topic_prefix : namespace for the topics, e.g. "/B" → /B/vla/request and
+                   /B/vla/response. Empty (default) keeps /vla/request and
+                   /vla/response. Use it to run several inference stacks at once.
     """
 
     def __init__(
@@ -50,6 +54,7 @@ class VLAClient:
         unnorm_key:   str   = "franka_isaac",
         timeout_s:    float = 10.0,
         jpeg_quality: int   = 85,
+        topic_prefix: str   = "",
     ):
         try:
             import rclpy
@@ -70,13 +75,19 @@ class VLAClient:
         self._results = {}
         self._lock    = threading.Lock()
 
+        prefix          = topic_prefix.strip().strip("/")
+        node_suffix     = re.sub(r"[^A-Za-z0-9_]", "_", prefix)   # ROS node names: alphanumerics and _ only
+        prefix          = f"/{prefix}" if prefix else ""
+        self.req_topic  = f"{prefix}/vla/request"
+        self.resp_topic = f"{prefix}/vla/response"
+
         rclpy.init()
-        self._node = rclpy.create_node("vla_client")
+        self._node = rclpy.create_node(f"vla_client_{node_suffix}" if node_suffix else "vla_client")
         String     = __import__("std_msgs.msg", fromlist=["String"]).String
 
-        self._pub = self._node.create_publisher(String, "/vla/request", 10)
+        self._pub = self._node.create_publisher(String, self.req_topic, 10)
         self._node.create_subscription(
-            String, "/vla/response", self._on_response, 10
+            String, self.resp_topic, self._on_response, 10
         )
 
         executor = rclpy.executors.MultiThreadedExecutor()
@@ -85,8 +96,8 @@ class VLAClient:
         self._spin_thread.start()
 
         print("[VLAClient] ROS2 node started.")
-        print("[VLAClient] Publishing to  /vla/request")
-        print("[VLAClient] Subscribed to  /vla/response")
+        print(f"[VLAClient] Publishing to  {self.req_topic}")
+        print(f"[VLAClient] Subscribed to  {self.resp_topic}")
 
     def _on_response(self, msg):
         try:
@@ -106,6 +117,36 @@ class VLAClient:
         pil.save(buf, format="JPEG", quality=self.jpeg_quality)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+    @staticmethod
+    def _pose_json(pose):
+        """pose: list of 12-float rows [ee_x, ee_y, ee_z, joint_1..joint_9] -> plain rounded lists."""
+        return [[round(float(v), 5) for v in row] for row in pose]
+
+    def send_between(self, obs_rgb, step: int, pose=None):
+        """
+        Publish one in-between observation as its own small message, fire-and-forget.
+
+        {"type": "between", "episode": E, "step": k, "images_b64": {cam_id (str): JPEG},
+         "pose": [[12 floats]]}
+        k = actions executed so far in the episode. "pose" is the robot pose measured at the
+        same instant as the frame (one row). The bridge forwards it to the server, which
+        stores the frame and publishes no reply, so this neither waits nor pauses the simulation.
+        """
+        from std_msgs.msg import String
+
+        views = obs_rgb if isinstance(obs_rgb, dict) else {1: obs_rgb}
+        payload = {
+            "type":       "between",
+            "episode":    self._episode,
+            "step":       int(step),
+            "images_b64": {str(k): self._compress(v) for k, v in sorted(views.items())},
+        }
+        if pose is not None:
+            payload["pose"] = self._pose_json(pose)
+        msg      = String()
+        msg.data = json.dumps(payload)
+        self._pub.publish(msg)
+
     def new_episode(self):
         """
         Mark the start of a new episode.  Stateful servers (semcom_server.py)
@@ -115,8 +156,27 @@ class VLAClient:
         """
         self._episode += 1
 
-    def request_action(self, obs_rgb: np.ndarray) -> np.ndarray:
-        """Publish obs, block until server replies, return (7,) float32 action."""
+    def request_action(self, obs_rgb, disturbed: bool = False, pose=None) -> np.ndarray:
+        """
+        Publish obs, block until server replies, return the action array, or None
+        if the server replied with an error (caller should hold, not act).
+
+        obs_rgb   : one (H, W, 3) uint8 image, or {cam_id: image} for several
+                    cameras. One image -> "jpeg_b64" (legacy format). Several
+                    -> "images_b64" {cam_id (str): JPEG}, with no "jpeg_b64".
+
+        disturbed : True if an interference event (action perturbation or cube
+                    teleport) fired since the previous request — i.e. this
+                    observation reflects an injected disturbance rather than
+                    clean rollout. Servers that don't care can ignore the field.
+
+        pose      : list of rows [ee_x, ee_y, ee_z, joint_1..joint_9] (12 floats, same
+                    quantities/units/order as robot_ee_pos + robot_joint_pos in the
+                    datasets). One row per control step executed since the previous
+                    request, row j = pose at the instant of the frame after step j; the last
+                    row belongs to the image in this request. The first request of an
+                    episode has a single row (pose when its image was taken).
+        """
         from std_msgs.msg import String
 
         with self._lock:
@@ -125,21 +185,46 @@ class VLAClient:
             event      = threading.Event()
             self._pending[seq] = event
 
-        msg      = String()
-        msg.data = json.dumps({
+        views = obs_rgb if isinstance(obs_rgb, dict) else {1: obs_rgb}
+        images_b64 = {str(k): self._compress(v) for k, v in sorted(views.items())}
+
+        payload = {
             "seq":         seq,
             "episode":     self._episode,
-            "jpeg_b64":    self._compress(obs_rgb),
+            "disturbed":   disturbed,
             "instruction": self.instruction,
             "unnorm_key":  self.unnorm_key,
-        })
+        }
+        if len(views) == 1:
+            # Single view: legacy field only, identical to the old wire format.
+            payload["jpeg_b64"] = next(iter(images_b64.values()))
+        else:
+            # Multi view: images_b64 only. Do NOT also send jpeg_b64 — it would
+            # duplicate a camera and push the sample past ~64 KB, which forces
+            # RTPS fragmentation that Fast DDS drops across subnets.
+            payload["images_b64"] = images_b64
+        if pose is not None:
+            payload["pose"] = self._pose_json(pose)
+
+        msg      = String()
+        msg.data = json.dumps(payload)
+        n_subs = self._pub.get_subscription_count()
+        if len(msg.data) > 60_000:
+            print(f"[VLAClient] WARNING: payload {len(msg.data)/1024:.0f} KiB is near the "
+                  f"64 KiB UDP datagram limit; lower --jpeg_quality if the server stops receiving.")
+        if seq == 1 or n_subs == 0:
+            print(f"[VLAClient] seq={seq} publish {self.req_topic}  cams={sorted(views)}  "
+                  f"payload={len(msg.data) / 1024:.0f} KiB  matched_subscribers={n_subs}")
         self._pub.publish(msg)
 
         if not event.wait(timeout=self.timeout_s):
             with self._lock:
                 self._pending.pop(seq, None)
             raise TimeoutError(
-                f"No response from VLA server within {self.timeout_s}s."
+                f"No response from VLA server within {self.timeout_s}s "
+                f"(seq={seq}, matched_subscribers={n_subs}; 0 means nothing on this "
+                f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '').strip() or '<unset>'} "
+                f"is listening on {self.req_topic})."
             )
 
         with self._lock:
@@ -147,8 +232,9 @@ class VLAClient:
             self._pending.pop(seq, None)
 
         if reply.get("status") != "ok":
-            print(f"[VLAClient] Server error: {reply.get('message')}. Using zero action.")
-            return np.zeros(7, dtype=np.float32)
+            print(f"[VLAClient] Server error: {reply.get('message')}. "
+                  f"No action received — holding position.")
+            return None
 
         return np.array(reply["action"], dtype=np.float32)
 
@@ -176,7 +262,13 @@ class InterferenceInjector:
         action_noise_scale: float = 0.30,
         pose_delta_max:     float = 0.15,
         seed:               int   = 0,
+        min_gap:            int   = 0,
     ):
+        # min_gap: minimum number of steps between two events of the same kind
+        # (action noise / cube teleport). 0 = no limit (independent roll every step).
+        self.min_gap            = max(int(min_gap), 0)
+        self._action_wait       = 0
+        self._pose_wait         = 0
         self.action_prob        = action_prob
         self.pose_prob          = pose_prob
         self.action_noise_scale = action_noise_scale
@@ -189,12 +281,18 @@ class InterferenceInjector:
     def reset(self):
         self.action_events = 0
         self.pose_events   = 0
+        self._action_wait  = 0
+        self._pose_wait    = 0
 
     def maybe_perturb_action(self, action: np.ndarray) -> np.ndarray:
+        if self._action_wait > 0:          # inside the min_gap window: no roll
+            self._action_wait -= 1
+            return action
         if self.rng.random() < self.action_prob:
             noise  = self.np_rng.randn(*action.shape).astype(np.float32)
             action = np.clip(action + noise * self.action_noise_scale, -1., 1.)
             self.action_events += 1
+            self._action_wait = max(self.min_gap - 1, 0)
         return action
 
     def maybe_teleport_cubes(
@@ -214,8 +312,12 @@ class InterferenceInjector:
         (scene.MIN_CUBE_DIST) against every cube in all_prim_paths, including
         ones not being moved (e.g. one currently grasped by the gripper).
         """
+        if self._pose_wait > 0:            # inside the min_gap window: no roll
+            self._pose_wait -= 1
+            return False
         if self.rng.random() >= self.pose_prob:
             return False
+        self._pose_wait = max(self.min_gap - 1, 0)
         import omni.isaac.core.utils.prims as prim_utils
         from pxr import Gf, UsdGeom
 
@@ -287,7 +389,18 @@ class HDF5Writer:
         print(f"[HDF5Writer] {'Appending to' if mode=='a' else 'Writing to'}: {path} (starting at ep {self.ep})")
 
     def write(self, observations: list, actions: list,
-              metadata: dict | None = None):
+              metadata: dict | None = None, disturbed: list | None = None,
+              extras: dict | None = None):
+        """
+        extras    : optional {name: list of per-step arrays}, each stored as its own
+                    dataset of length T (e.g. robot_ee_pos, robot_joint_pos).
+
+        disturbed : optional per-step bool list/array, same length as
+                    observations/actions. disturbed[i] marks whether an
+                    interference event (actuator noise or cube teleport) fired
+                    while step i was executing — i.e. a frame-aligned version
+                    of the episode-level n_action_events/n_pose_events counts.
+        """
         grp = self.f.create_group(f"episode_{self.ep}")
         # observations is a list of dicts {cam_id: (H,W,3)}
         for cam_id in observations[0].keys():
@@ -299,12 +412,17 @@ class HDF5Writer:
         grp.create_dataset(
             "actions", data=np.stack(actions), compression="lzf"
         )
+        if disturbed is not None:
+            grp.create_dataset(
+                "disturbed", data=np.asarray(disturbed, dtype=bool), compression="lzf"
+            )
+        for name, series in (extras or {}).items():
+            grp.create_dataset(name, data=np.stack(series), compression="lzf")
         if metadata:
             for k, v in metadata.items():
                 grp.attrs[k] = v
         self.ep += 1
-        if self.ep % 20 == 0:
-            self.f.flush()
+        self.f.flush()   # every episode, so a crash loses at most the current one
 
     def close(self):
         self.f.flush()
@@ -336,6 +454,8 @@ def parse_collector_args(
     )
     p.add_argument("--timeout_s",    type=float, default=10.0)
     p.add_argument("--jpeg_quality", type=int,   default=85)
+    p.add_argument("--topic_prefix", type=str,   default="",
+                   help="Topic namespace, e.g. /B -> /B/vla/request, /B/vla/response")
     p.add_argument("--instruction",  type=str,   default=default_instruction)
     p.add_argument("--unnorm_key",   type=str,   default=default_unnorm_key)
     p.add_argument("--output",       type=str,   default=default_output)
@@ -346,6 +466,12 @@ def parse_collector_args(
     p.add_argument("--interference_prob",   type=float, default=0.10)
     p.add_argument("--action_noise_scale",  type=float, default=0.30)
     p.add_argument("--pose_delta_max",      type=float, default=0.15)
+    p.add_argument("--pose_flush_subframes", type=int, default=32,
+                   help="Render subframes for the step right after a cube teleport, so the old "
+                        "cube position doesn't linger as a faded ghost (normal steps use 4)")
+    p.add_argument("--interference_min_gap", type=int,  default=5,
+                   help="Minimum steps between two interference events of the same kind "
+                        "(default 5; 0 = no limit)")
     p.add_argument("--scripted", action="store_true",
                    help="Use the scene's scripted_action() instead of the VLA server")
     p.add_argument("--record_failures", action="store_true",
@@ -386,6 +512,7 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
             unnorm_key   = args.unnorm_key,
             timeout_s    = args.timeout_s,
             jpeg_quality = args.jpeg_quality,
+            topic_prefix = args.topic_prefix,
         )
 
     writer   = HDF5Writer(args.output)
@@ -395,6 +522,7 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
         action_noise_scale = args.action_noise_scale,
         pose_delta_max     = args.pose_delta_max,
         seed               = args.seed or 0,
+        min_gap            = args.interference_min_gap,
     )
 
     print(f"\n[Collector] {args.num_episodes} episodes × {args.episode_length} steps")
@@ -421,6 +549,7 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
         primary_cam = min(obs_t.keys())           # lowest cam id used for VLA
 
         for step in range(args.episode_length):
+            pose_event = False            # set when a cube teleport fires this step
             if args.scripted:
                 action = scene.scripted_action()
             else:
@@ -428,9 +557,10 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
                 action = client.request_action(obs_t[primary_cam])
                 total_latency  += (time.perf_counter() - t_req) * 1000
                 total_requests += 1
-                if args.interference_action:
-                    action = injector.maybe_perturb_action(action)
-                scene.apply_action(action)
+                if action is not None:
+                    if args.interference_action:
+                        action = injector.maybe_perturb_action(action)
+                    scene.apply_action(action)
 
             if args.interference_pose and hasattr(scene, "cubes"):
                 # Single shared roll: if it fires, all cubes teleport together,
@@ -447,14 +577,15 @@ def collect(scene: BaseScene, args: argparse.Namespace) -> None:
                 all_paths = [cube.prim_path for cube in scene.cubes.values()]
                 movable_paths = [cube.prim_path for cube in scene.cubes.values()
                                  if cube is not held_cube]
-                injector.maybe_teleport_cubes(
+                pose_event = injector.maybe_teleport_cubes(
                     movable_paths, all_paths, x_range, y_range, min_dist
                 )
 
-            obs_buf.append(obs_t)
-            act_buf.append(action)
+            if action is not None:        # a held step has no action to record
+                obs_buf.append(obs_t)
+                act_buf.append(action)
 
-            scene.step()
+            scene.step(rt_subframes=args.pose_flush_subframes if pose_event else 4)
             obs_t = scene.get_obs()   # dict {cam_id: (H,W,3)}
 
             if scene.is_success():
